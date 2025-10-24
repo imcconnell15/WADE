@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# WADE - Wide-Area Data Extraction :: Bootstrap Installer
-# Author: SSgt McConnell
-set -euo pipefail
+# WADE - Wide-Area Data Extraction :: Bootstrap Installer (soft-fail)
+# Author: Ian McConnell
+# Behavior:
+# - Continues installing other components if one fails
+# - Aggregates failures & prints a summary at the end (exit 2 if any failed)
+
+set -Euo pipefail
 
 #####################################
 # Banner (ASCII)
@@ -50,7 +54,46 @@ require_root() { if [[ ${EUID:-$(id -u)} -ne 0 ]]; then echo "[-] Run as root (s
 confirm() { [[ "$NONINTERACTIVE" -eq 1 ]] && return 0; read -r -p "${1:-Proceed?} [y/N]: " a; [[ "$a" =~ ^[Yy]$ ]]; }
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 validate_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[1-2][0-9]|3[0-2]))?$ ]]; }
+
+# Hard-fatal (only for true preflight errors like unsupported OS)
 die(){ echo "[-] $*"; exit 1; }
+
+# --- Soft-fail aggregation ----------------------------------------------
+FAILS=()
+WARNS=()
+
+fail_note() {  # record a module failure but keep going
+  local mod="$1"; shift
+  local msg="${*:-failed}"
+  echo "[-] [$mod] $msg"
+  FAILS+=("$mod — $msg")
+}
+
+warn_note() {  # record a non-fatal warning
+  local mod="$1"; shift
+  local msg="${*:-warning}"
+  echo "[!] [$mod] $msg"
+  WARNS+=("$mod — $msg")
+}
+
+finish_summary() {
+  echo
+  echo "================ WADE INSTALL SUMMARY ================"
+  if ((${#FAILS[@]})); then
+    echo "Failed components:"
+    printf ' - %s\n' "${FAILS[@]}"
+  else
+    echo "No component failures recorded."
+  fi
+  if ((${#WARNS[@]})); then
+    echo
+    echo "Warnings:"
+    printf ' - %s\n' "${WARNS[@]}"
+  fi
+  echo "======================================================"
+  # exit non-zero if anything failed (useful for automation)
+  ((${#FAILS[@]}==0)) || exit 2
+}
 
 find_offline_src() {
   for d in /media/*/wade-offline /run/media/*/wade-offline /mnt/wade-offline /wade-offline; do
@@ -146,9 +189,9 @@ MOD_PIRANHA_ENABLED="1"
 MOD_BARRACUDA_ENABLED="1"
 MOD_HAYABUSA_ENABLED="1"
 
-# Sigma & Hayabusa rules
-SIGMA_ENABLED="1"
-SIGMA_AUTOUPDATE="0"   # no auto-updater script/timer
+# Sigma (disabled / removed from installer) & Hayabusa
+SIGMA_ENABLED="0"
+SIGMA_AUTOUPDATE="0"
 HAYABUSA_ARCH_AUTO="1"
 HAYABUSA_ARCH_OVERRIDE=""
 HAYABUSA_DEST="/usr/local/bin/hayabusa"
@@ -269,26 +312,26 @@ else
   read -r -p "Hostname for this WADE server [${DEFAULT_HOSTNAME}]: " LWADE; LWADE="${LWADE:-$DEFAULT_HOSTNAME}"
   read -r -p "Primary Linux user to own shares [${DEFAULT_OWNER}]: " LWADEUSER; LWADEUSER="${LWADEUSER:-$DEFAULT_OWNER}"
   read -r -p "Samba users (comma-separated) [${DEFAULT_SMB_USERS}]: " SMB_USERS_CSV; SMB_USERS_CSV="${SMB_USERS_CSV:-$DEFAULT_SMB_USERS}"
-  read -r -p "Allowed networks CSV (optional) [${DEFAULT_ALLOW_NETS}]: " ALLOW_NETS_CSV; ALLOW_NETS_CSV="${ALLOW_NETS_CSV:-$DEFAULT_ALLOW_NETS}"
+  read -r -p "Allowed networks CSV (optional, ex. 10.10.10.0/24,20.20.0.0/16) [${DEFAULT_ALLOW_NETS}]: " ALLOW_NETS_CSV; ALLOW_NETS_CSV="${ALLOW_NETS_CSV:-$DEFAULT_ALLOW_NETS}"
 fi
 hostnamectl set-hostname "$LWADE" || true
 
 IFS=',' read -ra ALLOW_NETS_ARR <<< "${ALLOW_NETS_CSV// /}"
-for net in "${ALLOW_NETS_ARR[@]:-}"; do [[ -n "$net" ]] && ! validate_cidr "$net" && die "Invalid CIDR: $net"; done
+for net in "${ALLOW_NETS_ARR[@]:-}"; do [[ -n "$net" ]] && ! validate_cidr "$net" && warn_note "precheck" "Invalid CIDR ignored: $net"; done
 IFS=',' read -ra SMBUSERS <<< "${SMB_USERS_CSV}"
 
 if ! id -u "$LWADEUSER" >/dev/null 2>&1; then
   echo "[*] Creating user ${LWADEUSER}…"
-  useradd -m -s /bin/bash "$LWADEUSER"
+  useradd -m -s /bin/bash "$LWADEUSER" || fail_note "useradd" "could not create ${LWADEUSER}"
   if [[ "$NONINTERACTIVE" -eq 0 ]]; then
     while :; do read -s -p "Password for ${LWADEUSER}: " p1; echo; read -s -p "Confirm: " p2; echo; [[ "$p1" == "$p2" && -n "$p1" ]] && break; echo "Mismatch/empty. Try again."; done
-    echo "${LWADEUSER}:${p1}" | chpasswd
+    echo "${LWADEUSER}:${p1}" | chpasswd || warn_note "useradd" "could not set password for ${LWADEUSER}"
   fi
   usermod -aG sudo "$LWADEUSER" || true
 fi
 for u in "${SMBUSERS[@]}"; do
   u=$(echo "$u" | xargs)
-  id -u "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
+  id -u "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u" || warn_note "useradd" "failed creating $u"
 done
 
 if [[ "$NONINTERACTIVE" -eq 0 ]]; then
@@ -305,40 +348,43 @@ fi
 #####################################
 # Core packages
 #####################################
-WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools plocate libewf2 ewf-tools pipx zip unzip)
-if [[ "$PM" == "apt" ]]; then
-  JAVA_PKG="${JAVA_PACKAGE_APT:-default-jdk}"
-  bash -lc "$PKG_UPDATE"
-  bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} ufw ${JAVA_PKG}"
-else
-  JAVA_PKG="${JAVA_PACKAGE_RPM:-java-11-openjdk}"
-  bash -lc "$PKG_UPDATE"
-  EXTRA_RPM=(policycoreutils policycoreutils-python-utils setools-console "$JAVA_PKG")
-  bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} firewalld ${EXTRA_RPM[*]}" || true
-  systemctl enable firewalld --now || true
-fi
+( set -e
+  WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools plocate libewf2 ewf-tools pipx zip unzip)
+  if [[ "$PM" == "apt" ]]; then
+    JAVA_PKG="${JAVA_PACKAGE_APT:-default-jdk}"
+    bash -lc "$PKG_UPDATE"
+    bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} ufw ${JAVA_PKG}"
+  else
+    JAVA_PKG="${JAVA_PACKAGE_RPM:-java-11-openjdk}"
+    bash -lc "$PKG_UPDATE"
+    EXTRA_RPM=(policycoreutils policycoreutils-python-utils setools-console "$JAVA_PKG")
+    bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} firewalld ${EXTRA_RPM[*]}" || true
+    systemctl enable firewalld --now || true
+  fi
+) || fail_note "core_packages" "base packages failed"
 
 #####################################
 # Shares (DataSources, Cases, Staging)
 #####################################
-DATADIR="/home/${LWADEUSER}/${WADE_DATADIR}"
-CASESDIR="/home/${LWADEUSER}/${WADE_CASESDIR}"
-STAGINGDIR="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
-mkdir -p "$DATADIR" "$CASESDIR" "$STAGINGDIR"
-chown -R "${LWADEUSER}:${LWADEUSER}" "/home/${LWADEUSER}"
-chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
+( set -e
+  DATADIR="/home/${LWADEUSER}/${WADE_DATADIR}"
+  CASESDIR="/home/${LWADEUSER}/${WADE_CASESDIR}"
+  STAGINGDIR="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
+  mkdir -p "$DATADIR" "$CASESDIR" "$STAGINGDIR"
+  chown -R "${LWADEUSER}:${LWADEUSER}" "/home/${LWADEUSER}"
+  chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
-SMB_CONF="/etc/samba/smb.conf"; [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
-HOSTS_DENY_LINE="   hosts deny = 0.0.0.0/0"
-HOSTS_ALLOW_BLOCK=""
-if [[ "${#ALLOW_NETS_ARR[@]}" -gt 0 ]]; then
-  HOSTS_ALLOW_BLOCK="   hosts allow ="
-  for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_ALLOW_BLOCK+=" ${n}"; done
-fi
-VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed 's/ //g')"
+  SMB_CONF="/etc/samba/smb.conf"; [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
+  HOSTS_DENY_LINE="   hosts deny = 0.0.0.0/0"
+  HOSTS_ALLOW_BLOCK=""
+  if [[ "${#ALLOW_NETS_ARR[@]}" -gt 0 ]]; then
+    HOSTS_ALLOW_BLOCK="   hosts allow ="
+    for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_ALLOW_BLOCK+=" ${n}"; done
+  fi
+  VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed 's/ //g')"
 
-awk 'BEGIN{skip=0} /^\[WADE-BEGIN\]/{skip=1;next} /^\[WADE-END\]/{skip=0;next} skip==0{print}' "$SMB_CONF" > "${SMB_CONF}.tmp" && mv "${SMB_CONF}.tmp" "$SMB_CONF"
-cat <<EOF >> "$SMB_CONF"
+  awk 'BEGIN{skip=0} /^\[WADE-BEGIN\]/{skip=1;next} /^\[WADE-END\]/{skip=0;next} skip==0{print}' "$SMB_CONF" > "${SMB_CONF}.tmp" && mv "${SMB_CONF}.tmp" "$SMB_CONF"
+  cat <<EOF >> "$SMB_CONF"
 [WADE-BEGIN]
 [DataSources]
    path = ${DATADIR}
@@ -375,96 +421,94 @@ ${HOSTS_DENY_LINE}
 [WADE-END]
 EOF
 
-if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-  for u in "${SMBUSERS[@]}"; do
-    u=$(echo "$u" | xargs)
-    echo "[*] Set Samba password for $u"
-    while :; do read -s -p "Password for $u: " sp1; echo; read -s -p "Confirm: " sp2; echo; [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break; echo "Mismatch/empty. Try again."; done
-    ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -a "$u" >/dev/null
-  done
-fi
-
-# SELinux (Oracle/RHEL)
-if have_cmd getenforce; then
-  SEL=$(getenforce || echo Disabled)
-  if [[ "$SEL" == "Enforcing" || "$SEL" == "Permissive" ]]; then
-    setsebool -P samba_enable_home_dirs on || true
-    semanage fcontext -a -t samba_share_t "/home/${LWADEUSER}(/.*)?" 2>/dev/null || true
-    restorecon -Rv "/home/${LWADEUSER}" || true
+  if [[ "$NONINTERACTIVE" -eq 0 ]]; then
+    for u in "${SMBUSERS[@]}"; do
+      u=$(echo "$u" | xargs)
+      echo "[*] Set Samba password for $u"
+      while :; do read -s -p "Password for $u: " sp1; echo; read -s -p "Confirm: " sp2; echo; [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break; echo "Mismatch/empty. Try again."; done
+      ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -a "$u" >/dev/null
+    done
   fi
-fi
 
-# Start Samba
-echo "[*] Enabling and starting Samba…"
-if systemctl list-unit-files | grep -q '^smbd\.service'; then systemctl enable smbd --now; systemctl list-unit-files | grep -q '^nmbd\.service' && systemctl enable nmbd --now || true
-elif systemctl list-unit-files | grep -q '^smb\.service'; then systemctl enable smb --now; systemctl list-unit-files | grep -q '^nmb\.service' && systemctl enable nmb --now || true
-else systemctl enable smbd --now 2>/dev/null || systemctl enable smb --now || true; systemctl enable nmbd --now 2>/dev/null || systemctl enable nmb --now || true; fi
-
-# Firewall
-echo "[*] Configuring firewall…"
-if [[ "$FIREWALL" == "ufw" ]]; then
-  have_cmd ufw && { ufw allow Samba || true; }
-else
-  systemctl enable firewalld --now || true
-  if have_cmd firewall-cmd; then
-    if [[ "${WADE_STRICT_FIREWALL:-0}" -eq 1 ]]; then
-      firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true
-      for n in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${n}' service name='samba' accept"
-      done
-    else
-      firewall-cmd --permanent --add-service=samba || true
-      for n in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${n}' service name='samba' accept"
-      done
+  # SELinux (Oracle/RHEL)
+  if have_cmd getenforce; then
+    SEL=$(getenforce || echo Disabled)
+    if [[ "$SEL" == "Enforcing" || "$SEL" == "Permissive" ]]; then
+      setsebool -P samba_enable_home_dirs on || true
+      semanage fcontext -a -t samba_share_t "/home/${LWADEUSER}(/.*)?" 2>/dev/null || true
+      restorecon -Rv "/home/${LWADEUSER}" || true
     fi
-    firewall-cmd --reload || true
   fi
-fi
+
+  # Start Samba
+  echo "[*] Enabling and starting Samba…"
+  if systemctl list-unit-files | grep -q '^smbd\.service'; then systemctl enable smbd --now; systemctl list-unit-files | grep -q '^nmbd\.service' && systemctl enable nmbd --now || true
+  elif systemctl list-unit-files | grep -q '^smb\.service'; then systemctl enable smb --now; systemctl list-unit-files | grep -q '^nmb\.service' && systemctl enable nmb --now || true
+  else systemctl enable smbd --now 2>/dev/null || systemctl enable smb --now || true; systemctl enable nmbd --now 2>/dev/null || systemctl enable nmb --now || true; fi
+
+  # Firewall
+  echo "[*] Configuring firewall…"
+  if [[ "$FIREWALL" == "ufw" ]]; then
+    have_cmd ufw && { ufw allow Samba || true; }
+  else
+    systemctl enable firewalld --now || true
+    if have_cmd firewall-cmd; then
+      if [[ "${WADE_STRICT_FIREWALL:-0}" -eq 1 ]]; then
+        firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true
+        for n in "${ALLOW_NETS_ARR[@]}"; do
+          firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${n}' service name='samba' accept"
+        done
+      else
+        firewall-cmd --permanent --add-service=samba || true
+        for n in "${ALLOW_NETS_ARR[@]}"; do
+          firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${n}' service name='samba' accept"
+        done
+      fi
+      firewall-cmd --reload || true
+    fi
+  fi
+) || fail_note "samba_shares" "share setup failed"
 
 #####################################
-# Volatility3 & Dissect via pipx
+# Volatility3 & Dissect via pipx (soft-fail)
 #####################################
-export PIPX_HOME=/opt/pipx; export PIPX_BIN_DIR=/usr/local/bin; mkdir -p "$PIPX_HOME"
-python3 -m pipx ensurepath || true
-pipx install --force volatility3 || true
-pipx install --force dissect --include-deps || true
+( set -e
+  export PIPX_HOME=/opt/pipx; export PIPX_BIN_DIR=/usr/local/bin; mkdir -p "$PIPX_HOME"
+  python3 -m pipx ensurepath || true
+  pipx install --force volatility3
+  pipx install --force dissect --include-deps
+) || fail_note "pipx_tools" "volatility3/dissect install failed"
 
 #####################################
 # Helpers
 #####################################
+# fetch_pkg: try to copy from /var/wade/pkg or $OFFLINE_SRC; NEVER die here.
 fetch_pkg() {
-  # $1 subdir (zookeeper|solr|activemq|autopsy|volatility3/symbols|bulk_extractor|piranha|barracuda|hayabusa|sigma), $2 filename
+  # $1 subdir (zookeeper|solr|activemq|autopsy|volatility3/symbols|bulk_extractor|piranha|barracuda|hayabusa), $2 filename
   local sub="$1" file="$2"
   local local_pkg="${WADE_PKG_DIR}/${sub}/${file}"
   if [[ -f "$local_pkg" ]]; then cp "$local_pkg" .; return 0; fi
   if [[ "$OFFLINE" == "1" ]]; then
     local off="${OFFLINE_SRC}/${sub}/${file}"
-    [[ -f "$off" ]] || die "Missing ${file} (looked in ${local_pkg} and ${off})"
-    cp "$off" .; return 0
+    [[ -f "$off" ]] && { cp "$off" .; return 0; }
   fi
   return 1
 }
 
 detect_hayabusa_arch() {
   local arch="$(uname -m)"
-  local out="lin-x64-gnu"
   case "$arch" in
-    x86_64|amd64) out="lin-x64-gnu" ;;
-    aarch64|arm64) out="lin-aarch64-gnu" ;;
+    x86_64|amd64) echo "lin-x64-gnu" ;;
+    aarch64|arm64) echo "lin-aarch64-gnu" ;;
+    *) echo "lin-x64-gnu" ;;
   esac
-  if [[ -n "${HAYABUSA_ARCH_OVERRIDE:-}" ]]; then
-    out="${HAYABUSA_ARCH_OVERRIDE}"
-  elif [[ "${HAYABUSA_ARCH_AUTO:-1}" != "1" ]]; then
-    out="lin-x64-gnu"
-  fi
-  echo "$out"
 }
 
 #####################################
-# Volatility3 symbol packs (+SHA256 verify if available)
+# Volatility3 symbol packs (+SHA256 verify if available, soft-fail)
 #####################################
 if [[ "${MOD_VOL_SYMBOLS_ENABLED:-1}" == "1" ]]; then
+( set -e
   echo "[*] Installing Volatility3 symbol packs… (first use may build cache for a while)"
   mkdir -p /usr/local/bin/symbols
   VOL_SYM_DIR="$(find /opt/pipx/venvs/volatility3 -type d -path '*/site-packages/volatility3/symbols' | head -1 || true)"
@@ -472,85 +516,87 @@ if [[ "${MOD_VOL_SYMBOLS_ENABLED:-1}" == "1" ]]; then
   mkdir -p "$VOL_SYM_DIR"
   for z in windows.zip mac.zip linux.zip; do
     fetch_pkg "volatility3/symbols" "$z" || curl -L "https://downloads.volatilityfoundation.org/volatility3/symbols/${z}" -o "$z"
+    [[ -f "$z" ]] || { echo "missing $z"; exit 1; }
     cp -f "$z" "$VOL_SYM_DIR/"
     cp -f "$z" /usr/local/bin/symbols/ || true
   done
-  SUMS="SHA256SUMS"
-  if fetch_pkg "volatility3/symbols" "$SUMS" || curl -fsSL "https://downloads.volatilityfoundation.org/volatility3/symbols/${SUMS}" -o "$SUMS"; then
+  if curl -fsSL "https://downloads.volatilityfoundation.org/volatility3/symbols/SHA256SUMS" -o "SHA256SUMS"; then
     for z in windows.zip mac.zip linux.zip; do
-      if grep -q " ${z}\$" "$SUMS"; then
-        SUMLINE="$(grep " ${z}\$" "$SUMS")"
-        echo "$SUMLINE" | sha256sum -c - || echo "[!] SHA256 check skipped/failed for ${z}"
+      if grep -q " ${z}\$" SHA256SUMS; then
+        echo "$(grep " ${z}\$" SHA256SUMS)" | sha256sum -c - || echo "[!] SHA256 check failed for ${z}"
       fi
     done
   else
     echo "[!] Could not obtain SHA256SUMS; skipping verification."
   fi
+) || fail_note "volatility_symbols" "download/verify failed"
 fi
 
 #####################################
-# bulk_extractor (pkg or source)
+# bulk_extractor (always build from source; soft-fail)
 #####################################
 if [[ "${MOD_BULK_EXTRACTOR_ENABLED:-1}" == "1" ]]; then
-  echo "[*] Installing bulk_extractor…"
+( set -e
+  echo "[*] Installing bulk_extractor from source…"
+
+  BE_PREFIX="${WADE_TOOLS_DIR:-/opt/wade/tools.d}/bulk_extractor"
+  mkdir -p "$BE_PREFIX" /var/tmp/wade/build
+  BUILD_DIR="$(mktemp -d /var/tmp/wade/build/be.XXXXXX)"
+
   if [[ "$PM" == "apt" ]]; then
-    if bash -lc "$PKG_INSTALL bulk-extractor" ; then
-      echo "[+] bulk_extractor installed via APT."
-    else
-      echo "[!] APT package unavailable. Trying source build…"
-      BE_TGZ="$(ls "${WADE_PKG_DIR}/bulk_extractor/"bulk_extractor-*.tar.gz 2>/dev/null | head -1 || true)"
-      if [[ -z "$BE_TGZ" && "$OFFLINE" == "1" ]]; then die "Provide bulk_extractor-*.tar.gz under /var/wade/pkg/bulk_extractor/ for offline build."; fi
-      [[ -n "$BE_TGZ" ]] && cp "$BE_TGZ" . || fetch_pkg bulk_extractor "bulk_extractor-latest.tar.gz" || true
-      if [[ ! -f "$(ls bulk_extractor-*.tar.gz bulk_extractor-latest.tar.gz 2>/dev/null | head -1)" ]]; then die "No bulk_extractor source tarball found."; fi
-      bash -lc "$PKG_INSTALL build-essential autoconf automake libtool pkg-config \
-        libewf-dev libssl-dev zlib1g-dev libxml2-dev libexiv2-dev libtre-dev \
-        libsqlite3-dev libpcap-dev"
-      TARFILE="$(ls bulk_extractor-*.tar.gz bulk_extractor-latest.tar.gz 2>/dev/null | head -1)"
-      tar -xzf "$TARFILE"
-      SRC_DIR="$(tar -tf "$TARFILE" | head -1 | cut -d/ -f1)"
-      pushd "$SRC_DIR" >/dev/null
-      ./bootstrap.sh || true
-      ./configure
-      make -j"$(nproc)"
-      make install
-      ldconfig || true
-      popd >/dev/null
-    fi
+    bash -lc "$PKG_INSTALL -y --no-install-recommends \
+      git ca-certificates build-essential autoconf automake libtool pkg-config \
+      flex bison \
+      libewf-dev libssl-dev zlib1g-dev libxml2-dev libexiv2-dev libtre-dev \
+      libsqlite3-dev libpcap-dev libre2-dev libpcre3-dev libexpat1-dev || true"
   else
-    if bash -lc "$PKG_INSTALL bulk_extractor" ; then
-      echo "[+] bulk_extractor installed via DNF/YUM."
-    else
-      echo "[!] RPM package unavailable. Trying source build…"
-      BE_TGZ="$(ls "${WADE_PKG_DIR}/bulk_extractor/"bulk_extractor-*.tar.gz 2>/dev/null | head -1 || true)"
-      [[ -z "$BE_TGZ" && "$OFFLINE" == "1" ]] && die "Provide bulk_extractor-*.tar.gz under /var/wade/pkg/bulk_extractor/ for offline build."
-      [[ -n "$BE_TGZ" ]] && cp "$BE_TGZ" .
-      [[ -z "$BE_TGZ" ]] && die "No bulk_extractor source tarball found."
-      bash -lc "$PKG_INSTALL gcc gcc-c++ make autoconf automake libtool pkgconfig \
-        libewf-devel openssl-devel zlib-devel libxml2-devel exiv2-devel tre-devel \
-        sqlite-devel libpcap-devel"
-      TARFILE="$(ls bulk_extractor-*.tar.gz 2>/dev/null | head -1)"
-      tar -xzf "$TARFILE"
-      SRC_DIR="$(tar -tf "$TARFILE" | head -1 | cut -d/ -f1)"
-      pushd "$SRC_DIR" >/dev/null
-      ./bootstrap.sh || true
-      ./configure
-      make -j"$(nproc)"
-      make install
-      ldconfig || true
-      popd >/dev/null
-    fi
+    bash -lc "$PKG_INSTALL -y @'Development Tools' || true"
+    bash -lc "$PKG_INSTALL -y git ca-certificates libewf-devel openssl-devel \
+      zlib-devel libxml2-devel exiv2-devel tre-devel sqlite-devel libpcap-devel \
+      re2-devel pcre-devel expat-devel flex bison || true"
   fi
+
+  OFFLINE_TGZ="${WADE_PKG_DIR:-/var/wade/pkg}/bulk_extractor/bulk_extractor-src.tar.gz"
+  BE_GIT_REF="${BE_GIT_REF:-master}"
+
+  pushd "$BUILD_DIR" >/dev/null
+  if [[ "$OFFLINE" == "1" && -f "$OFFLINE_TGZ" ]]; then
+    echo "[*] Using offline bulk_extractor source tarball: $OFFLINE_TGZ"
+    tar -xzf "$OFFLINE_TGZ"
+    [[ -d bulk_extractor ]] || { echo "bulk_extractor folder not found in tarball"; exit 1; }
+    cd bulk_extractor
+  else
+    echo "[*] Cloning bulk_extractor (with submodules)…"
+    git clone --recurse-submodules https://github.com/simsong/bulk_extractor.git
+    cd bulk_extractor
+    [[ "$BE_GIT_REF" != "master" ]] && git checkout "$BE_GIT_REF" || true
+    git submodule update --init --recursive
+  fi
+
+  ./bootstrap.sh || true
+  ./configure --prefix="$BE_PREFIX"
+  make -j"$(nproc)"
+  make install
+
+  install -d /usr/local/bin
+  ln -sf "$BE_PREFIX/bin/bulk_extractor" /usr/local/bin/bulk_extractor
+  /usr/local/bin/bulk_extractor -V >/dev/null 2>&1 || { echo "version check failed"; exit 1; }
+
+  popd >/dev/null
+  rm -rf "$BUILD_DIR"
+) || fail_note "bulk_extractor" "build/install failed (see ${LOG_FILE})"
 fi
 
 #####################################
-# Piranha (venv + launcher)
+# Piranha (venv + launcher) — soft-fail
 #####################################
 if [[ "${MOD_PIRANHA_ENABLED:-1}" == "1" ]]; then
+( set -e
   echo "[*] Installing Piranha…"
   install -d /opt/piranha
   if [[ "$OFFLINE" == "1" ]]; then
     PKG_ARC="$(ls "${WADE_PKG_DIR}/piranha/"piranha*.tar.gz "${WADE_PKG_DIR}/piranha/"piranha*.zip 2>/dev/null | head -1 || true)"
-    [[ -z "$PKG_ARC" ]] && die "Place Piranha archive under /var/wade/pkg/piranha/ for offline install."
+    [[ -n "$PKG_ARC" ]] || { echo "offline Piranha archive missing"; exit 1; }
     cp "$PKG_ARC" /opt/piranha/
     pushd /opt/piranha >/dev/null
     [[ "$PKG_ARC" == *.zip ]] && unzip -o "$(basename "$PKG_ARC")" || tar -xzf "$(basename "$PKG_ARC")"
@@ -566,17 +612,19 @@ if [[ "${MOD_PIRANHA_ENABLED:-1}" == "1" ]]; then
 exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"
 EOF
   chmod 0755 /usr/local/bin/piranha
+) || fail_note "piranha" "setup failed"
 fi
 
 #####################################
-# Barracuda (venv + launcher)
+# Barracuda (venv + launcher) — soft-fail
 #####################################
 if [[ "${MOD_BARRACUDA_ENABLED:-1}" == "1" ]]; then
+( set -e
   echo "[*] Installing Barracuda…"
   install -d /opt/barracuda
   if [[ "$OFFLINE" == "1" ]]; then
     PKG_ARC="$(ls "${WADE_PKG_DIR}/barracuda/"barracuda*.tar.gz "${WADE_PKG_DIR}/barracuda/"barracuda*.zip 2>/dev/null | head -1 || true)"
-    [[ -z "$PKG_ARC" ]] && die "Place Barracuda archive under /var/wade/pkg/barracuda/ for offline install."
+    [[ -n "$PKG_ARC" ]] || { echo "offline Barracuda archive missing"; exit 1; }
     cp "$PKG_ARC" /opt/barracuda/
     pushd /opt/barracuda >/dev/null
     [[ "$PKG_ARC" == *.zip ]] && unzip -o "$(basename "$PKG_ARC")" || tar -xzf "$(basename "$PKG_ARC")"
@@ -592,14 +640,16 @@ if [[ "${MOD_BARRACUDA_ENABLED:-1}" == "1" ]]; then
 exec /opt/barracuda/.venv/bin/python /opt/barracuda/app.py "$@"
 EOF
   chmod 0755 /usr/local/bin/barracuda
+) || fail_note "barracuda" "setup failed"
 fi
 
 #####################################
-# Hayabusa (binary + rules)
+# Hayabusa (binary; robust extract) — soft-fail
 #####################################
 if [[ "${MOD_HAYABUSA_ENABLED:-1}" == "1" ]]; then
+( set -e
   echo "[*] Installing Hayabusa…"
-  install -d "$(dirname "${HAYABUSA_DEST}")" "${HAYABUSA_RULES_DIR}"
+  install -d "$(dirname "${HAYABUSA_DEST}")"
 
   HAY_ARCH="$(detect_hayabusa_arch)"
   HAY_ZIP=""
@@ -609,7 +659,7 @@ if [[ "${MOD_HAYABUSA_ENABLED:-1}" == "1" ]]; then
     HAY_ZIP="$(basename "$HAY_ZIP_LOCAL")"
   elif [[ "$OFFLINE" == "1" ]]; then
     HAY_ZIP_USB="$(ls "${OFFLINE_SRC}/hayabusa/"hayabusa-*-${HAY_ARCH}.zip 2>/dev/null | sort -V | tail -1 || true)"
-    [[ -z "$HAY_ZIP_USB" ]] && die "Hayabusa zip for arch '${HAY_ARCH}' not found offline. Put it under /var/wade/pkg/hayabusa/."
+    [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '${HAY_ARCH}' not found offline"; exit 1; }
     cp "$HAY_ZIP_USB" .
     HAY_ZIP="$(basename "$HAY_ZIP_USB")"
   else
@@ -617,100 +667,57 @@ if [[ "${MOD_HAYABUSA_ENABLED:-1}" == "1" ]]; then
       echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH}…"
       DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
         | jq -r --arg pat "$HAY_ARCH" '.assets[] | select(.name | test($pat)) | .browser_download_url' | head -1)"
-      [[ -z "$DL_URL" ]] && die "Could not resolve latest Hayabusa asset for ${HAY_ARCH}."
+      [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH}"; exit 1; }
       HAY_ZIP="$(basename "$DL_URL")"
       curl -L "$DL_URL" -o "$HAY_ZIP"
     else
-      die "curl/jq required to auto-fetch Hayabusa online."
+      echo "curl/jq required to auto-fetch Hayabusa online"; exit 1
     fi
   fi
 
-  TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
-  unzip -o "$HAY_ZIP" -d "$TMPDIR" >/dev/null
-  HAY_BIN_PATH="$(find "$TMPDIR" -type f -name 'hayabusa' | head -1 || true)"
-  [[ -z "$HAY_BIN_PATH" ]] && die "Hayabusa binary not found inside ${HAY_ZIP}."
+  TMPDIR="$(mktemp -d)"; cleanup(){ rm -rf "$TMPDIR"; }; trap cleanup EXIT
+  unzip -qo "$HAY_ZIP" -d "$TMPDIR"
+
+  # Robust binary detection: don’t require exec perms; we’ll set them.
+  HAY_BIN_PATH="$(find "$TMPDIR" -type f \( -name 'hayabusa' -o -name 'hayabusa-*' \) \
+                  ! -path '*/rules/*' ! -path '*/config/*' | head -1 || true)"
+  if [[ -z "$HAY_BIN_PATH" ]]; then
+    echo "Hayabusa binary not found in ${HAY_ZIP}. Contents:"
+    find "$TMPDIR" -maxdepth 3 -type f -printf '  %P\n'
+    exit 1
+  fi
+
   install -m 0755 "$HAY_BIN_PATH" "${HAYABUSA_DEST}"
+  echo "[+] Installed Hayabusa to ${HAYABUSA_DEST}"
 
-  echo "[*] Installing Hayabusa rules…"
-  RULES_ARC=""
-  RULES_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa/"hayabusa-rules*.zip "${WADE_PKG_DIR}/hayabusa/"hayabusa-rules*.tar.gz 2>/dev/null | sort -V | tail -1 || true)"
-  if [[ -n "$RULES_LOCAL" ]]; then
-    cp "$RULES_LOCAL" .
-    RULES_ARC="$(basename "$RULES_LOCAL")"
-  elif [[ "$OFFLINE" == "1" ]]; then
-    RULES_USB="$(ls "${OFFLINE_SRC}/hayabusa/"hayabusa-rules*.zip "${OFFLINE_SRC}/hayabusa/"hayabusa-rules*.tar.gz 2>/dev/null | sort -V | tail -1 || true)"
-    [[ -z "$RULES_USB" ]] && die "hayabusa-rules archive not found offline. Put it under /var/wade/pkg/hayabusa/."
-    cp "$RULES_USB" .
-    RULES_ARC="$(basename "$RULES_USB")"
-  else
-    if have_cmd curl && have_cmd jq; then
-      echo "[*] Downloading latest hayabusa-rules…"
-      RULES_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa-rules/releases/latest \
-        | jq -r '.assets[] | .browser_download_url' | grep -E '\.(zip|tar\.gz)$' | head -1)"
-      [[ -z "$RULES_URL" ]] && die "Could not resolve hayabusa-rules latest asset."
-      RULES_ARC="$(basename "$RULES_URL")"
-      curl -L "$RULES_URL" -o "$RULES_ARC"
-    else
-      die "curl/jq required to fetch hayabusa-rules online."
-    fi
-  fi
+  # Optional content from the archive
+  [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules"  /usr/local/bin/; echo "[+] Copied Hayabusa rules/ to /usr/local/bin/rules"; }
+  [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config" /usr/local/bin/; echo "[+] Copied Hayabusa config/ to /usr/local/bin/config"; }
 
-  rm -rf "${HAYABUSA_RULES_DIR:?}"/*
-  if [[ "$RULES_ARC" == *.zip ]]; then
-    unzip -o "$RULES_ARC" -d "$HAYABUSA_RULES_DIR" >/dev/null
-  else
-    tar -xzf "$RULES_ARC" -C "$HAYABUSA_RULES_DIR"
-  fi
-
-  cat >/usr/local/bin/hayabusa-run <<EOF
-#!/usr/bin/env bash
-# Default runner to ensure rules path; adjust per your pipeline needs.
-exec "${HAYABUSA_DEST}" --rules "${HAYABUSA_RULES_DIR}" "\$@"
-EOF
-  chmod 0755 /usr/local/bin/hayabusa-run
+  # Smoke test
+  "${HAYABUSA_DEST}" --help >/dev/null 2>&1 || { echo "Hayabusa post-install test failed"; exit 1; }
+) || fail_note "hayabusa" "binary/rules copy failed"
 fi
 
 #####################################
-# SigmaHQ rules (generic sigma repo)
+# Zookeeper (pinned) — soft-fail
 #####################################
-if [[ "${SIGMA_ENABLED:-1}" == "1" ]]; then
-  echo "[*] Installing/Updating SigmaHQ rules…"
-  install -d "${SIGMA_RULES_DIR}"
-
-  if [[ "$OFFLINE" == "1" ]]; then
-    SIG_ARC="$(ls "${WADE_PKG_DIR}/sigma/"sigma*.zip "${WADE_PKG_DIR}/sigma/"sigma*.tar.gz 2>/dev/null | sort -V | tail -1 || true)"
-    [[ -z "$SIG_ARC" ]] && echo "[!] No sigma archive found offline; skipping." || {
-      cp "$SIG_ARC" .
-      rm -rf "${SIGMA_RULES_DIR:?}"/*
-      [[ "$SIG_ARC" == *.zip ]] && unzip -o "$(basename "$SIG_ARC")" -d "${SIGMA_RULES_DIR}" >/dev/null || tar -xzf "$(basename "$SIG_ARC")" -C "${SIGMA_RULES_DIR}"
-    }
-  else
-    if [[ -d "${SIGMA_RULES_DIR}/.git" ]]; then
-      git -C "${SIGMA_RULES_DIR}" pull --ff-only || true
-    else
-      rm -rf "${SIGMA_RULES_DIR:?}"/*
-      git clone --depth 1 https://github.com/SigmaHQ/sigma "${SIGMA_RULES_DIR}" || echo "[!] Could not clone SigmaHQ/sigma."
-    fi
-  fi
-fi
-
-#####################################
-# Zookeeper (pinned)
-#####################################
-ZOOKEEPER_TGZ="apache-zookeeper-${ZOOKEEPER_VER}-bin.tar.gz"
-fetch_pkg zookeeper "$ZOOKEEPER_TGZ" || curl -L "https://archive.apache.org/dist/zookeeper/zookeeper-${ZOOKEEPER_VER}/${ZOOKEEPER_TGZ}" -o "$ZOOKEEPER_TGZ"
-id zookeeper >/dev/null 2>&1 || useradd --system -s /usr/sbin/nologin zookeeper
-mkdir -p /opt/zookeeper /var/lib/zookeeper
-tar -xzf "$ZOOKEEPER_TGZ" -C /opt/zookeeper --strip-components 1
-cat >/opt/zookeeper/conf/zoo.cfg <<'EOF'
+( set -e
+  ZOOKEEPER_TGZ="apache-zookeeper-${ZOOKEEPER_VER}-bin.tar.gz"
+  fetch_pkg zookeeper "$ZOOKEEPER_TGZ" || curl -L "https://archive.apache.org/dist/zookeeper/zookeeper-${ZOOKEEPER_VER}/${ZOOKEEPER_TGZ}" -o "$ZOOKEEPER_TGZ"
+  [[ -f "$ZOOKEEPER_TGZ" ]] || { echo "ZooKeeper tarball missing"; exit 1; }
+  id zookeeper >/dev/null 2>&1 || useradd --system -s /usr/sbin/nologin zookeeper
+  mkdir -p /opt/zookeeper /var/lib/zookeeper
+  tar -xzf "$ZOOKEEPER_TGZ" -C /opt/zookeeper --strip-components 1
+  cat >/opt/zookeeper/conf/zoo.cfg <<'EOF'
 ticktime=2000
 dataDir=/var/lib/zookeeper
 clientPort=2181
 maxClientCnxns=60
 4lw.commands.whitelist=mntr,conf,ruok
 EOF
-chown -R zookeeper:zookeeper /opt/zookeeper /var/lib/zookeeper
-cat >/etc/systemd/system/zookeeper.service <<'EOF'
+  chown -R zookeeper:zookeeper /opt/zookeeper /var/lib/zookeeper
+  cat >/etc/systemd/system/zookeeper.service <<'EOF'
 [Unit]
 Description=Zookeeper Daemon
 After=network.target
@@ -727,43 +734,50 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload; systemctl enable zookeeper --now
+  systemctl daemon-reload; systemctl enable zookeeper --now
+) || fail_note "zookeeper" "install/config failed"
 
 #####################################
-# Solr (pinned, cloud mode)
+# Solr (pinned, cloud mode) — soft-fail
 #####################################
-SOLR_TGZ="solr-${SOLR_VER}.tgz"
-fetch_pkg solr "$SOLR_TGZ" || curl -L "https://archive.apache.org/dist/lucene/solr/${SOLR_VER}/${SOLR_TGZ}" -o "$SOLR_TGZ"
-tar -xvzf "$SOLR_TGZ" "solr-${SOLR_VER}/bin/install_solr_service.sh" --strip-components=2
-bash ./install_solr_service.sh "$SOLR_TGZ"
-IPV4=$(hostname -I 2>/dev/null | awk '{print $1}')
-sed -i "s/^#\?SOLR_HEAP=.*/SOLR_HEAP=\"${SOLR_HEAP}\"/" /etc/default/solr.in.sh
-sed -i "s|^#\?SOLR_JAVA_MEM=.*|SOLR_JAVA_MEM=\"${SOLR_JAVA_MEM}\"|" /etc/default/solr.in.sh
-if grep -q '^#\?ZK_HOST=' /etc/default/solr.in.sh; then
-  sed -i "s|^#\?ZK_HOST=.*|ZK_HOST=\"${SOLR_ZK_HOST}\"|" /etc/default/solr.in.sh
-else
-  echo "ZK_HOST=\"${SOLR_ZK_HOST}\"" >> /etc/default/solr.in.sh
-fi
-sed -i "s|^#\?SOLR_JETTY_HOST=.*|SOLR_JETTY_HOST=\"${IPV4}\"|" /etc/default/solr.in.sh
-systemctl restart solr
+( set -e
+  SOLR_TGZ="solr-${SOLR_VER}.tgz"
+  fetch_pkg solr "$SOLR_TGZ" || curl -L "https://archive.apache.org/dist/lucene/solr/${SOLR_VER}/${SOLR_TGZ}" -o "$SOLR_TGZ"
+  [[ -f "$SOLR_TGZ" ]] || { echo "Solr tgz missing"; exit 1; }
+  tar -xvzf "$SOLR_TGZ" "solr-${SOLR_VER}/bin/install_solr_service.sh" --strip-components=2
+  bash ./install_solr_service.sh "$SOLR_TGZ"
+  IPV4=$(hostname -I 2>/dev/null | awk '{print $1}')
+  sed -i "s/^#\?SOLR_HEAP=.*/SOLR_HEAP=\"${SOLR_HEAP}\"/" /etc/default/solr.in.sh
+  sed -i "s|^#\?SOLR_JAVA_MEM=.*|SOLR_JAVA_MEM=\"${SOLR_JAVA_MEM}\"|" /etc/default/solr.in.sh
+  if grep -q '^#\?ZK_HOST=' /etc/default/solr.in.sh; then
+    sed -i "s|^#\?ZK_HOST=.*|ZK_HOST=\"${SOLR_ZK_HOST}\"|" /etc/default/solr.in.sh
+  else
+    echo "ZK_HOST=\"${SOLR_ZK_HOST}\"" >> /etc/default/solr.in.sh
+  fi
+  sed -i "s|^#\?SOLR_JETTY_HOST=.*|SOLR_JETTY_HOST=\"${IPV4}\"|" /etc/default/solr.in.sh
+  systemctl restart solr
 
-# Autopsy configset
-AUTOPSY_ZIP="SOLR_8.6.3_AutopsyService.zip"
-fetch_pkg autopsy "$AUTOPSY_ZIP" || curl -L "https://sourceforge.net/projects/autopsy/files/CollaborativeServices/Solr/${AUTOPSY_ZIP}/download" -o "$AUTOPSY_ZIP"
-mkdir -p /opt/autopsy-solr; unzip -o "$AUTOPSY_ZIP" -d /opt/autopsy-solr >/dev/null
-CONF_DIR=$(find /opt/autopsy-solr -type d -path "*/AutopsyConfig/conf" | head -1 || true)
-chown -R solr:solr /opt/autopsy-solr
-[[ -n "$CONF_DIR" ]] && sudo -u solr /opt/solr/bin/solr create_collection -c AutopsyConfig -d "$CONF_DIR" || true
+  # Autopsy configset
+  AUTOPSY_ZIP="SOLR_8.6.3_AutopsyService.zip"
+  fetch_pkg autopsy "$AUTOPSY_ZIP" || curl -L "https://sourceforge.net/projects/autopsy/files/CollaborativeServices/Solr/${AUTOPSY_ZIP}/download" -o "$AUTOPSY_ZIP"
+  [[ -f "$AUTOPSY_ZIP" ]] || { echo "Autopsy Solr config zip missing"; exit 1; }
+  mkdir -p /opt/autopsy-solr; unzip -o "$AUTOPSY_ZIP" -d /opt/autopsy-solr >/dev/null
+  CONF_DIR=$(find /opt/autopsy-solr -type d -path "*/AutopsyConfig/conf" | head -1 || true)
+  chown -R solr:solr /opt/autopsy-solr
+  [[ -n "$CONF_DIR" ]] && sudo -u solr /opt/solr/bin/solr create_collection -c AutopsyConfig -d "$CONF_DIR" || true
+) || fail_note "solr" "install/config failed"
 
 #####################################
-# ActiveMQ (pinned)
+# ActiveMQ (pinned) — soft-fail
 #####################################
-ACTIVEMQ_TGZ="apache-activemq-${ACTIVEMQ_VER}-bin.tar.gz"
-fetch_pkg activemq "$ACTIVEMQ_TGZ" || curl -L "https://archive.apache.org/dist/activemq/${ACTIVEMQ_VER}/${ACTIVEMQ_TGZ}" -o "$ACTIVEMQ_TGZ"
-id activemq >/dev/null 2>&1 || useradd --system -s /usr/sbin/nologin activemq
-mkdir -p /opt/activemq; tar -xzf "$ACTIVEMQ_TGZ" -C /opt/activemq --strip-components 1
-chown -R activemq:activemq /opt/activemq
-cat >/etc/systemd/system/activemq.service <<'EOF'
+( set -e
+  ACTIVEMQ_TGZ="apache-activemq-${ACTIVEMQ_VER}-bin.tar.gz"
+  fetch_pkg activemq "$ACTIVEMQ_TGZ" || curl -L "https://archive.apache.org/dist/activemq/${ACTIVEMQ_VER}/${ACTIVEMQ_TGZ}" -o "$ACTIVEMQ_TGZ"
+  [[ -f "$ACTIVEMQ_TGZ" ]] || { echo "ActiveMQ tarball missing"; exit 1; }
+  id activemq >/dev/null 2>&1 || useradd --system -s /usr/sbin/nologin activemq
+  mkdir -p /opt/activemq; tar -xzf "$ACTIVEMQ_TGZ" -C /opt/activemq --strip-components 1
+  chown -R activemq:activemq /opt/activemq
+  cat >/etc/systemd/system/activemq.service <<'EOF'
 [Unit]
 Description=Apache ActiveMQ
 After=network.target
@@ -776,13 +790,15 @@ ExecStop=/opt/activemq/bin/activemq stop
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload; systemctl enable activemq --now
+  systemctl daemon-reload; systemctl enable activemq --now
+) || fail_note "activemq" "install/config failed"
 
 #####################################
-# systemd units: Piranha & Barracuda
+# systemd units: Piranha & Barracuda (soft-fail-ish — only if present)
 #####################################
-if [[ -x /opt/piranha/.venv/bin/python && -f /opt/piranha/piranha.py ]]; then
-  cat >/etc/systemd/system/piranha.service <<EOF
+( set -e
+  if [[ -x /opt/piranha/.venv/bin/python && -f /opt/piranha/piranha.py ]]; then
+    cat >/etc/systemd/system/piranha.service <<EOF
 [Unit]
 Description=WADE Piranha (DFIR helper)
 After=network-online.target
@@ -810,12 +826,12 @@ AmbientCapabilities=
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now piranha.service || true
-fi
+    systemctl daemon-reload
+    systemctl enable --now piranha.service || true
+  fi
 
-if [[ -x /opt/barracuda/.venv/bin/python && -f /opt/barracuda/app.py ]]; then
-  cat >/etc/systemd/system/barracuda.service <<EOF
+  if [[ -x /opt/barracuda/.venv/bin/python && -f /opt/barracuda/app.py ]]; then
+    cat >/etc/systemd/system/barracuda.service <<EOF
 [Unit]
 Description=WADE Barracuda (DFIR helper)
 After=network-online.target
@@ -843,14 +859,16 @@ AmbientCapabilities=
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now barracuda.service || true
-fi
+    systemctl daemon-reload
+    systemctl enable --now barracuda.service || true
+  fi
+) || fail_note "systemd_helpers" "unit creation failed"
 
 #####################################
-# PostgreSQL (Ubuntu path)
+# PostgreSQL (Ubuntu path) — soft-fail on install/config
 #####################################
 if [[ "$PM" == "apt" ]]; then
+( set -e
   bash -lc "$PKG_INSTALL postgresql"
   systemctl enable postgresql
   PG_VER=$(psql -V | awk '{print $3}' | cut -d. -f1)
@@ -864,10 +882,11 @@ if [[ "$PM" == "apt" ]]; then
   if [[ "${PG_CREATE_AUTOPSY_USER:-1}" == "1" && "$NONINTERACTIVE" -eq 0 ]]; then
     echo "[*] Create Postgres role 'autopsy' (for Autopsy DB)…"
     read -s -p "Password for postgres role 'autopsy': " DBP1; echo; read -s -p "Confirm: " DBP2; echo
-    [[ "$DBP1" == "$DBP2" && -n "$DBP1" ]] || die "Passwords mismatch/empty"
+    [[ "$DBP1" == "$DBP2" && -n "$DBP1" ]] || { echo "DB password mismatch/empty"; exit 1; }
     sudo -u postgres psql -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='autopsy') THEN CREATE USER autopsy WITH ENCRYPTED PASSWORD '${DBP1}'; END IF; END \$\$;"
     sudo -u postgres psql -c "ALTER USER autopsy CREATEDB;"
   fi
+) || fail_note "postgresql" "install/config failed"
 fi
 
 #####################################
@@ -896,17 +915,18 @@ chmod 600 "$ENV_FILE"
 
 IPV4=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo
-echo "[+] WADE install complete."
+echo "[+] WADE install attempted."
 echo "    Shares: //${IPV4}/${WADE_DATADIR} //${IPV4}/${WADE_CASESDIR} //${IPV4}/${WADE_STAGINGDIR}"
 echo "    Zookeeper : 127.0.0.1:2181"
 echo "    Solr (UI) : http://${IPV4}:8983/solr/#/~cloud"
 echo "    ActiveMQ  : ${IPV4}:61616"
 echo "    Postgres  : ${IPV4}:5432"
 echo "    Tools     : vol3, dissect, bulk_extractor (+ piranha, barracuda, hayabusa)"
-echo "    Rules     : Hayabusa→${HAYABUSA_RULES_DIR}  Sigma→${SIGMA_RULES_DIR}"
-echo "    Services  : piranha.service, barracuda.service (journalctl -u <name> -f)"
+echo "    Hayabusa  : binary at ${HAYABUSA_DEST}; rules/config copied if present"
 echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts)"
 echo "    Log       : ${LOG_FILE}"
 echo
 echo "NOTE: New tools default to SPLUNK index: '${SPLUNK_DEFAULT_INDEX:-wade_custom}'."
-echo "      Change in ${WADE_ETC}/wade.conf or override per-module later."
+
+# Final summary + non-zero exit if anything failed
+finish_summary
