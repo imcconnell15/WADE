@@ -4,7 +4,7 @@
 
 # NOTE: keep LF endings (use `dos2unix install.sh` if needed)
 
-set -Euo pipefail   # no -e; still strict on unset + pipefail
+set -Euo pipefail   # no -e (we soft-fail via step runner); still strict on unset + pipefail
 
 #####################################
 # Banner
@@ -615,10 +615,22 @@ run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_be '
   BUILD_DIR="$(mktemp -d /var/tmp/wade/build/be.XXXXXX)"
 
   if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL -y --no-install-recommends git ca-certificates build-essential autoconf automake libtool pkg-config flex bison libewf-dev libssl-dev zlib1g-dev libxml2-dev libexiv2-dev libtre-dev libsqlite3-dev libpcap-dev libre2-dev libpcre3-dev libexpat1-dev || true"
+    # Ubuntu/Debian build deps
+    bash -lc "$PKG_INSTALL --no-install-recommends \
+      git ca-certificates build-essential autoconf automake libtool pkg-config \
+      flex bison libewf-dev libssl-dev zlib1g-dev libxml2-dev libexiv2-dev \
+      libtre-dev libsqlite3-dev libpcap-dev libre2-dev libpcre3-dev libexpat1-dev" || true
   else
-    bash -lc "$PKG_INSTALL -y @'Development Tools' || true"
-    bash -lc "$PKG_INSTALL -y git ca-certificates libewf-devel openssl-devel zlib-devel libxml2-devel exiv2-devel tre-devel sqlite-devel libpcap-devel re2-devel pcre-devel expat-devel flex bison || true"
+    # RHEL/Oracle/Fedora build deps (use groupinstall for toolchain)
+    if have_cmd dnf; then
+      dnf -y groupinstall "Development Tools" || true
+    else
+      yum -y groupinstall "Development Tools" || true
+    fi
+    bash -lc "$PKG_INSTALL \
+      git ca-certificates libewf-devel openssl-devel zlib-devel libxml2-devel \
+      exiv2-devel tre-devel sqlite-devel libpcap-devel re2-devel pcre-devel \
+      expat-devel flex bison" || true
   fi
 
   OFFLINE_TGZ="${WADE_PKG_DIR:-/var/wade/pkg}/bulk_extractor/bulk_extractor-src.tar.gz"
@@ -662,6 +674,7 @@ run_step "qtgl-runtime" "present" get_ver_qtgl '
     libegl1 libopengl0 libgl1 libxkbcommon-x11-0 \
     libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
     libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1 \
+    libxcb-cursor0 \
     fonts-dejavu-core"
 ' || fail_note "qtgl-runtime" "Qt/GL libs missing"
 fi
@@ -673,7 +686,14 @@ get_ver_piranha(){ [[ -x /usr/local/bin/piranha && -d /opt/piranha/.venv ]] && e
 if [[ "${MOD_PIRANHA_ENABLED:-1}" == "1" ]]; then
 run_step "piranha" "installed" get_ver_piranha '
   set -e
-  install -d /opt/piranha
+  #install -d /opt/piranha
+  # Ensure runtime dirs and ownership for the service user
+  install -d /opt/piranha /opt/piranha/.config/matplotlib /var/log/wade/piranha
+  chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha /var/log/wade/piranha
+
+  # Optional: centralize log target while app still writes /opt/piranha/APT_Report.log
+  ln -sf /var/log/wade/piranha/APT_Report.log /opt/piranha/APT_Report.log || true
+  chown -h "${LWADEUSER}:${LWADEUSER}" /opt/piranha/APT_Report.log || true
   if [[ "$OFFLINE" == "1" ]]; then
     PKG_ARC="$(ls "${WADE_PKG_DIR}/piranha/"piranha*.tar.gz "${WADE_PKG_DIR}/piranha/"piranha*.zip 2>/dev/null | head -1 || true)"
     [[ -n "$PKG_ARC" ]] || { echo "offline Piranha archive missing"; exit 1; }
@@ -689,6 +709,10 @@ run_step "piranha" "installed" get_ver_piranha '
   [[ -f /opt/piranha/requirements.txt ]] && /opt/piranha/.venv/bin/pip install -r /opt/piranha/requirements.txt || true
   cat >/usr/local/bin/piranha <<'EOF'
 #!/usr/bin/env bash
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
+export HOME="/opt/piranha"
+export XDG_CONFIG_HOME="/opt/piranha/.config"
+export MPLCONFIGDIR="/opt/piranha/.config/matplotlib"
 cd /opt/piranha
 exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"
 EOF
@@ -697,7 +721,7 @@ EOF
 fi
 
 #####################################
-# Barracuda (soft-fail; fetch MITRE JSON; cd wrapper)
+# Barracuda (soft-fail; fetch MITRE JSON; cd wrapper; absolute JSON path)
 #####################################
 get_ver_barracuda(){
   [[ -x /usr/local/bin/barracuda && -d /opt/barracuda/.venv ]] || { echo ""; return; }
@@ -717,28 +741,72 @@ run_step "barracuda" "installed" get_ver_barracuda '
   else
     [[ -d /opt/barracuda/.git ]] || git clone https://github.com/williamjsmail/Barracuda /opt/barracuda || true
   fi
+
+  # venv + deps
   python3 -m venv /opt/barracuda/.venv || python3 -m virtualenv /opt/barracuda/.venv
   /opt/barracuda/.venv/bin/pip install --upgrade pip
   [[ -f /opt/barracuda/requirements.txt ]] && /opt/barracuda/.venv/bin/pip install -r /opt/barracuda/requirements.txt || true
-  # MITRE ATT&CK JSON (name expected by the app)
+
+  # Ensure MITRE JSON is present at the canonical location
   if [[ ! -f /opt/barracuda/enterprise-attack.json ]]; then
     if [[ -f "${WADE_PKG_DIR}/mitre/enterprise-attack.json" ]]; then
       cp "${WADE_PKG_DIR}/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
     elif [[ "$OFFLINE" == "1" && -f "${OFFLINE_SRC}/mitre/enterprise-attack.json" ]]; then
       cp "${OFFLINE_SRC}/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
     else
-      curl -fsSL \
-        https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json \
+      curl -fsSL https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json \
         -o /opt/barracuda/enterprise-attack.json
     fi
   fi
-  # Wrapper ensures correct working directory
-  cat >/usr/local/bin/barracuda <<'EOF'
+
+  # **** Hard patch: change relative JSON to absolute path ****
+  # techniques = load_techniques_enriched("enterprise-attack.json")
+  # -> techniques = load_techniques_enriched("/opt/barracuda/enterprise-attack.json")
+  sed -i -E \
+    '\''s|load_techniques_enriched\("enterprise-attack\.json"\)|load_techniques_enriched("/opt/barracuda/enterprise-attack.json")|'\'' \
+    /opt/barracuda/app.py || true
+
+  # Wrapper to enforce correct CWD + headless Qt
+  cat >/usr/local/bin/barracuda <<'\''EOF'\''
 #!/usr/bin/env bash
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 cd /opt/barracuda
 exec /opt/barracuda/.venv/bin/python /opt/barracuda/app.py "$@"
 EOF
   chmod 0755 /usr/local/bin/barracuda
+
+  # systemd unit (WorkingDirectory + env file)
+  cat >/etc/systemd/system/barracuda.service <<EOF
+[Unit]
+Description=WADE Barracuda (DFIR helper)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/barracuda/.venv/bin/python
+ConditionPathExists=/opt/barracuda/app.py
+
+[Service]
+Type=simple
+User=${LWADEUSER}
+Group=${LWADEUSER}
+WorkingDirectory=/opt/barracuda
+EnvironmentFile=-/etc/wade/wade.env
+Environment=PYTHONUNBUFFERED=1
+Environment=QT_QPA_PLATFORM=offscreen
+# (App still uses its own defaults; env variables are documented in wade.env)
+ExecStart=/opt/barracuda/.venv/bin/python /opt/barracuda/app.py
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now barracuda.service || true
 ' || fail_note "barracuda" "setup failed"
 fi
 
@@ -751,23 +819,25 @@ run_step "hayabusa" "" get_ver_hayabusa '
   echo "[*] Installing Hayabusa…"
   install -d "$(dirname "${HAYABUSA_DEST}")"
 
-  HAY_ARCH="$(detect_hayabusa_arch)"
+  # Defensive: make sure HAY_ARCH is set before any use (nounset-safe)
+  HAY_ARCH="${HAY_ARCH:-$(detect_hayabusa_arch)}"
   HAY_ZIP=""
-  HAY_ZIP_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa/"hayabusa-*-${HAY_ARCH}.zip 2>/dev/null | sort -V | tail -1 || true)"
+  HAY_ZIP_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa/"hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
+
   if [[ -n "$HAY_ZIP_LOCAL" ]]; then
     cp "$HAY_ZIP_LOCAL" .
     HAY_ZIP="$(basename "$HAY_ZIP_LOCAL")"
   elif [[ "$OFFLINE" == "1" ]]; then
-    HAY_ZIP_USB="$(ls "${OFFLINE_SRC}/hayabusa/"hayabusa-*-${HAY_ARCH}.zip 2>/dev/null | sort -V | tail -1 || true)"
-    [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '${HAY_ARCH}' not found offline"; exit 1; }
+    HAY_ZIP_USB="$(ls "${OFFLINE_SRC}/hayabusa/"hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
+    [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '${HAY_ARCH:-}' not found offline"; exit 1; }
     cp "$HAY_ZIP_USB" .
     HAY_ZIP="$(basename "$HAY_ZIP_USB")"
   else
     if have_cmd curl && have_cmd jq; then
-      echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH}…"
+      echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
       DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
-        | jq -r --arg pat "$HAY_ARCH" ".assets[] | select(.name | test(\$pat)) | .browser_download_url" | head -1)"
-      [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH}"; exit 1; }
+        | jq -r --arg pat "${HAY_ARCH:-}" ".assets[] | select(.name | test(\$pat)) | .browser_download_url" | head -1)"
+      [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH:-}"; exit 1; }
       HAY_ZIP="$(basename "$DL_URL")"
       curl -L "$DL_URL" -o "$HAY_ZIP"
     else
@@ -922,40 +992,50 @@ ProtectHome=true
 [Install]
 WantedBy=multi-user.target
 EOF
+
+
+
+
     systemctl daemon-reload
     systemctl enable --now piranha.service || true
   fi
 
   if [[ -x /opt/barracuda/.venv/bin/python && -f /opt/barracuda/app.py ]]; then
-    cat >/etc/systemd/system/barracuda.service <<EOF
+    cat >/etc/systemd/system/piranha.service <<EOF
 [Unit]
-Description=WADE Barracuda (DFIR helper)
+Description=WADE Piranha (DFIR helper)
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=/opt/barracuda/.venv/bin/python
-ConditionPathExists=/opt/barracuda/app.py
+ConditionPathExists=/opt/piranha/.venv/bin/python
+ConditionPathExists=/opt/piranha/piranha.py
 
 [Service]
 Type=simple
 User=${LWADEUSER}
 Group=${LWADEUSER}
-WorkingDirectory=/opt/barracuda
+WorkingDirectory=/opt/piranha
 EnvironmentFile=-/etc/wade/wade.env
 Environment=PYTHONUNBUFFERED=1
 Environment=QT_QPA_PLATFORM=offscreen
-ExecStart=/opt/barracuda/.venv/bin/python /opt/barracuda/app.py
-Restart=on-failure
-RestartSec=5s
+Environment=HOME=/opt/piranha
+Environment=XDG_CONFIG_HOME=/opt/piranha/.config
+Environment=MPLCONFIGDIR=/opt/piranha/.config/matplotlib
+ReadWritePaths=/opt/piranha /var/log/wade/piranha
+ProtectHome=true
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-ProtectHome=true
+
+ExecStart=/opt/piranha/.venv/bin/python /opt/piranha/piranha.py
+Restart=on-failure
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now barracuda.service || true
+
+systemctl daemon-reload
+systemctl enable --now piranha.service || true
   fi
 ) || fail_note "systemd_helpers" "unit creation failed"
 
@@ -989,9 +1069,10 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" ]]; then
 run_step "stig-prereqs" "installed" get_ver_stig '
   set -e
   if [[ "$PM" == "apt" ]]; then
-    # Known-good set on Ubuntu; plus fallback
+    # Known-good on Ubuntu
     bash -lc "$PKG_INSTALL openscap-scanner unzip ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications" || true
-    bash -lc "$PKG_INSTALL scap-security-guide" || true
+    # Only try scap-security-guide if it actually exists (avoid noisy E: lines)
+    bash -lc "apt-cache show scap-security-guide >/dev/null 2>&1 && $PKG_INSTALL scap-security-guide || true"
   else
     bash -lc "$PKG_INSTALL openscap-scanner unzip" || true
     bash -lc "$PKG_INSTALL scap-security-guide" || true
@@ -1051,11 +1132,18 @@ ACTIVEMQ_MQTT_PORT="1883"
 ACTIVEMQ_WS_PORT="61614"
 POSTGRES_PORT="5432"
 PIRANHA_PORT="5001"
-BARRACUDA_PORT="5002"
+BARRACUDA_PORT="5000"
 SPLUNK_WEB_PORT="8000"
 SPLUNK_MGMT_PORT="8089"
 SPLUNK_HEC_PORT="8088"
 SPLUNK_FORWARD_PORT="9997"
+
+# Barracuda runtime (Flask)
+BARRACUDA_APP_DIR="/opt/barracuda"
+BARRACUDA_HOST="0.0.0.0"
+BARRACUDA_PORT="5000"
+BARRACUDA_JSON_PATH="/opt/barracuda/enterprise-attack.json"
+BARRACUDA_UPLOADS_DIR="/opt/barracuda/uploads"
 
 WADE_SERVICE_PORTS_CSV="\${SSH_PORT},\${SMB_TCP_139},\${SMB_TCP_445},\${SMB_UDP_137},\${SMB_UDP_138},\${ZK_CLIENT_PORT},\${ZK_QUORUM_PORT},\${ZK_ELECTION_PORT},\${SOLR_PORT},\${ACTIVEMQ_OPENWIRE_PORT},\${ACTIVEMQ_WEB_CONSOLE_PORT},\${ACTIVEMQ_AMQP_PORT},\${ACTIVEMQ_STOMP_PORT},\${ACTIVEMQ_MQTT_PORT},\${ACTIVEMQ_WS_PORT},\${POSTGRES_PORT},\${PIRANHA_PORT},\${BARRACUDA_PORT},\${SPLUNK_WEB_PORT},\${SPLUNK_MGMT_PORT},\${SPLUNK_HEC_PORT},\${SPLUNK_FORWARD_PORT}"
 ENV
@@ -1068,6 +1156,7 @@ echo "    Zookeeper : 127.0.0.1:${ZK_CLIENT_PORT:-2181}"
 echo "    Solr (UI) : http://${IPV4}:${SOLR_PORT:-8983}/solr/#/~cloud"
 echo "    ActiveMQ  : ${IPV4}:${ACTIVEMQ_OPENWIRE_PORT:-61616} (web console :${ACTIVEMQ_WEB_CONSOLE_PORT:-8161})"
 echo "    Postgres  : ${IPV4}:${POSTGRES_PORT:-5432}"
+echo "    Barracuda  : ${IPV4}:5000"
 echo "    Tools     : vol3, dissect, bulk_extractor (+ piranha, barracuda, hayabusa)"
 echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
 echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
@@ -1080,32 +1169,55 @@ echo "NOTE: New tools default to SPLUNK index: '${SPLUNK_DEFAULT_INDEX:-wade_cus
 #####################################
 stig_list_profiles() {
   # $1 = DS or Benchmark XML
-  oscap info "$1" 2>/dev/null \
-    | awk -F': ' '/^ *Profile/{print $2}' \
-    | awk '{print $1}'
+  # Handles DISA “Profiles:” block (indented) with “Id: …” plus generic fallbacks.
+  local info
+  info="$(oscap info "$1" 2>/dev/null || true)"
+
+  {
+    # (1) “Profiles:” block → grab Id:
+    printf '%s\n' "$info" | awk '
+      BEGIN{inside=0}
+      /^[[:space:]]*Profiles:/ {inside=1; next}
+      inside && /^[[:space:]]*Id:[[:space:]]*/ {
+        sub(/^[[:space:]]*Id:[[:space:]]*/,"")
+        print $1
+      }
+    '
+    # (2) Generic “Profile: <id>”
+    printf '%s\n' "$info" | sed -nE 's/^[[:space:]]*Profile[[:space:]]*:[[:space:]]*([[:alnum:]_.:-]+).*/\1/p'
+    # (3) Generic “… (<id>)”
+    printf '%s\n' "$info" | sed -nE 's/^[[:space:]]*Profile.*\(([[:alnum:]_.:-]+)\).*/\1/p'
+  } | awk 'NF' | sort -u
 }
+
 stig_pick_profile_interactive() {
+  # All UI goes to stderr so command-substitution can capture only the chosen ID on stdout.
   local ds="$1"
   mapfile -t PROFILES < <(stig_list_profiles "$ds")
+
   if [[ ${#PROFILES[@]} -eq 0 ]]; then
-    echo "[!] No profiles found in: $ds" >&2
+    >&2 echo "[!] No profiles parsed from 'oscap info'."
+    >&2 echo "    Type a profile ID manually, or press Enter to use default:"
+    >&2 echo "    Default: ${STIG_PROFILE_ID:-<none set>}"
+    read -r -p "Profile ID: " manual
+    [[ -n "$manual" ]] && { printf '%s\n' "$manual"; return 0; }
+    [[ -n "${STIG_PROFILE_ID:-}" ]] && { printf '%s\n' "${STIG_PROFILE_ID}"; return 0; }
     return 1
   fi
-  echo "Available profiles:"
+
+  >&2 echo "Available profiles:"
   local i=1
-  for p in "${PROFILES[@]}"; do
-    printf "  %2d) %s\n" "$i" "$p"
-    ((i++))
-  done
+  for p in "${PROFILES[@]}"; do >&2 printf "  %2d) %s\n" "$i" "$p"; ((i++)); done
   local def=1
   read -r -p "Choose profile [${def}]: " idx
   idx="${idx:-$def}"
   if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#PROFILES[@]} )); then
-    echo "[!] Invalid selection." >&2
+    >&2 echo "[!] Invalid selection."
     return 1
   fi
-  echo "${PROFILES[$((idx-1))]}"
+  printf '%s\n' "${PROFILES[$((idx-1))]}"
 }
+
 stig_skip_args() {
   local s="${STIG_SKIP_RULES:-}"; [[ -z "$s" ]] && return 0
   IFS=',' read -ra arr <<< "$s"
@@ -1125,14 +1237,17 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
       # Pick latest zip or xml from ./stigs
       CAND_ZIP="$(ls -1 "${STIG_SRC_DIR}"/*.zip 2>/dev/null | sort -V | tail -1 || true)"
       CAND_XML="$(ls -1 "${STIG_SRC_DIR}"/*.xml "${STIG_SRC_DIR}"/*.XML 2>/dev/null | sort -V | tail -1 || true)"
-      DS_FILE=""
-      TMP_EXTRACT=""
+      DS_FILE=""; TMP_EXTRACT=""
+
       if [[ -n "$CAND_ZIP" ]]; then
         echo "[*] Using ZIP: $(basename "$CAND_ZIP")"
         TMP_EXTRACT="$(mktemp -d)"
         unzip -oq "$CAND_ZIP" -d "$TMP_EXTRACT"
-        DS_FILE="$(find "$TMP_EXTRACT" -type f -iname '*-ds.xml' | head -1 || true)"
-        [[ -z "$DS_FILE" ]] && DS_FILE="$(find "$TMP_EXTRACT" -type f -iname '*Benchmark*.xml' | head -1 || true)"
+        # Prefer datastreams; then fall back to Benchmark XML
+        for pat in '*-ds.xml' '*-datastream.xml' '*-xccdf.xml' '*Benchmark*.xml'; do
+          DS_FILE="$(find "$TMP_EXTRACT" -type f -iname "$pat" | head -1 || true)"
+          [[ -n "$DS_FILE" ]] && break
+        done
       elif [[ -n "$CAND_XML" ]]; then
         echo "[*] Using XML: $(basename "$CAND_XML")"
         DS_FILE="$CAND_XML"
