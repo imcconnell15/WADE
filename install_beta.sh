@@ -213,8 +213,9 @@ ACTIVEMQ_VER="5.14.0"
 # Java (headless recommended)
 JAVA_PACKAGE_APT="default-jre-headless"
 JAVA_PACKAGE_RPM="java-11-openjdk-headless"
-SOLR_HEAP="96G"
-SOLR_JAVA_MEM='-Xms16G -Xmx96G'
+SOLR_HEAP=""
+# Leave SOLR_HEAP blank so Solr uses SOLR_JAVA_MEM below (Xms 24G, Xmx 48G).
+SOLR_JAVA_MEM=\'-Xms24G -Xmx48G\'
 SOLR_ZK_HOST="127.0.0.1"
 
 # PostgreSQL lab settings (unsafe for prod)
@@ -389,7 +390,7 @@ else
   read -r -p "Hostname for this WADE server [${DEFAULT_HOSTNAME}]: " LWADE; LWADE="${LWADE:-$DEFAULT_HOSTNAME}"
   read -r -p "Primary Linux user to own shares [${DEFAULT_OWNER}]: " LWADEUSER; LWADEUSER="${LWADEUSER:-$DEFAULT_OWNER}"
   read -r -p "Samba users (comma-separated) [${DEFAULT_SMB_USERS}]: " SMB_USERS_CSV; SMB_USERS_CSV="${SMB_USERS_CSV:-$DEFAULT_SMB_USERS}"
-  read -r -p "Allowed networks CSV (optional) [${DEFAULT_ALLOW_NETS}]: " ALLOW_NETS_CSV; ALLOW_NETS_CSV="${ALLOW_NETS_CSV:-$DEFAULT_ALLOW_NETS}"
+  read -r -p "Allowed networks CSV (ex. 10.0.0.0/24,10.0.1.0/24) [${DEFAULT_ALLOW_NETS}]: " ALLOW_NETS_CSV; ALLOW_NETS_CSV="${ALLOW_NETS_CSV:-$DEFAULT_ALLOW_NETS}"
 fi
 hostnamectl set-hostname "$LWADE" || true
 
@@ -677,46 +678,95 @@ run_step "qtgl-runtime" "present" get_ver_qtgl '
     libxcb-cursor0 \
     fonts-dejavu-core"
 ' || fail_note "qtgl-runtime" "Qt/GL libs missing"
+
+#####################################
+# SSH X11 forwarding (server-side GUI over ssh -X)
+#####################################
+get_ver_x11fwd(){
+  if [[ "$PM" == "apt" ]]; then
+    dpkg -s xauth >/dev/null 2>&1 || { echo ""; return; }
+  else
+    rpm -q xorg-x11-xauth >/dev/null 2>&1 || rpm -q xauth >/dev/null 2>&1 || { echo ""; return; }
+  fi
+  grep -qiE '^\s*X11Forwarding\s+yes' /etc/ssh/sshd_config && echo configured || echo ""
+}
+
+run_step "x11-forwarding" "configured" get_ver_x11fwd '
+  set -e
+  if [[ "$PM" == "apt" ]]; then
+    bash -lc "$PKG_INSTALL xauth x11-apps"
+  else
+    bash -lc "$PKG_INSTALL xorg-x11-xauth || $PKG_INSTALL xauth || true"
+  fi
+
+  sed -ri "s/^\s*#?\s*X11Forwarding.*/X11Forwarding yes/" /etc/ssh/sshd_config
+  if grep -qiE "^\s*X11UseLocalhost" /etc/ssh/sshd_config; then
+    sed -ri "s/^\s*#?\s*X11UseLocalhost.*/X11UseLocalhost yes/" /etc/ssh/sshd_config
+  else
+    echo "X11UseLocalhost yes" >> /etc/ssh/sshd_config
+  fi
+  if ! grep -qiE "^\s*X11DisplayOffset" /etc/ssh/sshd_config; then
+    echo "X11DisplayOffset 10" >> /etc/ssh/sshd_config
+  fi
+
+  systemctl restart ssh || systemctl restart sshd || true
+
+  # Prepare per-user X and matplotlib dirs so GUIs can run without sudo -E
+  su - "${LWADEUSER}" -c "mkdir -p ~/.config/matplotlib; touch ~/.Xauthority; chmod 600 ~/.Xauthority" || true
+' || fail_note "x11-forwarding" "setup failed"
+
 fi
 
 #####################################
-# Piranha (soft-fail)
+# Piranha (install only; GUI via ssh -X, no systemd)
 #####################################
 get_ver_piranha(){ [[ -x /usr/local/bin/piranha && -d /opt/piranha/.venv ]] && echo installed || echo ""; }
+
 if [[ "${MOD_PIRANHA_ENABLED:-1}" == "1" ]]; then
 run_step "piranha" "installed" get_ver_piranha '
   set -e
-  #install -d /opt/piranha
-  # Ensure runtime dirs and ownership for the service user
-  install -d /opt/piranha /opt/piranha/.config/matplotlib /var/log/wade/piranha
+  # Runtime dirs + ownership
+  install -d /opt/piranha /var/log/wade/piranha
   chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha /var/log/wade/piranha
 
-  # Optional: centralize log target while app still writes /opt/piranha/APT_Report.log
-  ln -sf /var/log/wade/piranha/APT_Report.log /opt/piranha/APT_Report.log || true
-  chown -h "${LWADEUSER}:${LWADEUSER}" /opt/piranha/APT_Report.log || true
+  # Ensure the path Piranha currently logs to exists and is writable
+  install -d /opt/piranha/Documents/PiranhaLogs
+  chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha/Documents
+
+  # Symlink APT_Report.log into central logs
+  ln -sf /var/log/wade/piranha/APT_Report.log /opt/piranha/Documents/PiranhaLogs/APT_Report.log || true
+
+  # Get sources (online/offline)
   if [[ "$OFFLINE" == "1" ]]; then
     PKG_ARC="$(ls "${WADE_PKG_DIR}/piranha/"piranha*.tar.gz "${WADE_PKG_DIR}/piranha/"piranha*.zip 2>/dev/null | head -1 || true)"
     [[ -n "$PKG_ARC" ]] || { echo "offline Piranha archive missing"; exit 1; }
     cp "$PKG_ARC" /opt/piranha/
     pushd /opt/piranha >/dev/null
-    [[ "$PKG_ARC" == *.zip ]] && unzip -o "$(basename "$PKG_ARC")" || tar -xzf "$(basename "$PKG_ARC")"
+    [[ "$PKG_ARC" == *.zip ]] && unzip -o "$(basename "$PKG_ARC}")" || tar -xzf "$(basename "$PKG_ARC")"
     popd >/dev/null
   else
     [[ -d /opt/piranha/.git ]] || git clone https://github.com/williamjsmail/piranha /opt/piranha || true
   fi
+
+  # venv + deps
   python3 -m venv /opt/piranha/.venv || python3 -m virtualenv /opt/piranha/.venv
   /opt/piranha/.venv/bin/pip install --upgrade pip
   [[ -f /opt/piranha/requirements.txt ]] && /opt/piranha/.venv/bin/pip install -r /opt/piranha/requirements.txt || true
-  cat >/usr/local/bin/piranha <<'EOF'
+
+  # GUI wrapper (runs as calling user, no sudo/-E needed)
+  cat >/usr/local/bin/piranha <<'"EOF"'
 #!/usr/bin/env bash
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
-export HOME="/opt/piranha"
-export XDG_CONFIG_HOME="/opt/piranha/.config"
-export MPLCONFIGDIR="/opt/piranha/.config/matplotlib"
+set -euo pipefail
+# Prefer X11 rendering when DISPLAY is set; otherwise Qt picks a suitable backend.
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+# Per-user Matplotlib cache to avoid /opt writes
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$HOME/.config/matplotlib}"
+mkdir -p "$MPLCONFIGDIR"
 cd /opt/piranha
 exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"
 EOF
   chmod 0755 /usr/local/bin/piranha
+  chown "${LWADEUSER}:${LWADEUSER}" /usr/local/bin/piranha || true
 ' || fail_note "piranha" "setup failed"
 fi
 
@@ -766,6 +816,8 @@ run_step "barracuda" "installed" get_ver_barracuda '
     '\''s|load_techniques_enriched\("enterprise-attack\.json"\)|load_techniques_enriched("/opt/barracuda/enterprise-attack.json")|'\'' \
     /opt/barracuda/app.py || true
 
+  install -d -o autopsy -g autopsy -m 0750 /opt/barracuda/uploads
+
   # Wrapper to enforce correct CWD + headless Qt
   cat >/usr/local/bin/barracuda <<'\''EOF'\''
 #!/usr/bin/env bash
@@ -799,7 +851,7 @@ RestartSec=5s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-ProtectHome=true
+#ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
@@ -960,84 +1012,6 @@ EOF
   systemctl daemon-reload; systemctl enable activemq --now
 ' || fail_note "activemq" "install/config failed"
 
-#####################################
-# systemd units: Piranha & Barracuda (if present) — offscreen Qt
-#####################################
-( set -e
-  if [[ -x /opt/piranha/.venv/bin/python && -f /opt/piranha/piranha.py ]]; then
-    cat >/etc/systemd/system/piranha.service <<EOF
-[Unit]
-Description=WADE Piranha (DFIR helper)
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=/opt/piranha/.venv/bin/python
-ConditionPathExists=/opt/piranha/piranha.py
-
-[Service]
-Type=simple
-User=${LWADEUSER}
-Group=${LWADEUSER}
-WorkingDirectory=/opt/piranha
-EnvironmentFile=-/etc/wade/wade.env
-Environment=PYTHONUNBUFFERED=1
-Environment=QT_QPA_PLATFORM=offscreen
-ExecStart=/opt/piranha/.venv/bin/python /opt/piranha/piranha.py
-Restart=on-failure
-RestartSec=5s
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-
-
-
-    systemctl daemon-reload
-    systemctl enable --now piranha.service || true
-  fi
-
-  if [[ -x /opt/barracuda/.venv/bin/python && -f /opt/barracuda/app.py ]]; then
-    cat >/etc/systemd/system/piranha.service <<EOF
-[Unit]
-Description=WADE Piranha (DFIR helper)
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=/opt/piranha/.venv/bin/python
-ConditionPathExists=/opt/piranha/piranha.py
-
-[Service]
-Type=simple
-User=${LWADEUSER}
-Group=${LWADEUSER}
-WorkingDirectory=/opt/piranha
-EnvironmentFile=-/etc/wade/wade.env
-Environment=PYTHONUNBUFFERED=1
-Environment=QT_QPA_PLATFORM=offscreen
-Environment=HOME=/opt/piranha
-Environment=XDG_CONFIG_HOME=/opt/piranha/.config
-Environment=MPLCONFIGDIR=/opt/piranha/.config/matplotlib
-ReadWritePaths=/opt/piranha /var/log/wade/piranha
-ProtectHome=true
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-
-ExecStart=/opt/piranha/.venv/bin/python /opt/piranha/piranha.py
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now piranha.service || true
-  fi
-) || fail_note "systemd_helpers" "unit creation failed"
 
 #####################################
 # PostgreSQL (Ubuntu path; soft-fail)
