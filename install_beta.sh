@@ -215,7 +215,7 @@ JAVA_PACKAGE_APT="default-jre-headless"
 JAVA_PACKAGE_RPM="java-11-openjdk-headless"
 SOLR_HEAP=""
 # Leave SOLR_HEAP blank so Solr uses SOLR_JAVA_MEM below (Xms 24G, Xmx 48G).
-SOLR_JAVA_MEM=\'-Xms24G -Xmx48G\'
+SOLR_JAVA_MEM='-Xms24G -Xmx48G'
 SOLR_ZK_HOST="127.0.0.1"
 
 # PostgreSQL lab settings (unsafe for prod)
