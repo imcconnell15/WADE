@@ -53,6 +53,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)"
 # Primary place we look for DISA STIG zips/XML packaged with the repo
 STIG_SRC_DIR="${SCRIPT_DIR}/stigs"
 SPLUNK_SRC_DIR="${SCRIPT_DIR}"
+LOAD_PATCH_DIR="${SCRIPT_DIR}"
 
 #####################################
 # CLI flags & basic env
@@ -867,6 +868,10 @@ run_step "piranha" "installed" get_ver_piranha '
   python3 -m venv /opt/piranha/.venv || python3 -m virtualenv /opt/piranha/.venv
   /opt/piranha/.venv/bin/pip install --upgrade pip
   [[ -f /opt/piranha/requirements.txt ]] && /opt/piranha/.venv/bin/pip install -r /opt/piranha/requirements.txt || true
+
+   FEIX="$(ls "$LOAD_PATCH_DIR"/*.py | sort -V | tail -1)"
+   rm -rf /opt/piranha/backend/loader.py
+   cp "$LOAD_PATCH_DIR/$FEIX" /opt/piranha/backend/loader.py
 
   # GUI wrapper (runs as calling user, no sudo/-E needed)
   cat >/usr/local/bin/piranha <<'"EOF"'
