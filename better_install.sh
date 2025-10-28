@@ -599,8 +599,9 @@ EOF
 
   # Create Samba passwords for listed users (interactive only)
   if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-    for u in '"'"'${SMBUSERS[@]}'"'"'; do
-      u="$(echo "$u" | xargs)"
+    for u in "${SMBUSERS[@]}"; do
+      u="$(echo "$u" | xargs)"   # trim spaces
+      [[ -z "$u" ]] && continue
       echo "[*] Set Samba password for $u"
       while :; do
         read -s -p "Password for $u: " sp1; echo
@@ -608,7 +609,8 @@ EOF
         [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break
         echo "Mismatch/empty. Try again."
       done
-      ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -a "$u" >/dev/null
+      # -s = silent (read from stdin), avoids smbpasswd’s own prompt chatter
+      ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -s -a "$u" >/dev/null
     done
   fi
 
