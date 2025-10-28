@@ -871,7 +871,7 @@ run_step "piranha" "installed" get_ver_piranha '
 
    FEIX="$(ls "$LOAD_PATCH_DIR"/*.py | sort -V | tail -1)"
    rm -rf /opt/piranha/backend/loader.py
-   cp "$LOAD_PATCH_DIR/$FEIX" /opt/piranha/backend/loader.py
+   cp "$FEIX" /opt/piranha/backend/loader.py
 
   # GUI wrapper (runs as calling user, no sudo/-E needed)
   cat >/usr/local/bin/piranha <<'"EOF"'
