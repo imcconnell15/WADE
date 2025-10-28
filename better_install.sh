@@ -52,6 +52,7 @@ WADE_BANNER
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)"
 # Primary place we look for DISA STIG zips/XML packaged with the repo
 STIG_SRC_DIR="${SCRIPT_DIR}/stigs"
+SPLUNK_SRC_DIR="${SCRIPT_DIR}"
 
 #####################################
 # CLI flags & basic env
@@ -524,8 +525,22 @@ fi
 #####################################
 # Samba shares (DataSources, Cases, Staging)
 #####################################
+get_ver_samba(){
+  local SMB_CONF="/etc/samba/smb.conf"
+  grep -q '^\[WADE-BEGIN\]' "$SMB_CONF" 2>/dev/null || { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_DATADIR}" ]]   || { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_CASESDIR}" ]]  || { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_STAGINGDIR}" ]]|| { echo ""; return; }
+  echo configured
+}
+
 run_step "samba" "configured" get_ver_samba '
   set -e
+
+  SMB_CONF="/etc/samba/smb.conf"
+  [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
+
+  # Ensure share directories exist
   DATADIR="/home/${LWADEUSER}/${WADE_DATADIR}"
   CASESDIR="/home/${LWADEUSER}/${WADE_CASESDIR}"
   STAGINGDIR="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
@@ -533,16 +548,21 @@ run_step "samba" "configured" get_ver_samba '
   chown -R "${LWADEUSER}:${LWADEUSER}" "/home/${LWADEUSER}"
   chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
-  SMB_CONF="/etc/samba/smb.conf"; [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
+  # Assemble allow/deny
   HOSTS_DENY_LINE="   hosts deny = 0.0.0.0/0"
   HOSTS_ALLOW_BLOCK=""
   if [[ "${#ALLOW_NETS_ARR[@]}" -gt 0 ]]; then
-    HOSTS_ALLOW_BLOCK="   hosts allow ="; for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_ALLOW_BLOCK+=" ${n}"; done
+    HOSTS_ALLOW_BLOCK="   hosts allow ="
+    for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_ALLOW_BLOCK+=" ${n}"; done
   fi
-  VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed 's/ //g')"
 
+  # Users allowed on shares
+  VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed "s/[[:space:]]//g")"
+
+  # Remove any prior WADE block, then append a fresh one
   awk '"'"'BEGIN{skip=0} /^\[WADE-BEGIN\]/{skip=1;next} /^\[WADE-END\]/{skip=0;next} skip==0{print}'"'"' "$SMB_CONF" > "${SMB_CONF}.tmp" && mv "${SMB_CONF}.tmp" "$SMB_CONF"
-  cat <<EOF >> "$SMB_CONF"
+
+  cat >>"$SMB_CONF"<<EOF
 [WADE-BEGIN]
 [DataSources]
    path = ${DATADIR}
@@ -579,18 +599,30 @@ ${HOSTS_DENY_LINE}
 [WADE-END]
 EOF
 
-  # Samba passwords (interactive only)
+  # Validate config; rollback on failure
+  if ! testparm -s >/dev/null 2>&1; then
+    echo "[!] testparm failed; restoring ${SMB_CONF}.bak"
+    cp -f "${SMB_CONF}.bak" "$SMB_CONF"
+    exit 1
+  fi
+
+  # Create Samba passwords for listed users (interactive only)
   if [[ "$NONINTERACTIVE" -eq 0 ]]; then
     for u in '"'"'${SMBUSERS[@]}'"'"'; do
-      u=$(echo "$u" | xargs)
+      u="$(echo "$u" | xargs)"
       echo "[*] Set Samba password for $u"
-      while :; do read -s -p "Password for $u: " sp1; echo; read -s -p "Confirm: " sp2; echo; [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break; echo "Mismatch/empty. Try again."; done
+      while :; do
+        read -s -p "Password for $u: " sp1; echo
+        read -s -p "Confirm: " sp2; echo
+        [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break
+        echo "Mismatch/empty. Try again."
+      done
       ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -a "$u" >/dev/null
     done
   fi
 
-  # SELinux (Oracle/RHEL)
-  if have_cmd getenforce; then
+  # SELinux (RHEL-like only)
+  if command -v getenforce >/dev/null 2>&1; then
     SEL=$(getenforce || echo Disabled)
     if [[ "$SEL" == "Enforcing" || "$SEL" == "Permissive" ]]; then
       setsebool -P samba_enable_home_dirs on || true
@@ -599,30 +631,35 @@ EOF
     fi
   fi
 
-  # Start Samba services
-  if systemctl list-unit-files | grep -q "^smbd\.service"; then
-    systemctl enable smbd --now; systemctl list-unit-files | grep -q "^nmbd\.service" && systemctl enable nmbd --now || true
-  elif systemctl list-unit-files | grep -q "^smb\.service"; then
-    systemctl enable smb --now; systemctl list-unit-files | grep -q "^nmb\.service" && systemctl enable nmb --now || true
+  # Start/enable correct service name for the platform
+  if systemctl list-unit-files | grep -q "^smbd\\.service"; then
+    systemctl enable smbd --now
+    systemctl list-unit-files | grep -q "^nmbd\\.service" && systemctl enable nmbd --now || true
+  elif systemctl list-unit-files | grep -q "^smb\\.service"; then
+    systemctl enable smb --now
+    systemctl list-unit-files | grep -q "^nmb\\.service" && systemctl enable nmb --now || true
   else
     systemctl enable smbd --now 2>/dev/null || systemctl enable smb --now || true
     systemctl enable nmbd --now 2>/dev/null || systemctl enable nmb --now || true
   fi
 
-  # Firewall
-  if [[ "$FIREWALL" == "ufw" ]]; then have_cmd ufw && { ufw allow Samba || true; }
-  else
+  # Firewall open for Samba
+  if [[ "$FIREWALL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
+    ufw allow Samba || true
+  elif command -v firewall-cmd >/dev/null 2>&1; then
     systemctl enable firewalld --now || true
-    if have_cmd firewall-cmd; then
-      if [[ "${WADE_STRICT_FIREWALL:-0}" -eq 1 ]]; then
-        firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true
-        for n in "${ALLOW_NETS_ARR[@]}"; do firewall-cmd --permanent --add-rich-rule="rule family='"'"'ipv4'"'"' source address='"'"'${n}'"'"' service name='"'"'samba'"'"' accept"; done
-      else
-        firewall-cmd --permanent --add-service=samba || true
-        for n in "${ALLOW_NETS_ARR[@]}"; do firewall-cmd --permanent --add-rich-rule="rule family='"'"'ipv4'"'"' source address='"'"'${n}'"'"' service name='"'"'samba'"'"' accept"; done
-      fi
-      firewall-cmd --reload || true
+    if [[ "${WADE_STRICT_FIREWALL:-0}" -eq 1 ]]; then
+      firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true
+      for n in "${ALLOW_NETS_ARR[@]}"; do
+        firewall-cmd --permanent --add-rich-rule="rule family='"'"'ipv4'"'"' source address='"'"'${n}'"'"' service name='"'"'samba'"'"' accept" || true
+      done
+    else
+      firewall-cmd --permanent --add-service=samba || true
+      for n in "${ALLOW_NETS_ARR[@]}"; do
+        firewall-cmd --permanent --add-rich-rule="rule family='"'"'ipv4'"'"' source address='"'"'${n}'"'"' service name='"'"'samba'"'"' accept" || true
+      done
     fi
+    firewall-cmd --reload || true
   fi
 ' || fail_note "samba" "share setup failed"
 
@@ -1362,6 +1399,8 @@ splunk_uf_install_and_config(){
     curl -L "${SPLUNK_UF_DEB_URL}" -o "$PKG"
   elif ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb >/dev/null 2>&1; then
     PKG="$(ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb | sort -V | tail -1)"
+  elif ls "$SPLUNK_SRC_DIR/*.deb >/dev/null 2>&1; then
+    PKG="$(ls "$SPLUNK_SRC_DIR"/*.deb | sort -V | tail -1)"
   fi
 
   if [[ -n "$PKG" && -f "$PKG" ]]; then
