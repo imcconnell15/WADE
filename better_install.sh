@@ -874,17 +874,17 @@ run_step "piranha" "installed" get_ver_piranha '
    cp "$FEIX" /opt/piranha/backend/loader.py
 
   # GUI wrapper (runs as calling user, no sudo/-E needed)
-  cat >/usr/local/bin/piranha <<'"EOF"'
+ # cat >/usr/local/bin/piranha <<'"EOF"'
 #!/usr/bin/env bash
-set -euo pipefail
+#set -euo pipefail
 # Prefer X11 rendering when DISPLAY is set; otherwise Qt picks a suitable backend.
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+#export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 # Per-user Matplotlib cache to avoid /opt writes
-export MPLCONFIGDIR="${MPLCONFIGDIR:-$HOME/.config/matplotlib}"
-mkdir -p "$MPLCONFIGDIR"
-cd /opt/piranha
-exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"
-EOF
+#export MPLCONFIGDIR="${MPLCONFIGDIR:-$HOME/.config/matplotlib}"
+#mkdir -p "$MPLCONFIGDIR"
+#cd /opt/piranha
+echo 'exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"' > /usr/local/bin/piranha
+#EOF
   chmod 0755 /usr/local/bin/piranha
   chown "${LWADEUSER}:${LWADEUSER}" /usr/local/bin/piranha || true
 ' || fail_note "piranha" "setup failed"
