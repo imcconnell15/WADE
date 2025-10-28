@@ -1,0 +1,27 @@
+[Unit]
+Description=WADE Staging Daemon (full vs light)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/wade/stage_daemon.py
+
+[Service]
+Type=simple
+User=autopsy
+Group=autopsy
+EnvironmentFile=-/etc/wade/wade.env
+Environment=PYTHONUNBUFFERED=1
+# Optional tuning:
+# Environment=WADE_STAGE_SCAN_INTERVAL=30
+# Environment=WADE_STAGE_STABLE_SECONDS=10
+# Environment=WADE_STAGE_SAMPLE_HASH=0
+WorkingDirectory=/opt/wade
+ExecStart=/usr/bin/python3 /opt/wade/stage_daemon.py
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
