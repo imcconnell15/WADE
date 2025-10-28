@@ -164,15 +164,6 @@ get_ver_pipx_dissect(){ pipx list 2>/dev/null | awk '/package dissect /{print $3
 get_ver_stig(){ [[ -f "${STIG_UBU_EXTRACT_DIR:-/var/wade/stigs/ubuntu2404}/ds.xml" ]] && sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" || echo ""; }
 get_ver_qtgl(){ dpkg -s libegl1 >/dev/null 2>&1 && echo present || echo ""; }  # apt branch only
 
-get_ver_samba(){
-  grep -q '^\[WADE-BEGIN\]' /etc/samba/smb.conf 2>/dev/null || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_DATADIR}" ]] || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_CASESDIR}" ]] || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_STAGINGDIR}" ]] || { echo ""; return; }
-  echo configured
-}
-
-
 #####################################
 # WADE Doctor (services, shares, Splunk UF)
 #####################################
