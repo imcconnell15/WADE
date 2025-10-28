@@ -4,7 +4,6 @@
 
 # NOTE: keep LF endings (use `dos2unix install.sh` if needed)
 
-
 ### ---------- Prompt helpers ----------
 prompt_with_default() {
   local q="$1"; local d="$2"; local ans
@@ -48,9 +47,7 @@ WADE_BANNER
 #####################################
 # Script location & STIG source dir
 #####################################
-# Absolute path to the directory of this script, even under sudo
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)"
-# Primary place we look for DISA STIG zips/XML packaged with the repo
 STIG_SRC_DIR="${SCRIPT_DIR}/stigs"
 SPLUNK_SRC_DIR="${SCRIPT_DIR}"
 LOAD_PATCH_DIR="${SCRIPT_DIR}"
@@ -123,7 +120,7 @@ STEPS_DIR="${WADE_VAR_DEFAULT}/state/steps"; mkdir -p "$STEPS_DIR"
 
 _inlist(){ local item="$1" list_csv="$2"; [[ -z "$list_csv" ]] && return 0; IFS=',' read -ra arr <<< "$list_csv"; for x in "${arr[@]}"; do [[ "$item" == "$x" ]] && return 0; done; return 1; }
 mark_done(){ local step="$1" ver="$2"; shift 2 || true; printf '%s\n' "$ver" > "${STEPS_DIR}/${step}.ver"; [[ $# -gt 0 ]] && printf '%s\n' "$*" > "${STEPS_DIR}/${step}.note"; }
-get_mark_ver(){ local step="$1"; [[ -f "${STEPS_DIR}/${step}.ver" ]] && cat "${STEPS_DIR}/${step}.ver" || echo ""; }
+get_mark_ver(){ local step="$1" [[ -f "${STEPS_DIR}/${step}.ver" ]] && cat "${STEPS_DIR}/${step}.ver" || echo ""; }
 report_step(){ printf " - %-16s want=%-12s have=%-14s [%s]\n" "$1" "${2:-n/a}" "${3:-n/a}" "$4"; }
 
 run_step(){
@@ -164,19 +161,26 @@ get_ver_pipx_vol3(){ pipx list 2>/dev/null | awk '/package volatility3 /{print $
 get_ver_pipx_dissect(){ pipx list 2>/dev/null | awk '/package dissect /{print $3}' | tr -d '()' || true; }
 get_ver_stig(){ [[ -f "${STIG_UBU_EXTRACT_DIR:-/var/wade/stigs/ubuntu2404}/ds.xml" ]] && sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" || echo ""; }
 get_ver_qtgl(){ dpkg -s libegl1 >/dev/null 2>&1 && echo present || echo ""; }  # apt branch only
+get_ver_splunkuf(){
+  [[ -x /opt/splunkforwarder/bin/splunk ]] || { echo ""; return; }
+  local outconf="/opt/splunkforwarder/etc/system/local/outputs.conf"
+  if [[ -f "$outconf" ]] && grep -q '^\s*server\s*=' "$outconf"; then
+    echo installed
+  else
+    echo ""
+  fi
+}
 
 #####################################
 # WADE Doctor (services, shares, Splunk UF)
 #####################################
 wade_doctor() {
   echo "=== WADE Doctor ==="
-  # Samba service state
   if systemctl is-active --quiet smbd || systemctl is-active --quiet smb; then
     echo "[*] Samba: active"
   else
     echo "[!] Samba: inactive"
   fi
-  # Validate expected shares exist in smb.conf and on disk
   SMB_CONF="/etc/samba/smb.conf"
   for SHARE in DataSources Cases Staging; do
     if testparm -s 2>/dev/null | grep -q "^\[$SHARE\]"; then
@@ -190,7 +194,6 @@ wade_doctor() {
       echo "[!] Share [$SHARE] not found in smb.conf (testparm)"
     fi
   done
-  # Splunk UF
   if [[ -x /opt/splunkforwarder/bin/splunk ]]; then
     echo "[*] Splunk UF present: version $(/opt/splunkforwarder/bin/splunk version 2>/dev/null | awk '{print $NF}')"
     OUTCONF="/opt/splunkforwarder/etc/system/local/outputs.conf"
@@ -204,19 +207,10 @@ wade_doctor() {
     else
       echo "[!] UF outputs.conf missing at $OUTCONF"
     fi
-    # Deployment server
-    DC="/opt/splunkforwarder/etc/system/local/deploymentclient.conf"
-    if [[ -f "$DC" ]]; then
-      DS_TARGET="$(awk -F= '/^\s*targetUri\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$DC" 2>/dev/null)"
-      if [[ -n "$DS_TARGET" ]]; then
-        echo "[+] UF deployment server: $DS_TARGET"
-      fi
-    fi
     /opt/splunkforwarder/bin/splunk status 2>/dev/null | sed -n '1,8p' || true
   else
     echo "[!] Splunk UF not installed"
   fi
-  # Ports
   echo "[*] Listening ports (smbd 139/445, solr 8983, postgres 5432):"
   ss -plnt | awk 'NR==1 || /:139 |:445 |:8983 |:5432 /'
   echo "===================="
@@ -298,8 +292,25 @@ PG_PERF_SYNCCOMMIT="off"
 PG_PERF_FULLPAGE="off"
 PG_CREATE_AUTOPSY_USER="1"
 
-# Splunk default index for new tools (adjust live later)
+# ===== Splunk (UF + ports) =====
+# Default index new WADE tools should use (kept for backwards-compat)
 SPLUNK_DEFAULT_INDEX="wade_custom"
+
+# Universal Forwarder defaults (used by the installer prompts & env)
+# One or more indexers, comma-separated, each as host:port
+SPLUNK_UF_RCVR_HOSTS="splunk.example.org:9997"
+SPLUNK_UF_DEFAULT_INDEX="wade_custom"
+SPLUNK_UF_COMPRESSED="true"     # tcpout: compressed = true|false
+SPLUNK_UF_USE_ACK="true"        # tcpout: useACK = true|false
+SPLUNK_UF_SSL_VERIFY="false"    # tcpout: sslVerifyServerCert = true|false
+SPLUNK_UF_SSL_COMMON_NAME="*"   # tcpout: sslCommonNameToCheck (only if verify true)
+SPLUNK_UF_DEPLOYMENT_SERVER=""  # e.g. "ds.example.org:8089" or blank to skip
+
+# Ports (for summary/UI hints; *not* proof of local Splunk Enterprise)
+SPLUNK_WEB_PORT="8000"
+SPLUNK_MGMT_PORT="8089"
+SPLUNK_HEC_PORT="8088"
+SPLUNK_FORWARD_PORT="9997"
 
 # Module toggles
 MOD_VOL_SYMBOLS_ENABLED="1"
@@ -532,7 +543,6 @@ run_step "samba" "configured" get_ver_samba '
   SMB_CONF="/etc/samba/smb.conf"
   [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
 
-  # Ensure share directories exist
   DATADIR="/home/${LWADEUSER}/${WADE_DATADIR}"
   CASESDIR="/home/${LWADEUSER}/${WADE_CASESDIR}"
   STAGINGDIR="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
@@ -540,7 +550,6 @@ run_step "samba" "configured" get_ver_samba '
   chown -R "${LWADEUSER}:${LWADEUSER}" "/home/${LWADEUSER}"
   chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
-  # Assemble allow/deny
   HOSTS_DENY_LINE="   hosts deny = 0.0.0.0/0"
   HOSTS_ALLOW_BLOCK=""
   if [[ "${#ALLOW_NETS_ARR[@]}" -gt 0 ]]; then
@@ -548,10 +557,8 @@ run_step "samba" "configured" get_ver_samba '
     for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_ALLOW_BLOCK+=" ${n}"; done
   fi
 
-  # Users allowed on shares
   VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed "s/[[:space:]]//g")"
 
-  # Remove any prior WADE block, then append a fresh one
   awk '"'"'BEGIN{skip=0} /^\[WADE-BEGIN\]/{skip=1;next} /^\[WADE-END\]/{skip=0;next} skip==0{print}'"'"' "$SMB_CONF" > "${SMB_CONF}.tmp" && mv "${SMB_CONF}.tmp" "$SMB_CONF"
 
   cat >>"$SMB_CONF"<<EOF
@@ -591,17 +598,15 @@ ${HOSTS_DENY_LINE}
 [WADE-END]
 EOF
 
-  # Validate config; rollback on failure
   if ! testparm -s >/dev/null 2>&1; then
     echo "[!] testparm failed; restoring ${SMB_CONF}.bak"
     cp -f "${SMB_CONF}.bak" "$SMB_CONF"
     exit 1
   fi
 
-  # Create Samba passwords for listed users (interactive only)
   if [[ "$NONINTERACTIVE" -eq 0 ]]; then
     for u in "${SMBUSERS[@]}"; do
-      u="$(echo "$u" | xargs)"   # trim spaces
+      u="$(echo "$u" | xargs)"
       [[ -z "$u" ]] && continue
       echo "[*] Set Samba password for $u"
       while :; do
@@ -610,12 +615,10 @@ EOF
         [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break
         echo "Mismatch/empty. Try again."
       done
-      # -s = silent (read from stdin), avoids smbpasswd’s own prompt chatter
       ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -s -a "$u" >/dev/null
     done
   fi
 
-  # SELinux (RHEL-like only)
   if command -v getenforce >/dev/null 2>&1; then
     SEL=$(getenforce || echo Disabled)
     if [[ "$SEL" == "Enforcing" || "$SEL" == "Permissive" ]]; then
@@ -625,19 +628,17 @@ EOF
     fi
   fi
 
-  # Start/enable correct service name for the platform
-  if systemctl list-unit-files | grep -q "^smbd\\.service"; then
+  if systemctl list-unit-files | grep -q "^smbd\.service"; then
     systemctl enable smbd --now
-    systemctl list-unit-files | grep -q "^nmbd\\.service" && systemctl enable nmbd --now || true
-  elif systemctl list-unit-files | grep -q "^smb\\.service"; then
+    systemctl list-unit-files | grep -q "^nmbd\.service" && systemctl enable nmbd --now || true
+  elif systemctl list-unit-files | grep -q "^smb\.service"; then
     systemctl enable smb --now
-    systemctl list-unit-files | grep -q "^nmb\\.service" && systemctl enable nmb --now || true
+    systemctl list-unit-files | grep -q "^nmb\.service" && systemctl enable nmb --now || true
   else
     systemctl enable smbd --now 2>/dev/null || systemctl enable smb --now || true
     systemctl enable nmbd --now 2>/dev/null || systemctl enable nmb --now || true
   fi
 
-  # Firewall open for Samba
   if [[ "$FIREWALL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
     ufw allow Samba || true
   elif command -v firewall-cmd >/dev/null 2>&1; then
@@ -727,13 +728,11 @@ run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_be '
   BUILD_DIR="$(mktemp -d /var/tmp/wade/build/be.XXXXXX)"
 
   if [[ "$PM" == "apt" ]]; then
-    # Ubuntu/Debian build deps
     bash -lc "$PKG_INSTALL --no-install-recommends \
       git ca-certificates build-essential autoconf automake libtool pkg-config \
       flex bison libewf-dev libssl-dev zlib1g-dev libxml2-dev libexiv2-dev \
       libtre-dev libsqlite3-dev libpcap-dev libre2-dev libpcre3-dev libexpat1-dev" || true
   else
-    # RHEL/Oracle/Fedora build deps (use groupinstall for toolchain)
     if have_cmd dnf; then
       dnf -y groupinstall "Development Tools" || true
     else
@@ -822,7 +821,6 @@ run_step "x11-forwarding" "configured" get_ver_x11fwd '
 
   systemctl restart ssh || systemctl restart sshd || true
 
-  # Prepare per-user X and matplotlib dirs so GUIs can run without sudo -E
   su - "${LWADEUSER}" -c "mkdir -p ~/.config/matplotlib; touch ~/.Xauthority; chmod 600 ~/.Xauthority" || true
 ' || fail_note "x11-forwarding" "setup failed"
 
@@ -836,18 +834,13 @@ get_ver_piranha(){ [[ -x /usr/local/bin/piranha && -d /opt/piranha/.venv && -f /
 if [[ "${MOD_PIRANHA_ENABLED:-1}" == "1" ]]; then
 run_step "piranha" "installed" get_ver_piranha '
   set -e
-  # Runtime dirs + ownership
   install -d /opt/piranha /var/log/wade/piranha
   chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha /var/log/wade/piranha
 
-  # Ensure the path Piranha currently logs to exists and is writable
   install -d /opt/piranha/Documents/PiranhaLogs
   chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha/Documents
-
-  # Symlink APT_Report.log into central logs
   ln -sf /var/log/wade/piranha/APT_Report.log /opt/piranha/Documents/PiranhaLogs/APT_Report.log || true
 
-  # Get sources (online/offline)
   if [[ "$OFFLINE" == "1" ]]; then
     PKG_ARC="$(ls "${WADE_PKG_DIR}/piranha/"piranha*.tar.gz "${WADE_PKG_DIR}/piranha/"piranha*.zip 2>/dev/null | head -1 || true)"
     [[ -n "$PKG_ARC" ]] || { echo "offline Piranha archive missing"; exit 1; }
@@ -864,27 +857,17 @@ run_step "piranha" "installed" get_ver_piranha '
 
   [[ -f /opt/piranha/piranha.py ]] || { echo "Piranha sources missing under /opt/piranha"; exit 1; }
 
-  # venv + deps
   python3 -m venv /opt/piranha/.venv || python3 -m virtualenv /opt/piranha/.venv
   /opt/piranha/.venv/bin/pip install --upgrade pip
   [[ -f /opt/piranha/requirements.txt ]] && /opt/piranha/.venv/bin/pip install -r /opt/piranha/requirements.txt || true
 
-   FEIX="$(ls "$LOAD_PATCH_DIR"/*.py | sort -V | tail -1)"
-   rm -rf /opt/piranha/backend/loader.py
-   cp "$FEIX" /opt/piranha/backend/loader.py
+  FEIX="$(ls "$LOAD_PATCH_DIR"/*.py 2>/dev/null | sort -V | tail -1)"
+  if [[ -n "$FEIX" ]]; then
+    rm -f /opt/piranha/backend/loader.py
+    cp "$FEIX" /opt/piranha/backend/loader.py || true
+  fi
 
-  # GUI wrapper (runs as calling user, no sudo/-E needed)
- # cat >/usr/local/bin/piranha <<'"EOF"'
-#!/usr/bin/env bash
-#set -euo pipefail
-# Prefer X11 rendering when DISPLAY is set; otherwise Qt picks a suitable backend.
-#export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
-# Per-user Matplotlib cache to avoid /opt writes
-#export MPLCONFIGDIR="${MPLCONFIGDIR:-$HOME/.config/matplotlib}"
-#mkdir -p "$MPLCONFIGDIR"
-#cd /opt/piranha
-echo 'exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"' > /usr/local/bin/piranha
-#EOF
+  echo 'exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"' > /usr/local/bin/piranha
   chmod 0755 /usr/local/bin/piranha
   chown "${LWADEUSER}:${LWADEUSER}" /usr/local/bin/piranha || true
 ' || fail_note "piranha" "setup failed"
@@ -912,12 +895,10 @@ run_step "barracuda" "installed" get_ver_barracuda '
     [[ -d /opt/barracuda/.git ]] || git clone https://github.com/williamjsmail/Barracuda /opt/barracuda || true
   fi
 
-  # venv + deps
   python3 -m venv /opt/barracuda/.venv || python3 -m virtualenv /opt/barracuda/.venv
   /opt/barracuda/.venv/bin/pip install --upgrade pip
   [[ -f /opt/barracuda/requirements.txt ]] && /opt/barracuda/.venv/bin/pip install -r /opt/barracuda/requirements.txt || true
 
-  # Ensure MITRE JSON is present at the canonical location
   if [[ ! -f /opt/barracuda/enterprise-attack.json ]]; then
     if [[ -f "${WADE_PKG_DIR}/mitre/enterprise-attack.json" ]]; then
       cp "${WADE_PKG_DIR}/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
@@ -929,16 +910,12 @@ run_step "barracuda" "installed" get_ver_barracuda '
     fi
   fi
 
-  # **** Hard patch: change relative JSON to absolute path ****
-  # techniques = load_techniques_enriched("enterprise-attack.json")
-  # -> techniques = load_techniques_enriched("/opt/barracuda/enterprise-attack.json")
   sed -i -E \
     '\''s|load_techniques_enriched\("enterprise-attack\.json"\)|load_techniques_enriched("/opt/barracuda/enterprise-attack.json")|'\'' \
     /opt/barracuda/app.py || true
 
   install -d -o autopsy -g autopsy -m 0750 /opt/barracuda/uploads
 
-  # Wrapper to enforce correct CWD + headless Qt
   cat >/usr/local/bin/barracuda <<'\''EOF'\''
 #!/usr/bin/env bash
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
@@ -947,7 +924,6 @@ exec /opt/barracuda/.venv/bin/python /opt/barracuda/app.py "$@"
 EOF
   chmod 0755 /usr/local/bin/barracuda
 
-  # systemd unit (WorkingDirectory + env file)
   cat >/etc/systemd/system/barracuda.service <<EOF
 [Unit]
 Description=WADE Barracuda (DFIR helper)
@@ -964,14 +940,12 @@ WorkingDirectory=/opt/barracuda
 EnvironmentFile=-/etc/wade/wade.env
 Environment=PYTHONUNBUFFERED=1
 Environment=QT_QPA_PLATFORM=offscreen
-# (App still uses its own defaults; env variables are documented in wade.env)
 ExecStart=/opt/barracuda/.venv/bin/python /opt/barracuda/app.py
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-#ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
@@ -991,7 +965,6 @@ run_step "hayabusa" "" get_ver_hayabusa '
   echo "[*] Installing Hayabusa…"
   install -d "$(dirname "${HAYABUSA_DEST}")"
 
-  # Defensive: make sure HAY_ARCH is set before any use (nounset-safe)
   HAY_ARCH="${HAY_ARCH:-$(detect_hayabusa_arch)}"
   HAY_ZIP=""
   HAY_ZIP_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa/"hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
@@ -1095,7 +1068,6 @@ run_step "solr" "${SOLR_VER}" get_ver_solr '
   sed -i "s|^#\?SOLR_JETTY_HOST=.*|SOLR_JETTY_HOST=\"${IPV4}\"|" /etc/default/solr.in.sh
   systemctl restart solr
 
-  # Autopsy configset
   AUTOPSY_ZIP="SOLR_8.6.3_AutopsyService.zip"
   fetch_pkg autopsy "$AUTOPSY_ZIP" || curl -L "https://sourceforge.net/projects/autopsy/files/CollaborativeServices/Solr/${AUTOPSY_ZIP}/download" -o "$AUTOPSY_ZIP"
   [[ -f "$AUTOPSY_ZIP" ]] || { echo "Autopsy Solr config zip missing"; exit 1; }
@@ -1132,7 +1104,6 @@ EOF
   systemctl daemon-reload; systemctl enable activemq --now
 ' || fail_note "activemq" "install/config failed"
 
-
 #####################################
 # PostgreSQL (Ubuntu path; soft-fail)
 #####################################
@@ -1163,9 +1134,7 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" ]]; then
 run_step "stig-prereqs" "installed" get_ver_stig '
   set -e
   if [[ "$PM" == "apt" ]]; then
-    # Known-good on Ubuntu
     bash -lc "$PKG_INSTALL openscap-scanner unzip ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications" || true
-    # Only try scap-security-guide if it actually exists (avoid noisy E: lines)
     bash -lc "apt-cache show scap-security-guide >/dev/null 2>&1 && $PKG_INSTALL scap-security-guide || true"
   else
     bash -lc "$PKG_INSTALL openscap-scanner unzip" || true
@@ -1175,10 +1144,144 @@ run_step "stig-prereqs" "installed" get_ver_stig '
 fi
 
 #####################################
+# Splunk Universal Forwarder (idempotent step)
+#####################################
+run_step "splunk-uf" "installed" get_ver_splunkuf '
+  set -e
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get install -y --no-install-recommends procps curl || true
+  fi
+
+  id splunkfwd >/dev/null 2>&1 || useradd --system --home-dir /opt/splunkforwarder --shell /usr/sbin/nologin splunkfwd || true
+
+  PKG=""
+  if [[ -n "${SPLUNK_UF_DEB_URL:-}" ]]; then
+    PKG="/tmp/$(basename "${SPLUNK_UF_DEB_URL}")"
+    curl -L "${SPLUNK_UF_DEB_URL}" -o "$PKG"
+  elif ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb >/dev/null 2>&1; then
+    PKG="$(ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb | sort -V | tail -1)"
+  elif ls "${SPLUNK_SRC_DIR}"/*.deb >/dev/null 2>&1; then
+    PKG="$(ls "${SPLUNK_SRC_DIR}"/*.deb | sort -V | tail -1)"
+  fi
+
+  if [[ -n "$PKG" && -f "$PKG" ]]; then
+    dpkg -i "$PKG" || apt-get -f install -y
+  else
+    echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/ or ${SPLUNK_SRC_DIR}"
+    exit 1
+  fi
+
+  /opt/splunkforwarder/bin/splunk enable boot-start -systemd-managed 1 -user splunkfwd --accept-license --answer-yes
+
+  mkdir -p /opt/splunkforwarder/etc/system/local
+
+  SERVER_LINE=""
+  DEFAULT_INDEX="${SPLUNK_DEFAULT_INDEX:-wade_custom}"
+  COMPRESSED="true"
+  USE_ACK="true"
+  SSL_BLOCK=""
+  DS_TARGET=""
+
+  if [[ "${NONINTERACTIVE:-0}" -eq 0 ]]; then
+    echo
+    echo ">> Splunk UF configuration"
+    IDXERS="$(prompt_with_default "Indexer(s) host[:port], comma-separated" "${SPLUNK_UF_RCVR_HOST:-splunk.example.org}:${SPLUNK_UF_RCVR_PORT:-9997}")"
+    DEFAULT_PORT="${SPLUNK_UF_RCVR_PORT:-9997}"
+    NORMALIZED=""
+    IFS=',' read -r -a ARR <<< "$IDXERS"
+    for h in "${ARR[@]}"; do
+      h="$(echo "$h" | xargs)"
+      [[ -z "$h" ]] && continue
+      if [[ "$h" == *:* ]]; then NORMALIZED+="${h},"
+      else NORMALIZED+="${h}:${DEFAULT_PORT},"
+      fi
+    done
+    SERVER_LINE="${NORMALIZED%,}"
+
+    DEFAULT_INDEX="$(prompt_with_default "Default index for WADE logs" "$DEFAULT_INDEX")"
+    if yesno_with_default "Enable compression?" "Y"; then COMPRESSED="true"; else COMPRESSED="false"; fi
+    if yesno_with_default "Enable indexer ACKs (useACK)?" "Y"; then USE_ACK="true"; else USE_ACK="false"; fi
+    if yesno_with_default "Configure a deployment server?" "N"; then
+      DS_TARGET="$(prompt_with_default "Deployment server host:port" "ds.example.org:8089")"
+    fi
+    if yesno_with_default "Add SSL verify (sslVerifyServerCert=true)?" "N"; then
+      SSL_BLOCK=$'\nsslVerifyServerCert = true\nsslCommonNameToCheck = *'
+    fi
+  else
+    SERVER_LINE="${SPLUNK_UF_RCVR_HOST:-splunk.example.org}:${SPLUNK_UF_RCVR_PORT:-9997}"
+  fi
+
+  cat >/opt/splunkforwarder/etc/system/local/outputs.conf <<OUTCONF
+[tcpout]
+defaultGroup = default-autolb-group
+indexAndForward = false
+
+[tcpout:default-autolb-group]
+server = ${SERVER_LINE}
+autoLB = true
+compressed = ${COMPRESSED}
+useACK = ${USE_ACK}${SSL_BLOCK}
+OUTCONF
+
+  cat >/opt/splunkforwarder/etc/system/local/inputs.conf <<INCONF
+[monitor:///var/wade/logs]
+index = ${DEFAULT_INDEX}
+sourcetype = wade:log
+
+[monitor:///var/log/wade/piranha]
+index = ${DEFAULT_INDEX}
+sourcetype = wade:piranha
+
+[monitor:///var/log/wade]
+index = ${DEFAULT_INDEX}
+sourcetype = wade:misc
+INCONF
+
+  if [[ -n "$DS_TARGET" ]]; then
+    cat >/opt/splunkforwarder/etc/system/local/deploymentclient.conf <<DCONF
+[deployment-client]
+
+[target-broker:deploymentServer]
+targetUri = ${DS_TARGET}
+DCONF
+  fi
+
+  chown -R splunkfwd:splunkfwd /opt/splunkforwarder
+  systemctl daemon-reload
+  systemctl enable --now SplunkForwarder.service || systemctl restart SplunkForwarder.service || true
+
+  echo installed
+' || fail_note "splunk-uf" "install/config failed"
+
+#####################################
 # Persist facts & endpoints
 #####################################
 ENV_FILE="${WADE_ETC}/wade.env"
 IPV4="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
+# — Derive Splunk UF settings if present (fall back to conf defaults) —
+OUTCONF="/opt/splunkforwarder/etc/system/local/outputs.conf"
+INCONF="/opt/splunkforwarder/etc/system/local/inputs.conf"
+DCONF="/opt/splunkforwarder/etc/system/local/deploymentclient.conf"
+
+UF_RCVR="$(awk -F= '/^\s*server\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$OUTCONF" 2>/dev/null)"
+UF_COMP="$(awk -F= '/^\s*compressed\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
+UF_ACKS="$(awk -F= '/^\s*useACK\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
+UF_SSLV="$(awk -F= '/^\s*sslVerifyServerCert\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
+UF_SSLN="$(awk -F= '/^\s*sslCommonNameToCheck\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$OUTCONF" 2>/dev/null)"
+UF_DS="$(awk -F= '/^\s*targetUri\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$DCONF" 2>/dev/null)"
+UF_IDX="$(awk -F= '/^\s*index\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$INCONF" 2>/dev/null)"
+
+# fallbacks to defaults from wade.conf
+UF_RCVR="${UF_RCVR:-${SPLUNK_UF_RCVR_HOSTS:-${SPLUNK_UF_RCVR_HOST:-}}}"
+UF_COMP="${UF_COMP:-${SPLUNK_UF_COMPRESSED:-true}}"
+UF_ACKS="${UF_ACKS:-${SPLUNK_UF_USE_ACK:-true}}"
+UF_SSLV="${UF_SSLV:-${SPLUNK_UF_SSL_VERIFY:-false}}"
+UF_SSLN="${UF_SSLN:-${SPLUNK_UF_SSL_COMMON_NAME:-*}}"
+UF_DS="${UF_DS:-${SPLUNK_UF_DEPLOYMENT_SERVER:-}}"
+UF_IDX="${UF_IDX:-${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}}"
 
 cat > "$ENV_FILE" <<ENV
 # ===== WADE runtime facts =====
@@ -1197,8 +1300,21 @@ WADE_PKG_DIR="${WADE_PKG_DIR}"
 WADE_TOOLS_DIR="${WADE_TOOLS_DIR}"
 WADE_PIPELINES_DIR="${WADE_PIPELINES_DIR}"
 
-# Splunk default index for new tools
+# Splunk settings (UF actuals if present, else defaults)
 SPLUNK_DEFAULT_INDEX="${SPLUNK_DEFAULT_INDEX:-wade_custom}"
+SPLUNK_UF_RCVR_HOSTS="${UF_RCVR}"
+SPLUNK_UF_DEFAULT_INDEX="${UF_IDX}"
+SPLUNK_UF_COMPRESSED="${UF_COMP}"
+SPLUNK_UF_USE_ACK="${UF_ACKS}"
+SPLUNK_UF_SSL_VERIFY="${UF_SSLV}"
+SPLUNK_UF_SSL_COMMON_NAME="${UF_SSLN}"
+SPLUNK_UF_DEPLOYMENT_SERVER="${UF_DS}"
+
+# Reference ports (for dashboards / docs)
+SPLUNK_WEB_PORT="${SPLUNK_WEB_PORT:-8000}"
+SPLUNK_MGMT_PORT="${SPLUNK_MGMT_PORT:-8089}"
+SPLUNK_HEC_PORT="${SPLUNK_HEC_PORT:-8088}"
+SPLUNK_FORWARD_PORT="${SPLUNK_FORWARD_PORT:-9997}"
 
 # Hayabusa locations
 HAYABUSA_DEST="${HAYABUSA_DEST}"
@@ -1227,21 +1343,15 @@ ACTIVEMQ_WS_PORT="61614"
 POSTGRES_PORT="5432"
 PIRANHA_PORT="5001"
 BARRACUDA_PORT="5000"
-SPLUNK_WEB_PORT="8000"
-SPLUNK_MGMT_PORT="8089"
-SPLUNK_HEC_PORT="8088"
-SPLUNK_FORWARD_PORT="9997"
-
-# Barracuda runtime (Flask)
-BARRACUDA_APP_DIR="/opt/barracuda"
-BARRACUDA_HOST="0.0.0.0"
-BARRACUDA_PORT="5000"
-BARRACUDA_JSON_PATH="/opt/barracuda/enterprise-attack.json"
-BARRACUDA_UPLOADS_DIR="/opt/barracuda/uploads"
+SPLUNK_WEB_PORT="\${SPLUNK_WEB_PORT}"
+SPLUNK_MGMT_PORT="\${SPLUNK_MGMT_PORT}"
+SPLUNK_HEC_PORT="\${SPLUNK_HEC_PORT}"
+SPLUNK_FORWARD_PORT="\${SPLUNK_FORWARD_PORT}"
 
 WADE_SERVICE_PORTS_CSV="\${SSH_PORT},\${SMB_TCP_139},\${SMB_TCP_445},\${SMB_UDP_137},\${SMB_UDP_138},\${ZK_CLIENT_PORT},\${ZK_QUORUM_PORT},\${ZK_ELECTION_PORT},\${SOLR_PORT},\${ACTIVEMQ_OPENWIRE_PORT},\${ACTIVEMQ_WEB_CONSOLE_PORT},\${ACTIVEMQ_AMQP_PORT},\${ACTIVEMQ_STOMP_PORT},\${ACTIVEMQ_MQTT_PORT},\${ACTIVEMQ_WS_PORT},\${POSTGRES_PORT},\${PIRANHA_PORT},\${BARRACUDA_PORT},\${SPLUNK_WEB_PORT},\${SPLUNK_MGMT_PORT},\${SPLUNK_HEC_PORT},\${SPLUNK_FORWARD_PORT}"
 ENV
 chmod 600 "$ENV_FILE"
+
 
 echo
 echo "[+] WADE install attempted."
@@ -1254,6 +1364,21 @@ echo "    Barracuda  : ${IPV4}:5000"
 echo "    Tools     : vol3, dissect, bulk_extractor (+ piranha, barracuda, hayabusa)"
 echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
 echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
+UF_PRESENT="no"
+UF_OUT_TARGETS=""
+UF_DS_TARGET=""
+if [[ -x /opt/splunkforwarder/bin/splunk ]]; then
+  UF_PRESENT="yes"
+  UF_OUT_TARGETS="$(awk -F= '/^\s*server\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' /opt/splunkforwarder/etc/system/local/outputs.conf 2>/dev/null)"
+  UF_DS_TARGET="$(awk -F= '/^\s*targetUri\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' /opt/splunkforwarder/etc/system/local/deploymentclient.conf 2>/dev/null)"
+fi
+
+if [[ "$UF_PRESENT" == "yes" ]]; then
+  echo "    Splunk UF : forwarding to ${UF_OUT_TARGETS:-<not configured>} (DS: ${UF_DS_TARGET:-none})"
+  echo "                compressed=${SPLUNK_UF_COMPRESSED:-${UF_COMP:-true}}, useACK=${SPLUNK_UF_USE_ACK:-${UF_ACKS:-true}}, sslVerify=${SPLUNK_UF_SSL_VERIFY:-${UF_SSLV:-false}}"
+else
+  echo "    Splunk UF : not installed"
+fi
 echo "    Log       : ${LOG_FILE}"
 echo
 echo "NOTE: New tools default to SPLUNK index: '${SPLUNK_DEFAULT_INDEX:-wade_custom}'."
@@ -1262,13 +1387,10 @@ echo "NOTE: New tools default to SPLUNK index: '${SPLUNK_DEFAULT_INDEX:-wade_cus
 # Interactive STIG assessment (end; reads from ./stigs)
 #####################################
 stig_list_profiles() {
-  # $1 = DS or Benchmark XML
-  # Handles DISA “Profiles:” block (indented) with “Id: …” plus generic fallbacks.
   local info
   info="$(oscap info "$1" 2>/dev/null || true)"
 
   {
-    # (1) “Profiles:” block → grab Id:
     printf '%s\n' "$info" | awk '
       BEGIN{inside=0}
       /^[[:space:]]*Profiles:/ {inside=1; next}
@@ -1277,15 +1399,12 @@ stig_list_profiles() {
         print $1
       }
     '
-    # (2) Generic “Profile: <id>”
     printf '%s\n' "$info" | sed -nE 's/^[[:space:]]*Profile[[:space:]]*:[[:space:]]*([[:alnum:]_.:-]+).*/\1/p'
-    # (3) Generic “… (<id>)”
     printf '%s\n' "$info" | sed -nE 's/^[[:space:]]*Profile.*\(([[:alnum:]_.:-]+)\).*/\1/p'
   } | awk 'NF' | sort -u
 }
 
 stig_pick_profile_interactive() {
-  # All UI goes to stderr so command-substitution can capture only the chosen ID on stdout.
   local ds="$1"
   mapfile -t PROFILES < <(stig_list_profiles "$ds")
 
@@ -1328,7 +1447,6 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
     read -r -p "Run STIG assessment now? [y/N]: " __ans
     if [[ "$__ans" =~ ^[Yy]$ ]]; then
       install -d "${STIG_REPORT_DIR}" "${STIG_UBU_EXTRACT_DIR}"
-      # Pick latest zip or xml from ./stigs
       CAND_ZIP="$(ls -1 "${STIG_SRC_DIR}"/*.zip 2>/dev/null | sort -V | tail -1 || true)"
       CAND_XML="$(ls -1 "${STIG_SRC_DIR}"/*.xml "${STIG_SRC_DIR}"/*.XML 2>/dev/null | sort -V | tail -1 || true)"
       DS_FILE=""; TMP_EXTRACT=""
@@ -1337,7 +1455,6 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
         echo "[*] Using ZIP: $(basename "$CAND_ZIP")"
         TMP_EXTRACT="$(mktemp -d)"
         unzip -oq "$CAND_ZIP" -d "$TMP_EXTRACT"
-        # Prefer datastreams; then fall back to Benchmark XML
         for pat in '*-ds.xml' '*-datastream.xml' '*-xccdf.xml' '*Benchmark*.xml'; do
           DS_FILE="$(find "$TMP_EXTRACT" -type f -iname "$pat" | head -1 || true)"
           [[ -n "$DS_FILE" ]] && break
@@ -1366,7 +1483,6 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
                "${DS_FILE}"; then
             echo "[+] STIG report: ${REP_HTML}"
             echo "[+] STIG ARF   : ${REP_ARF}"
-            # Save a stable copy for idempotent --check summaries
             cp -f "${DS_FILE}" "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || true
             mark_done "stig-eval" "$(sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || echo run-${TS})"
           else
@@ -1380,118 +1496,3 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
 fi
 
 finish_summary
-
-splunk_uf_install_and_config(){
-  set -e
-  if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || true
-    apt-get install -y --no-install-recommends procps curl
-  fi
-
-  id splunkfwd >/dev/null 2>&1 || useradd --system --home-dir /opt/splunkforwarder --shell /usr/sbin/nologin splunkfwd || true
-
-  local PKG=""
-  if [[ -n "${SPLUNK_UF_DEB_URL:-}" ]]; then
-    PKG="/tmp/$(basename "${SPLUNK_UF_DEB_URL}")"
-    curl -L "${SPLUNK_UF_DEB_URL}" -o "$PKG"
-  elif ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb >/dev/null 2>&1; then
-    PKG="$(ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb | sort -V | tail -1)"
-  elif ls "$SPLUNK_SRC_DIR/*.deb >/dev/null 2>&1; then
-    PKG="$(ls "$SPLUNK_SRC_DIR"/*.deb | sort -V | tail -1)"
-  fi
-
-  if [[ -n "$PKG" && -f "$PKG" ]]; then
-    dpkg -i "$PKG" || apt-get -f install -y
-  else
-    echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/"
-    return 1
-  fi
-
-  /opt/splunkforwarder/bin/splunk enable boot-start -systemd-managed 1 -user splunkfwd --accept-license --answer-yes
-
-  mkdir -p /opt/splunkforwarder/etc/system/local
-
-  local SERVER_LINE=""
-  local DEFAULT_INDEX="${SPLUNK_DEFAULT_INDEX:-wade_custom}"
-  local COMPRESSED="true"
-  local USE_ACK="true"
-  local SSL_BLOCK=""
-  local DS_TARGET=""
-
-  if [[ "${NONINTERACTIVE:-0}" -eq 0 ]]; then
-    echo
-    echo ">> Splunk UF configuration"
-    local IDXERS
-    IDXERS="$(prompt_with_default "Indexer(s) host[:port], comma-separated" "${SPLUNK_UF_RCVR_HOST:-splunk.example.org}:${SPLUNK_UF_RCVR_PORT:-9997}")"
-    local DEFAULT_PORT="${SPLUNK_UF_RCVR_PORT:-9997}"
-    local NORMALIZED=""
-    IFS=',' read -r -a ARR <<< "$IDXERS"
-    for h in "${ARR[@]}"; do
-      h="$(echo "$h" | xargs)"
-      [[ -z "$h" ]] && continue
-      if [[ "$h" == *:* ]]; then NORMALIZED+="${h},"; else NORMALIZED+="${h}:${DEFAULT_PORT},"; fi
-    done
-    SERVER_LINE="${NORMALIZED%,}"
-
-    DEFAULT_INDEX="$(prompt_with_default "Default index for WADE logs" "$DEFAULT_INDEX")"
-    if yesno_with_default "Enable compression?" "Y"; then COMPRESSED="true"; else COMPRESSED="false"; fi
-    if yesno_with_default "Enable indexer ACKs (useACK)?" "Y"; then USE_ACK="true"; else USE_ACK="false"; fi
-    if yesno_with_default "Configure a deployment server?" "N"; then
-      DS_TARGET="$(prompt_with_default "Deployment server host:port" "ds.example.org:8089")"
-    fi
-    if yesno_with_default "Add SSL verify (sslVerifyServerCert=true)?" "N"; then
-      SSL_BLOCK=$'sslVerifyServerCert = true\nsslCommonNameToCheck = *'
-    fi
-  else
-    SERVER_LINE="${SPLUNK_UF_RCVR_HOST:-splunk.example.org}:${SPLUNK_UF_RCVR_PORT:-9997}"
-  fi
-
-  cat >/opt/splunkforwarder/etc/system/local/outputs.conf <<OUTCONF
-[tcpout]
-defaultGroup = default-autolb-group
-indexAndForward = false
-
-[tcpout:default-autolb-group]
-server = ${SERVER_LINE}
-autoLB = true
-compressed = ${COMPRESSED}
-useACK = ${USE_ACK}
-${SSL_BLOCK}
-OUTCONF
-
-  cat >/opt/splunkforwarder/etc/system/local/inputs.conf <<INCONF
-[monitor:///var/wade/logs]
-index = ${DEFAULT_INDEX}
-sourcetype = wade:log
-
-[monitor:///var/log/wade/piranha]
-index = ${DEFAULT_INDEX}
-sourcetype = wade:piranha
-
-[monitor:///var/log/wade]
-index = ${DEFAULT_INDEX}
-sourcetype = wade:misc
-INCONF
-
-  if [[ -n "$DS_TARGET" ]]; then
-    cat >/opt/splunkforwarder/etc/system/local/deploymentclient.conf <<DCONF
-[deployment-client]
-
-[target-broker:deploymentServer]
-targetUri = ${DS_TARGET}
-DCONF
-  fi
-
-  chown -R splunkfwd:splunkfwd /opt/splunkforwarder
-  systemctl daemon-reload
-  systemctl enable --now SplunkForwarder.service || systemctl restart SplunkForwarder.service || true
-}
-
-
-
-# Execute Splunk UF step if requested via ONLY_LIST or menu
-if [[ "${ONLY_LIST:-}" == "splunk-uf" ]] || [[ ",${ONLY_LIST:-all}," == *",splunk-uf,"* ]]; then
-  splunk_uf_install_and_config || echo "[!] Splunk UF install/config failed"
-fi
-
