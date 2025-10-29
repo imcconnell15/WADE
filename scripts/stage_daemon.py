@@ -6,7 +6,7 @@
 # - Sorts host images to DataSources/Hosts/<hostname>/ and network configs to DataSources/Network/<hostname>/
 
 import json, os, re, shutil, signal, sqlite3, subprocess, sys, time, string, uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------- Config ----------
@@ -32,15 +32,30 @@ SQLITE_DB = STATE_DIR / "staging_index.sqlite3"
 
 FRAGMENT_LOG = None  # set later
 
+# ---- UTC helpers ----
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def utc_from_ts_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def ymd_from_path_mtime(path: Path) -> str:
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d")
+
 # Light helpers -------------------------------------------------------------
 def load_wade_env():
     env = {}
-    if WADE_ENV.exists():
-        for line in WADE_ENV.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line: continue
-            k, v = line.split("=", 1)
-            env[k.strip()] = v.strip().strip('"').strip("'")
+    for k, v in os.environ.items():
+        if k.startswith("WADE_"):
+            env[k] = v
+    try:
+        if WADE_ENV.exists():
+            for line in WADE_ENV.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line: 
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except PermissionError:
+        pass
     return env
 
 def run_cmd(cmd, timeout=10):
@@ -87,7 +102,7 @@ def already_processed(conn, sig: str) -> bool:
 
 def record_processed(conn, sig: str, path: Path, dest: Path, cls: str, profile: str):
     st = path.stat()
-    now = datetime.utcnow().isoformat()+"Z"
+    now = utc_now_iso()
     conn.execute("""
     INSERT OR REPLACE INTO processed
     (sig, path, size, mtime_ns, first_seen, last_seen, dest_path, classification, profile)
@@ -96,7 +111,7 @@ def record_processed(conn, sig: str, path: Path, dest: Path, cls: str, profile: 
     conn.commit()
 
 def json_log(payload: dict, base_dir: Path = LOG_ROOT):
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     name = payload.get("original_name","item")
     safe = re.sub(r"[^A-Za-z0-9_.-]+","_", name)[:80]
     out = base_dir / f"stage_{ts}_{safe}.json"
@@ -278,7 +293,7 @@ def detect_network_config(path: Path) -> dict|None:
 # Classification orchestrator ----------------------------------------------
 
 def fallback_date_from_fs(path: Path) -> str:
-    return datetime.utcfromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+    return ymd_from_path_mtime(path)
 
 def e01_fragmentation(path: Path) -> dict:
     base = path.with_suffix("")
@@ -369,7 +384,7 @@ def append_fragment_note(fragment_details: dict, dest: Path):
 
 # Main processing -----------------------------------------------------------
 
-def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str):
+def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str, queue_root: Path):
     started = time.time()
     original_name = path.name
     if not wait_until_stable(path, STABLE_SECONDS): return
@@ -411,8 +426,8 @@ def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str)
         "dest_path":str(dest),
         "sig":sig,
         "size_bytes":dest.stat().st_size,
-        "started_at_utc":datetime.utcfromtimestamp(started).isoformat()+"Z",
-        "finished_at_utc":datetime.utcnow().isoformat()+"Z",
+        "started_at_utc": utc_from_ts_iso(started),
+        "finished_at_utc": utc_now_iso(),
         "duration_seconds":round(duration,3),
     }
 
@@ -421,7 +436,7 @@ def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str)
         "schema": "wade.queue.workorder",
         "version": 1,
         "id": str(uuid.uuid4()),
-        "created_utc": datetime.utcnow().isoformat() + "Z",
+        "created_utc": utc_now_iso(),
         "profile": profile,                          # full | light
         "classification": classification,            # e01 | mem | disk_raw | network_config
         "original_name": original_name,
@@ -430,14 +445,13 @@ def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str)
         "size_bytes": dest.stat().st_size,
         "sig": sig,
     }
-    # Type-specific enrichments
     if classification in ("e01","mem"):
-        work["hostname"] = payload.get("hostname") or Path(dest).stem
-        work["date_collected"] = payload.get("date_collected")
+        work["hostname"] = hostname or Path(dest).stem
+        work["date_collected"] = date_collected
     if classification == "network_config":
-        work["vendor"] = payload.get("vendor")
-        work["os_version"] = payload.get("os_version")
-        work["hostname"] = payload.get("hostname")
+        work["vendor"] = details.get("vendor")
+        work["os_version"] = details.get("os_version")
+        work["hostname"] = details.get("hostname") or Path(dest).stem
 
     # Enqueue and record the queue path in the stage log
     queue_path = enqueue_work(queue_root, work)
@@ -486,7 +500,7 @@ def build_paths():
     staging_full = staging_root / "full"
     staging_light = staging_root / "light"
     datasources = home / datadir_name
-    env = load_wade_env()
+
     queue_root = resolve_queue_root(owner, datasources, env)
     ensure_dirs(queue_root)
 
@@ -494,7 +508,7 @@ def build_paths():
     FRAGMENT_LOG = str(datasources / "images_to_be_defragmented.log")
 
     ensure_dirs(staging_full, staging_light, datasources / "Hosts", datasources / "Network")
-    return owner, staging_full, staging_light, datasources
+    return owner, staging_full, staging_light, datasources, queue_root
 
 def iter_files(d: Path):
     for p in d.glob("*"):
@@ -514,11 +528,11 @@ def main():
     while not stop:
         try:
             for p in iter_files(stage_full):
-                process_one(conn, p, datasources, profile="full", owner_user=owner)
+                process_one(conn, p, datasources, profile="full", owner_user=owner, queue_root=queue_root)
             for p in iter_files(stage_light):
-                process_one(conn, p, datasources, profile="light", owner_user=owner)
+                process_one(conn, p, datasources, profile="light", owner_user=owner, queue_root=queue_root)
         except Exception as e:
-            json_log({"event":"staging_error","error":repr(e),"ts":datetime.utcnow().isoformat()+"Z"})
+            json_log({"event":"staging_error","error":repr(e),"ts": utc_now_iso()})
         for _ in range(SCAN_INTERVAL_SEC):
             if stop: break
             time.sleep(1)
