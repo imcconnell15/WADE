@@ -1,7 +1,9 @@
 # WADE
 Automation Framework
 
-WADE – Linux Install & Staging (Heuristic) README
+WADE – Linux Install & Staging (Heuristic)
+
+Build a lightweight, heuristic-driven staging daemon on Linux that classifies and routes forensic artifacts (disk images, memory dumps, network configs) into a shared pipeline with full vs light processing profiles — all while maintaining idempotency, auditability, and zero heavy tooling in staging
 
 This doc captures the current Linux side of WADE: install, the staging daemon (Python), how to use wade.env, the systemd service .conf, how the “full vs light” intake works, and the new work‑order queue in the share for remote pipeline servers.
 ⸻
