@@ -547,7 +547,7 @@ fi
 # Core packages (+ headless Java & truststore)
 #####################################
 ( set -e
-  WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools plocate libewf2 ewf-tools pipx zip unzip)
+  WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools inotify-simple plocate libewf2 ewf-tools pipx zip unzip)
   if [[ "$PM" == "apt" ]]; then
     JAVA_PKG="${JAVA_PACKAGE_APT:-default-jre-headless}"
     bash -lc "$PKG_UPDATE"
@@ -699,24 +699,48 @@ EOF
 ' || fail_note "samba" "share setup failed"
 
 #####################################
-# Staging Service Install
+# Staging Service Install (venv-managed)
 #####################################
+
+# (reuse your existing get_ver_wade_stage, STAGE_SRC, STAGE_EXPECT_SHA)
+# Venv location for the service's interpreter
+VENV_DIR="/home/${LWADEUSER}/.venvs/wade"
 
 run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
   set -e
 
-  # Paths + env
+  # Load config if present (non-fatal)
   . "'"${WADE_ETC}/wade.conf"'" 2>/dev/null || true
   . "'"${WADE_ETC}/wade.env"'" 2>/dev/null || true
 
+  # 1) Install the daemon script
   install -d -m 0755 /opt/wade
   install -m 0755 "'"$STAGE_SRC"'" /opt/wade/stage_daemon.py
 
-  # Logs/state for daemon
+  # 2) Create the WADE venv for the service (owned by the runtime user)
+  install -d -m 0755 "/home/'"${LWADEUSER}"'/.venvs"
+  python3 -m venv "'"$VENV_DIR"'"
+  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "'"$VENV_DIR"'"
+
+  # 3) Install deps into the venv (no system Python writes → PEP 668-safe)
+  "'"$VENV_DIR"'/bin/python" -m pip install -U pip setuptools wheel
+  "'"$VENV_DIR"'/bin/pip" install inotify-simple
+
+  # 4) Smoke test: verify all imports you listed resolve from the venv
+  "'"$VENV_DIR"'/bin/python" - <<'"'"'PY'"'"'
+import json, os, re, shutil, signal, sqlite3, subprocess, sys, time, string, uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Tuple
+from inotify_simple import INotify, flags
+import difflib
+print("WADE staging imports OK from", sys.executable)
+PY
+
+  # 5) Ensure logs/state + staging/share structure exists
   install -d -m 0755 /var/wade/logs/stage /var/wade/state
   chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /var/wade
 
-  # Create watched folders + queue in the share
   STAGING_ROOT="/home/'"${LWADEUSER}"'/'"${WADE_STAGINGDIR}"'"
   DATAS_ROOT="/home/'"${LWADEUSER}"'/'"${WADE_DATADIR}"'"
   QUEUE_DIR="${WADE_QUEUE_DIR:-_queue}"
@@ -725,14 +749,8 @@ run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
       "${STAGING_ROOT}/full" "${STAGING_ROOT}/light" \
       "${DATAS_ROOT}/Hosts" "${DATAS_ROOT}/Network" "${DATAS_ROOT}/${QUEUE_DIR}"
 
-  # Use a unit from the repo if present, else write a secure default
-  if [[ -f "'"${SCRIPT_DIR}"'/scritps/wade-staging.service" ]]; then
-    install -m 0644 "'"${SCRIPT_DIR}"'/scripts/wade-staging.service" /etc/systemd/system/wade-staging.service
-    # Ensure the unit runs as the chosen owner (override if necessary)
-    sed -i -E "s|^User=.*|User='"'"''"${LWADEUSER}"''"'"'|; s|^Group=.*|Group='"'"''"${LWADEUSER}"''"'"'|" /etc/systemd/system/wade-staging.service
-  else
-    cat >/etc/systemd/system/wade-staging.service <<EOF
-
+  # 6) Systemd unit — explicitly run with the venv’s interpreter
+  cat >/etc/systemd/system/wade-staging.service <<EOF
 [Unit]
 Description=WADE Staging Daemon (full vs light)
 After=network-online.target
@@ -741,38 +759,37 @@ ConditionPathExists=/opt/wade/stage_daemon.py
 
 [Service]
 Type=simple
-User='"${LWADEUSER}"'
-Group='"${LWADEUSER}"'
-# Uncomment if your Splunk UF runs as 'splunk' and you created the group:
-SupplementaryGroups=splunk
-
+User=${LWADEUSER}
+Group=${LWADEUSER}
+# If your Splunk UF runs as another user and needs to read outputs, consider:
+# SupplementaryGroups=splunk
 EnvironmentFile=-/etc/wade/wade.env
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/opt/wade
-ExecStart=/usr/bin/python3 /opt/wade/stage_daemon.py
+ExecStart=${VENV_DIR}/bin/python /opt/wade/stage_daemon.py
 Restart=on-failure
-RestartSec=5s
-
-# Make files group-readable for UF; keep group on new dirs/files
+RestartSec=3
 UMask=002
-
-# Sandboxing — allow access to /home and /var/wade for moves & logs
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=false
-ReadWritePaths=/home/'"${LWADEUSER}"' /var/wade
+ReadWritePaths=/home/${LWADEUSER} /var/wade
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  fi
 
+  # 7) Enable & start
   systemctl daemon-reload
   systemctl enable --now wade-staging.service
 
-  # Version marker = installed script hash (lets run_step skip next time)
+  # 8) Version marker (lets your idempotency skip next run)
   sha256sum /opt/wade/stage_daemon.py | awk '"'"'{print $1}'"'"' > "'"${STEPS_DIR}/wade-stage.ver"'"
+
+  # Optional: freeze for reproducibility alongside your repo
+  install -d -m 0755 /home/'"${LWADEUSER}"'/WADE 2>/dev/null || true
+  "'"$VENV_DIR"'/bin/pip" freeze > /home/'"${LWADEUSER}"'/WADE/requirements.lock || true
 ' || fail_note "wade-stage" "service install/start failed"
 
 #####################################
