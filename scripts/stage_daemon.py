@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # WADE Staging Daemon (Python, heuristic edition)
 # - Watches Staging/full and Staging/light
-# - Classifies E01 / mem / raw-dd / network_config via signatures (no heavy tools)
-# - Logs per-file JSON to /var/wade/logs/stage
+# - Classifies E01 / mem / raw-dd / network_config via signatures (no heavy tools by default)
+# - Per-file JSON event logs to /var/wade/logs/stage
+# - Text log (rotating) to /var/wade/logs/stage/stage_daemon.log
 # - Sorts host images to DataSources/Hosts/<hostname>/ and network configs to DataSources/Network/<hostname>/
 
-import json, os, re, shutil, signal, sqlite3, subprocess, sys, time, string, uuid
+import json, os, re, shutil, signal, sqlite3, subprocess, sys, time, string, uuid, logging, logging.handlers
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
@@ -17,22 +18,50 @@ DEFAULT_DATADIR = "DataSources"
 DEFAULT_STAGINGDIR = "Staging"
 
 SCAN_INTERVAL_SEC = int(os.environ.get("WADE_STAGE_SCAN_INTERVAL", "30"))
-STABLE_SECONDS = int(os.environ.get("WADE_STAGE_STABLE_SECONDS", "10"))
+
+# COPY-FINISH guard
+STABLE_SECONDS    = int(os.environ.get("WADE_STAGE_STABLE_SECONDS", "10"))
+MIN_AGE_SECONDS   = int(os.environ.get("WADE_STAGE_MIN_AGE_SECONDS", "2"))
+POLL_SECONDS      = float(os.environ.get("WADE_STAGE_POLL_SECONDS", "1.0"))
+REQUIRE_CLOSED_FD = os.environ.get("WADE_STAGE_REQUIRE_CLOSED_FD", "0").lower() in ("1","true","yes")
 
 # Heuristic scanning caps
-HEAD_SCAN_BYTES = int(os.environ.get("WADE_STAGE_HEAD_SCAN_BYTES", str(1024*1024)))  # 1 MiB
-KDBG_SCAN_BYTES = int(os.environ.get("WADE_STAGE_KDBG_SCAN_BYTES", str(0)))          # 0 disables
-TEXT_SNIFF_BYTES = int(os.environ.get("WADE_STAGE_TEXT_SNIFF_BYTES", str(128*1024))) # 128 KiB
+HEAD_SCAN_BYTES   = int(os.environ.get("WADE_STAGE_HEAD_SCAN_BYTES", str(1024*1024)))       # 1 MiB
+KDBG_SCAN_BYTES   = int(os.environ.get("WADE_STAGE_KDBG_SCAN_BYTES", str(32*1024*1024)))    # 32 MiB default
+TEXT_SNIFF_BYTES  = int(os.environ.get("WADE_STAGE_TEXT_SNIFF_BYTES", str(128*1024)))       # 128 KiB
 TEXT_MIN_PRINTABLE_RATIO = float(os.environ.get("WADE_STAGE_TEXT_MIN_PRINTABLE_RATIO", "0.92"))
 
+# Optional tool probe for extension-less memory files
+MEM_VOL_PROBE = os.environ.get("WADE_STAGE_MEM_VOL_PROBE", "0").lower() in ("1","true","yes")
+
 STATE_DIR = Path("/var/wade/state")
-LOG_ROOT = Path("/var/wade/logs/stage")
+LOG_ROOT  = Path("/var/wade/logs/stage")
+TEXT_LOG  = LOG_ROOT / "stage_daemon.log"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_ROOT.mkdir(parents=True, exist_ok=True)
 SQLITE_DB = STATE_DIR / "staging_index.sqlite3"
 
-FRAGMENT_LOG = None  # set later
-STAGING_ROOT: Optional[Path] = None  # set in build_paths()
+FRAGMENT_LOG: Optional[str] = None
+STAGING_ROOT: Optional[Path] = None
+
+INCOMPLETE_SUFFIXES = (".part", ".partial", ".tmp", ".crdownload", ".copying")
+
+# ---- Logging ----
+def init_logging() -> logging.Logger:
+    level_name = os.environ.get("WADE_STAGE_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    handlers = []
+    try:
+        TEXT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.handlers.RotatingFileHandler(str(TEXT_LOG), maxBytes=5*1024*1024, backupCount=3))
+    except Exception:
+        pass
+    handlers.append(logging.StreamHandler(sys.stdout))
+    logging.basicConfig(level=level, format="%(asctime)sZ %(levelname)s %(message)s", handlers=handlers)
+    logging.Formatter.converter = time.gmtime  # force UTC in text log
+    return logging.getLogger("wade.staging")
+
+log = init_logging()
 
 # ---- UTC helpers ----
 def utc_now_iso() -> str:
@@ -46,7 +75,8 @@ def ymd_from_path_mtime(path: Path) -> str:
 def load_wade_env():
     env = {}
     for k, v in os.environ.items():
-        if k.startswith("WADE_"): env[k] = v
+        if k.startswith("WADE_"):
+            env[k] = v
     try:
         if WADE_ENV.exists():
             for line in WADE_ENV.read_text().splitlines():
@@ -70,16 +100,16 @@ def run_cmd(cmd, timeout=10):
         return 1, "", str(e)
 
 def which(cmd: str) -> Optional[str]:
-    # Simple PATH search; also check a few common Vol3/ewf install spots
     for p in os.environ.get("PATH", "").split(os.pathsep):
         cand = Path(p) / cmd
         if cand.is_file() and os.access(cand, os.X_OK):
             return str(cand)
-    # extras
+    # a few common extras we care about
     extras = [
         "/usr/local/bin/vol", "/usr/bin/vol", "/opt/pipx/venvs/volatility3/bin/vol",
         "/usr/local/bin/target-info", "/usr/bin/target-info",
         "/usr/local/bin/ewfinfo", "/usr/bin/ewfinfo",
+        "/usr/sbin/lsof", "/usr/bin/lsof",
     ]
     base = Path(cmd).name
     for e in extras:
@@ -90,17 +120,50 @@ def which(cmd: str) -> Optional[str]:
 def ensure_dirs(*paths):
     for p in paths: Path(p).mkdir(parents=True, exist_ok=True)
 
-def wait_until_stable(path: Path, stable_seconds: int) -> bool:
-    if not path.exists(): return False
-    last = path.stat().st_size
-    left = stable_seconds
-    while left > 0:
-        time.sleep(1)
-        if not path.exists(): return False
-        size = path.stat().st_size
-        if size == last: left -= 1
-        else: last = size; left = stable_seconds
-    return True
+# ---- Strong “wait until finished” guard ----------------------------------
+def wait_to_finish(path: Path,
+                   stable_seconds: int = STABLE_SECONDS,
+                   min_age_seconds: int = MIN_AGE_SECONDS,
+                   poll_seconds: float = POLL_SECONDS,
+                   require_closed_fd: bool = REQUIRE_CLOSED_FD) -> bool:
+    if not path.exists():
+        return False
+
+    last_size = -1
+    last_mtime_ns = -1
+    remaining = stable_seconds
+    lsof_path = which("lsof") if require_closed_fd else None
+
+    while True:
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            return False
+
+        if st.st_size == last_size and st.st_mtime_ns == last_mtime_ns:
+            remaining -= poll_seconds
+        else:
+            last_size = st.st_size
+            last_mtime_ns = st.st_mtime_ns
+            remaining = stable_seconds
+
+        if remaining <= 0:
+            age = time.time() - st.st_mtime
+            if age < min_age_seconds:
+                time.sleep(max(poll_seconds, min_age_seconds - age))
+                remaining = stable_seconds
+                continue
+
+            if lsof_path:
+                rc, out, _ = run_cmd([lsof_path, "-t", "--", str(path)], timeout=5)
+                if rc == 0 and out.strip():
+                    time.sleep(poll_seconds)
+                    remaining = stable_seconds
+                    continue
+
+            return True
+
+        time.sleep(poll_seconds)
 
 def fast_signature(path: Path) -> str:
     st = path.stat()
@@ -132,6 +195,8 @@ def record_processed(conn, sig: str, path: Path, dest: Path, cls: str, profile: 
     conn.commit()
 
 def json_log(payload: dict, base_dir: Path = LOG_ROOT):
+    # always include ts_utc
+    payload.setdefault("ts_utc", utc_now_iso())
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     name = payload.get("original_name","item")
     safe = re.sub(r"[^A-Za-z0-9_.-]+","_", name)[:80]
@@ -162,7 +227,7 @@ def resolve_queue_root(owner: str, datasources: Path, env: dict) -> Path:
     qpath = Path(q)
     if qpath.is_absolute():
         return qpath
-    return datasources / qpath  # relative under DataSources
+    return datasources / qpath
 
 def write_json_atomic(path: Path, obj: dict):
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -171,7 +236,6 @@ def write_json_atomic(path: Path, obj: dict):
     os.replace(tmp, path)
 
 def enqueue_work(queue_root: Path, work: dict) -> Path:
-    # queue/<classification>/<profile>/<uuid>.json
     cls = work.get("classification", "unknown")
     prof = work.get("profile", "light")
     qdir = queue_root / cls / prof
@@ -182,29 +246,23 @@ def enqueue_work(queue_root: Path, work: dict) -> Path:
     return wpath
 
 # Heuristic detectors -------------------------------------------------------
-
 def is_e01(path: Path) -> bool:
-    # Extension-first (case-insensitive)
-    if path.suffix.lower() == ".e01": 
+    if path.suffix.lower() == ".e01":
         return True
     rc, out, _ = run_cmd(["file","-b",str(path)], timeout=5)
     return ("EnCase" in out) or ("EWF" in out)
 
 def detect_disk_image(path: Path) -> Optional[dict]:
-    """Return details if looks like a block/disk image."""
     try:
         head = read_head(path, min(HEAD_SCAN_BYTES, path.stat().st_size))
         size = len(head)
-        # GPT @ LBA1 (offset 512): "EFI PART"
         if size >= 520 and b"EFI PART" in head[512:520]:
             return {"kind":"gpt", "evidence":"EFI PART header"}
-        # MBR 0x55AA signature at 510
         if size >= 512 and head[510:512] == b"\x55\xaa":
             pt = head[446:446+64]
             if any(pt[i] != 0 for i in range(64)):
                 return {"kind":"mbr", "evidence":"MBR 0x55AA + non-empty PT"}
             return {"kind":"mbr", "evidence":"MBR 0x55AA"}
-        # FS boot sigs near start
         if size >= 512:
             if head[3:11] == b"NTFS    ":
                 return {"kind":"fs", "evidence":"NTFS boot sig"}
@@ -216,30 +274,36 @@ def detect_disk_image(path: Path) -> Optional[dict]:
 
 def name_looks_memory(path: Path) -> bool:
     n = path.name.lower()
-    return any(s in n for s in (".mem", ".vmem", "hiberfil", "hibernat", "winpmem", "rawmem", "ramdump", ".lime"))
+    # cover names without dot extensions (e.g., "immamemoryfile")
+    return any(s in n for s in (".mem", ".vmem", ".lime", "hiberfil", "winpmem", "rawmem", "ramdump", "memory", "memdump", "physmem"))
 
 def detect_memory_dump(path: Path) -> Optional[dict]:
-    """Return details if looks like a memory dump (quick, no Vol)."""
     try:
         head = read_head(path, min(max(HEAD_SCAN_BYTES, 4096), path.stat().st_size))
-        # Windows hibernation header
         if head[:4] in (b"HIBR", b"Hibr", b"hibr"):
             return {"kind":"hibernation", "evidence":"HIBR magic"}
-        # LiME
         if head[:4] == b"LiME":
             return {"kind":"lime", "evidence":"LiME magic"}
-        # Optional KDBG probe
-        if KDBG_SCAN_BYTES > 0 and b"KDBG" in head[:min(KDBG_SCAN_BYTES, len(head))]:
-            return {"kind":"raw", "evidence":"KDBG observed in head"}
-        # Name-hint last
+        # KDBG scan window (configurable)
+        if KDBG_SCAN_BYTES > 0:
+            scan = read_head(path, min(KDBG_SCAN_BYTES, path.stat().st_size))
+            if b"KDBG" in scan:
+                return {"kind":"raw", "evidence":"KDBG observed"}
+        # Name hint if not a disk
         if name_looks_memory(path) and not detect_disk_image(path):
             return {"kind":"raw", "evidence":"name hint (mem) and not disk"}
     except Exception:
         pass
+    # Optional volatility probe (off by default)
+    if MEM_VOL_PROBE:
+        vol = os.environ.get("WADE_VOL_PATH") or which("vol")
+        if vol:
+            rc, out, _ = run_cmd([vol, "-f", str(path), "windows.info.Info"], timeout=45)
+            if rc == 0 and re.search(r"\bSystemTime\b", out):
+                return {"kind":"raw", "evidence":"volatility info probe"}
     return None
 
 # Network configuration detection ------------------------------------------
-
 NET_VENDOR = ("cisco_ios","juniper_junos","vyos_edgeos","arista_eos","mikrotik_ros")
 
 def detect_cisco_ios(text: str) -> Optional[dict]:
@@ -300,43 +364,70 @@ def detect_network_config(path: Path) -> Optional[dict]:
     return None
 
 # Optional best-effort metadata via tools ----------------------------------
+def _json_deep_get_first_str(d):
+    # walk nested dicts/lists to find first 'hostname'-ish key (case-insensitive)
+    stack = [d]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if isinstance(k, str) and k.lower() in ("hostname", "host_name", "computername", "computer_name"):
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                stack.append(v)
+        elif isinstance(x, list):
+            stack.extend(x)
+    return None
 
 def best_effort_e01_meta(path: Path) -> Tuple[Optional[str], Optional[str]]:
-    """Return (hostname, date_yyyy_mm_dd) if tools are available."""
     host = None
     datecol = None
+
+    # Prefer Dissect's target-info JSON
     tgt = which("target-info")
     if tgt:
-        rc, out, _ = run_cmd([tgt, str(path), "-j"], timeout=20)
+        rc, out, _ = run_cmd([tgt, str(path), "-j"], timeout=30)
         if rc == 0:
             try:
                 j = json.loads(out)
-                host = j.get("hostname") or host
+                # try shallow then deep
+                host = j.get("hostname") or _json_deep_get_first_str(j) or host
             except Exception:
                 pass
+        if host is None:
+            # Plain-text fallback (your example format)
+            rc, out, _ = run_cmd([tgt, str(path)], timeout=30)
+            if rc == 0 and out:
+                m = re.search(r"(?m)^Hostname\s*:\s*(\S+)", out)
+                if m: host = m.group(1).strip()
+                # install date is not "acquisition date" but gives a useful y-m-d
+                m = re.search(r"(?m)^Install date\s*:\s*([^\n]+)", out)
+                if m:
+                    s = m.group(1)
+                    m2 = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+                    if m2: datecol = m2.group(1)
+
+    # ewfinfo for acquisition date (better “date collected”)
     ewf = which("ewfinfo")
     if ewf:
-        rc, out, _ = run_cmd([ewf, str(path)], timeout=20)
+        rc, out, _ = run_cmd([ewf, str(path)], timeout=30)
         if rc == 0:
-            m = re.search(r"Acquisition date\s*:\s*(.+)", out)
+            m = re.search(r"(?i)Acquisition date\s*:\s*([^\n]+)", out)
             if m:
-                s = m.group(1).strip()
-                # Try to pull an ISO-like date from the string
-                mm = re.search(r"(\d{4}-\d{2}-\d{2})", s)
-                if mm:
-                    datecol = mm.group(1)
+                s = m.group(1)
+                m2 = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+                if m2:
+                    datecol = m2.group(1)
+
     return host, datecol
 
 def best_effort_mem_meta(path: Path) -> Tuple[Optional[str], Optional[str]]:
-    """Return (hostname, date_yyyy_mm_dd) using Vol if available (Windows-centric)."""
     vol = os.environ.get("WADE_VOL_PATH") or which("vol")
     if not vol:
         return None, None
-    # Registry hive offset for SYSTEM
-    rc, out, _ = run_cmd([vol, "-f", str(path), "windows.registry.hivelist"], timeout=45)
     host = None
+    rc, out, _ = run_cmd([vol, "-f", str(path), "windows.registry.hivelist"], timeout=45)
     if rc == 0:
-        # first column is virtual offset; find line that contains SYSTEM
         for line in out.splitlines():
             if "SYSTEM" in line:
                 off = line.split()[0]
@@ -344,20 +435,17 @@ def best_effort_mem_meta(path: Path) -> Tuple[Optional[str], Optional[str]]:
                                         "--offset", off, "--key",
                                         r"ControlSet001\\Control\\ComputerName\\ComputerName"], timeout=45)
                 if rc2 == 0:
-                    # crude parse of 'ComputerName : "HOST"'
                     mm = re.search(r'ComputerName.*?"([^"]+)"', out2)
                     if mm: host = mm.group(1).strip()
                 break
     datecol = None
     rc3, out3, _ = run_cmd([vol, "-f", str(path), "windows.info.Info"], timeout=45)
     if rc3 == 0:
-        # Look for SystemTime or similar and pull YYYY-MM-DD
         mm = re.search(r'(\d{4}-\d{2}-\d{2})', out3)
         if mm: datecol = mm.group(1)
     return host, datecol
 
 # Classification orchestrator ----------------------------------------------
-
 def fallback_date_from_fs(path: Path) -> str:
     return ymd_from_path_mtime(path)
 
@@ -367,13 +455,11 @@ def e01_fragmentation(path: Path) -> dict:
     return {"fragmented": len(parts)>0, "parts": parts}
 
 def match_host_from_filename(datasources: Path, path: Path) -> Optional[str]:
-    """Try to map a filename to an existing host dir."""
     try:
         hosts_dir = datasources / "Hosts"
         if not hosts_dir.exists(): return None
         fn = path.stem.lower()
         candidates = [d.name for d in hosts_dir.iterdir() if d.is_dir()]
-        # exact match or prefix match
         for h in candidates:
             hl = h.lower()
             if fn == hl or fn.startswith(hl) or hl in fn:
@@ -383,76 +469,58 @@ def match_host_from_filename(datasources: Path, path: Path) -> Optional[str]:
     return None
 
 def classify(path: Path, datasources: Path) -> Tuple[str, dict]:
-    """
-    Returns (classification, details)
-    classification: 'e01' | 'mem' | 'disk_raw' | 'network_config' | 'misc' | 'unknown'
-    details: dict with fields per type
-    """
     ext = path.suffix.lower()
 
-    # 0) Extension-first rules
+    # 0) extension-first
     if ext == ".e01":
-        cls = "e01"
-        details = {
-            "date_collected": fallback_date_from_fs(path),
-            "hostname": path.stem,
-            "fragmentation": e01_fragmentation(path),
-        }
-        # Best-effort enrichment
+        details = {"date_collected": fallback_date_from_fs(path),
+                   "hostname": path.stem,
+                   "fragmentation": e01_fragmentation(path)}
         h2, d2 = best_effort_e01_meta(path)
         if h2: details["hostname"] = h2
         if d2: details["date_collected"] = d2
-        return cls, details
+        return "e01", details
 
-    if ext in {".mem", ".vmem", ".lime", ".sys"} or "hiberfil" in path.name.lower():
-        cls = "mem"
-        details = {
-            "date_collected": fallback_date_from_fs(path),
-            "hostname": path.stem,
-            "mem_signature": detect_memory_dump(path) or {"kind":"raw","evidence":"extension-based"},
-        }
-        # Best-effort with Vol if present
+    if ext in {".mem", ".vmem", ".lime"} or "hiberfil" in path.name.lower():
+        details = {"date_collected": fallback_date_from_fs(path),
+                   "hostname": path.stem,
+                   "mem_signature": detect_memory_dump(path) or {"kind":"raw","evidence":"extension-based"}}
         h2, d2 = best_effort_mem_meta(path)
         if h2: details["hostname"] = h2
         if d2: details["date_collected"] = d2
-        return cls, details
+        return "mem", details
 
-    # 1) Network config (text) by content
+    # 1) network configs (textual)
     net = detect_network_config(path)
     if net:
         return "network_config", net
 
-    # 2) Ambiguous raw/dd -> try disk heuristics first; fallback to mem if no disk sig but name hints
+    # 2) raw/dd: prefer disk then mem
     if ext in {".raw", ".dd"}:
         dsk = detect_disk_image(path)
         if dsk:
             return "disk_raw", {"disk_signature": dsk, "date_collected": fallback_date_from_fs(path)}
         mem = detect_memory_dump(path)
         if mem:
-            # conservative: treat as mem if disk sig absent but mem signs present
             h2, d2 = best_effort_mem_meta(path)
-            return "mem", {
-                "mem_signature": mem,
-                "date_collected": d2 or fallback_date_from_fs(path),
-                "hostname": h2 or path.stem
-            }
+            return "mem", {"mem_signature": mem,
+                           "date_collected": d2 or fallback_date_from_fs(path),
+                           "hostname": h2 or path.stem}
 
-    # 3) Try disk heuristics (no extension help)
+    # 3) disk by magic
     dsk2 = detect_disk_image(path)
     if dsk2:
         return "disk_raw", {"disk_signature": dsk2, "date_collected": fallback_date_from_fs(path)}
 
-    # 4) Try mem heuristics (no extension help)
+    # 4) mem by magic (incl. optional vol-probe)
     mem2 = detect_memory_dump(path)
     if mem2:
         h2, d2 = best_effort_mem_meta(path)
-        return "mem", {
-            "mem_signature": mem2,
-            "date_collected": d2 or fallback_date_from_fs(path),
-            "hostname": h2 or path.stem
-        }
+        return "mem", {"mem_signature": mem2,
+                       "date_collected": d2 or fallback_date_from_fs(path),
+                       "hostname": h2 or path.stem}
 
-    # 5) Misc fallback — try to place under an existing host/misc/
+    # 5) misc fallback into existing host “misc” if filename matches a known host
     mh = match_host_from_filename(datasources, path)
     if mh:
         return "misc", {"hostname": mh, "date_collected": fallback_date_from_fs(path)}
@@ -460,29 +528,26 @@ def classify(path: Path, datasources: Path) -> Tuple[str, dict]:
     return "unknown", {}
 
 # Placement ----------------------------------------------------------------
-
 def move_and_rename(path: Path, out_root: Path, classification: str, hostname: Optional[str], date_str: str) -> Path:
     if classification == "network_config":
         host = hostname or path.stem
         dest_dir = out_root / "Network" / host
         ensure_dirs(dest_dir)
         ext = path.suffix or ".cfg"
-        new_name = f"cfg_{host}_{date_str}{ext}"
-        dest = dest_dir / new_name
+        dest = dest_dir / f"cfg_{host}_{date_str}{ext}"
     elif classification == "misc":
         host = hostname or "_unsorted"
         dest_dir = out_root / "Hosts" / host / "misc"
         ensure_dirs(dest_dir)
-        dest = dest_dir / path.name  # keep original name for misc
+        dest = dest_dir / path.name
     else:
         host = hostname or path.stem
         dest_dir = out_root / "Hosts" / host
         ensure_dirs(dest_dir)
         ext = path.suffix
-        if classification == "e01": ext = ".E01"  # keep canonical case for E01
+        if classification == "e01": ext = ".E01"
         elif classification == "mem": ext = ext if ext else ".mem"
-        new_name = f"{host}_{date_str}{ext}"
-        dest = dest_dir / new_name
+        dest = dest_dir / f"{host}_{date_str}{ext}"
 
     i = 1
     while dest.exists():
@@ -515,47 +580,62 @@ def append_fragment_note(fragment_details: dict, dest: Path):
     with open(FRAGMENT_LOG, "a") as f: f.write("\n".join(lines))
 
 # Main processing -----------------------------------------------------------
-
 def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str, queue_root: Path):
-    started = time.time()
     original_name = path.name
-    if not wait_until_stable(path, STABLE_SECONDS): return
+
+    # Skip obviously incomplete suffixes
+    low = str(path).lower()
+    if low.endswith(INCOMPLETE_SUFFIXES) or path.suffix.lower() in INCOMPLETE_SUFFIXES:
+        log.debug(f"skip incomplete-suffix: {path}")
+        return
+
+    # Strong copy-finish guard
+    if not wait_to_finish(path):
+        return
+
+    started = time.time()
     sig = fast_signature(path)
 
+    # Duplicate guard → Staging/ignored
     if already_processed(conn, sig):
-        # Move duplicate aside into Staging/ignored
         if STAGING_ROOT:
             ignored = STAGING_ROOT / "ignored"
             ensure_dirs(ignored)
-            dest = ignored / path.name
+            dest_ignored = ignored / path.name
             try:
-                path.rename(dest)
+                path.rename(dest_ignored)
             except Exception:
-                shutil.move(str(path), str(dest))
+                shutil.move(str(path), str(dest_ignored))
             json_log({
                 "event":"staging_duplicate_ignored",
                 "original_name":original_name,
-                "full_path":str(dest),
+                "full_path":str(dest_ignored),
                 "profile":profile,
                 "sig":sig,
-                "size_bytes":dest.stat().st_size
+                "size_bytes":dest_ignored.stat().st_size
             })
+            log.info(f"duplicate → ignored: {dest_ignored}")
         return
 
-    # Classify (may also enrich metadata)
+    # Classify
     classification, details = classify(path, out_root)
+    log.info(f"classified {path} → {classification}")
 
     if classification == "unknown":
+        # one-time log + record to stop repeat spam
         json_log({
             "event":"staging_skipped_unknown","original_name":original_name,"full_path":str(path),
             "profile":profile,"sig":sig,"size_bytes":path.stat().st_size,"reason":"unrecognized file type"
         })
+        record_processed(conn, sig, path, path, "unknown", profile)
+        log.warning(f"unknown file type, recorded to prevent repeat logs: {path}")
         return
 
-    # Common fields to derive
+    # Derive common fields
     hostname = details.get("hostname") or None
     date_collected = details.get("date_collected") or fallback_date_from_fs(path)
 
+    # Move/rename
     dest = move_and_rename(path, out_root, classification, hostname, date_collected)
     try:
         shutil.chown(dest, user=owner_user, group=owner_user)
@@ -582,16 +662,16 @@ def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str,
         "duration_seconds":round(duration,3),
     }
 
-    # Build a work-order for downstream consumers
+    # Build work order
     work = {
         "schema": "wade.queue.workorder",
         "version": 1,
         "id": str(uuid.uuid4()),
         "created_utc": utc_now_iso(),
-        "profile": profile,                          # full | light
-        "classification": classification,            # e01 | mem | disk_raw | network_config | misc
+        "profile": profile,
+        "classification": classification,
         "original_name": original_name,
-        "source_host": os.uname().nodename,          # producer host
+        "source_host": os.uname().nodename,
         "dest_path": str(dest),
         "size_bytes": dest.stat().st_size,
         "sig": sig,
@@ -606,11 +686,9 @@ def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str,
     if classification == "misc":
         work["hostname"] = hostname or "_unsorted"
 
-    # Enqueue and record the queue path in the stage log
     queue_path = enqueue_work(queue_root, work)
     payload["queue_path"] = str(queue_path)
 
-    # Evidence details in the log (handy for Splunk)
     if classification == "disk_raw":
         payload["evidence"] = details.get("disk_signature")
     elif classification == "mem":
@@ -618,6 +696,7 @@ def process_one(conn, path: Path, out_root: Path, profile: str, owner_user: str,
 
     json_log(payload)
     record_processed(conn, sig, dest, dest, classification, profile)
+    log.info(f"staged → {classification} {dest} (queued {queue_path.name}) in {duration:.2f}s")
 
 def build_paths():
     env = load_wade_env()
@@ -643,7 +722,7 @@ def build_paths():
 
 def iter_files(d: Path):
     for p in d.glob("*"):
-        if p.is_file() and not p.name.lower().endswith((".part",".tmp",".crdownload")):
+        if p.is_file() and not p.name.lower().endswith(INCOMPLETE_SUFFIXES):
             yield p
 
 def main():
@@ -655,7 +734,7 @@ def main():
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
-    print("[*] WADE staging daemon (heuristic) running…")
+    log.info("[*] WADE staging daemon (heuristic) running…")
     while not stop:
         try:
             for p in iter_files(stage_full):
@@ -663,11 +742,14 @@ def main():
             for p in iter_files(stage_light):
                 process_one(conn, p, datasources, profile="light", owner_user=owner, queue_root=queue_root)
         except Exception as e:
-            json_log({"event":"staging_error","error":repr(e),"ts": utc_now_iso()})
-        for _ in range(SCAN_INTERVAL_SEC):
+            json_log({"event":"staging_error","error":repr(e),"ts_utc": utc_now_iso()})
+            log.exception("staging_error")
+        # sleep with early exit
+        steps = max(1, int(SCAN_INTERVAL_SEC / POLL_SECONDS))
+        for _ in range(steps):
             if stop: break
-            time.sleep(1)
-    print("[*] WADE staging daemon exiting.")
+            time.sleep(POLL_SECONDS)
+    log.info("[*] WADE staging daemon exiting.")
 
 if __name__ == "__main__":
     main()
