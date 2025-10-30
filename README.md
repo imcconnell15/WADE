@@ -1,145 +1,161 @@
-WADE — Wide-Area Data Extraction
+# WADE — Wide-Area Data Extraction
 
-WADE is a DFIR automation framework for staging, routing, and processing forensic artifacts at scale, with outputs designed for Splunk search and visualization. It aims to be:
+*A DFIR automation framework for staging, routing, and processing forensic artifacts at scale—built for austere ops, friendly to Splunk, and allergic to drama.*
 
-Idempotent & auditable: predictable installs, per-file JSON logs, state tracking
+---
 
-Modular: small wade-* services (start with wade-stage) you can add over time
+## TL;DR
 
-Online or offline: install works with pinned packages and offline kits (road-mapped)
+* **Idempotent & auditable** — predictable installs, per-file JSON logs, state tracking
+* **Modular** — small `wade-*` services (starting with `wade-stage`) you can add over time
+* **Online or offline** — works with pinned packages; offline kit is on the roadmap
+* **Ops-friendly** — sane defaults, `systemd` units, `logrotate`, single `.env`
 
-Ops-friendly: sane defaults, systemd units, logrotate, single .env
+Repo: **[https://github.com/imcconnell15/WADE](https://github.com/imcconnell15/WADE)**
 
-Core repo layout: scripts/, splunkapp/, stigs/, top-level install.sh and Python helpers. 
-GitHub
+---
 
-What WADE does (today)
+## What WADE Does (Today)
 
-Staging daemon (wade-stage)
+### `wade-stage` — Staging Daemon
 
-Watches Staging/{full,light} for new files
+* Watches `Staging/{full,light}` for new files
+* Classifies artifacts with fast header/hint checks (E01/EWF, raw disks, memory dumps, network configs)
+* Moves/renames into `DataSources/...` using a consistent `<HOST>/<DATE>` scheme
+* Writes **per-file JSON logs** to `/var/wade/logs/stage/`
+* Drops **work-order JSON** into a `_queue/` share for downstream processors (Dissect, Volatility, Plaso, etc.)
 
-Classifies artifacts without heavy tooling (headers & hints): E01/EWF, raw disks, memory dumps, network configs
+> **Config:** All tunables live in `/etc/wade/wade.env`.
+> **Service:** Managed by `systemd` and ships with a `logrotate` policy (uses `SIGUSR1` to reopen logs).
 
-Moves/renames into DataSources/… with a consistent host/date naming scheme
+---
 
-Writes a per-file JSON log to /var/wade/logs/stage/
+## Repo Structure
 
-Drops a work-order JSON in a share _queue/ for downstream workers (Dissect, Volatility, Plaso, etc.) to pick up later
-
-All tunables live in /etc/wade/wade.env. Service is managed by systemd and ships with a logrotate policy (USR1 reopen). These pieces are reflected in the current README and script set. 
-GitHub
-
-Repo structure
+```
 WADE/
 ├─ scripts/           # helper scripts & service bits (growing over time)
 ├─ splunkapp/         # Splunk app scaffolding (indexes/props/transforms & more)
 ├─ stigs/             # STIG-ish hardening bits and checklists
 ├─ install.sh         # idempotent installer (Linux host bootstrap & config)
 └─ loader_patch.py    # helper/loader utility (dev)
+```
 
+Browse the tree for the latest content.
 
-Browse the tree for the latest content. 
-GitHub
+---
 
-Quick start (Linux host)
+## Quick Start (Linux Host)
 
-Tested as a Linux-first flow; Windows workers come later (KAPE/Zimmerman/etc.).
+Tested Linux-first; Windows workers (KAPE/Zimmerman/etc.) come later.
 
-Clone & run installer
-
+```bash
 git clone https://github.com/imcconnell15/WADE.git
 cd WADE
 sudo -E bash ./install.sh
+```
 
+The installer bootstraps packages, users/dirs, env files, and the `wade-stage` service.
+Splunk UF and app packaging are in the project plan; see [`splunkapp/`](./splunkapp/).
 
-The installer bootstraps packages, users/dirs, env files, and the wade-stage service.
+---
 
-Splunk UF and app packaging are included in the project plan; see splunkapp/.
+## Service Lifecycle
 
-Service lifecycle
-
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now wade-stage.service
 sudo systemctl status wade-stage.service
 journalctl -u wade-stage -f
+```
 
+---
 
-Where to drop things
+## Where to Drop Things
 
+```
 /home/autopsy/Staging/
 ├─ full/   # full pipeline targets (full tooling downstream)
 └─ light/  # minimal pipeline / triage
+```
 
+### What Shows Up
 
-What shows up
+* Processed data → `/home/autopsy/DataSources/Hosts/<HOST>/...`
+* Per-file JSON logs → `/var/wade/logs/stage/`
+* Work orders (JSON) → `<share>/_queue/...` for processors to consume
 
-Processed data → /home/autopsy/DataSources/Hosts/<HOST>/... (and /Network/... for configs)
+---
 
-Per-file JSON logs → /var/wade/logs/stage/
+## Configuration
 
-Work orders (JSON) → <share>/_queue/… for your processors to consume
+**Everything lives in** `/etc/wade/wade.env`. Common keys you’ll see:
 
-These behaviors match the current project docs and scripts. 
-GitHub
+| Key                       | Purpose                                                     |
+| ------------------------- | ----------------------------------------------------------- |
+| `WADE_OWNER_USER`         | Service/account owner (e.g., `autopsy`)                     |
+| `WADE_DATADIR`            | Root for processed data (e.g., `/home/autopsy/DataSources`) |
+| `WADE_STAGINGDIR`         | Inbound watch root (e.g., `/home/autopsy/Staging`)          |
+| `WADE_QUEUE_DIR`          | Work-order drop location (absolute or `~autopsy` relative)  |
+| `WADE_SCAN_INTERVAL`      | Poll cadence / stabilization window                         |
+| `WADE_SNIFF_HEADER_BYTES` | Header bytes to read for classification                     |
+| `WADE_SNIFF_TEXT_BYTES`   | Text bytes to sample when needed                            |
 
-Configuration
+**Example snippet:**
 
-All runtime tunables live in /etc/wade/wade.env. Examples you’ll see in the docs:
+```env
+WADE_OWNER_USER=autopsy
+WADE_DATADIR=/home/autopsy/DataSources
+WADE_STAGINGDIR=/home/autopsy/Staging
+WADE_QUEUE_DIR=/home/autopsy/_queue
+WADE_SCAN_INTERVAL=5
+WADE_SNIFF_HEADER_BYTES=4096
+WADE_SNIFF_TEXT_BYTES=16384
+```
 
-Identity/paths: WADE_OWNER_USER, WADE_DATADIR, WADE_STAGINGDIR
+> **After changes:** `sudo systemctl restart wade-stage.service`
 
-Scanner cadence & stabilization windows
+---
 
-Header/text sniff sizes for classification
+## Logging & Rotation
 
-Queue directory (absolute or relative under ~autopsy)
+* Per-artifact JSON logs under `/var/wade/logs/stage/`
+* Rotated **daily**, keep **14** compressed archives
+* Uses `SIGUSR1` (no `copytruncate`) so the daemon cleanly reopens the file
 
-The README in-repo outlines these keys and restart steps. 
-GitHub
+This policy is wired automatically by `install.sh` during service setup.
 
-Logging & rotation
+---
 
-Logs are written per artifact to /var/wade/logs/stage/ as JSON.
+## Splunk
 
-A logrotate policy rotates daily, keeps 14 compressed archives, and signals the service with SIGUSR1 so it reopens its log file (no copytruncate).
+A WADE Splunk app scaffold lives under [`splunkapp/`](./splunkapp/) to centralize:
 
-install.sh wires this automatically during service setup.
+* **Indexes / sourcetypes** (e.g., `wade_<tool>`)
+* **Props/transforms** for JSONL/JSON tool outputs
+* **Deployment packaging** for Universal Forwarders (road-mapped)
 
-This pattern is baked into the repo’s service guidance. 
-GitHub
+Use it as your starting point for search, dashboards, and operational views.
 
-Splunk
+---
 
-A WADE Splunk app scaffold lives under splunkapp/ to centralize:
+## Roadmap (Abridged)
 
-indexes / sourcetypes
+* [ ] Windows worker host with KAPE / Zimmerman / RECmd
+* [ ] Processor services: Dissect, Volatility3, Plaso, Hayabusa, YARA, Bulk Extractor
+* [ ] Offline kit packaging for air-gapped installs (pinned artifacts)
+* [ ] Splunk: final indexes, props/transforms, saved searches, dashboards
+* [ ] More `wade-*` services + a shared work-order schema
 
-props/transforms for JSONL/JSON tools
+---
 
-deployment packaging for UFs (road-mapped)
+## License
 
-Use this as your starting point for index naming like wade_<tool> and the dashboards you build on top. Repo contains the app folder today. 
-GitHub
+MIT — see [`LICENSE`](./LICENSE).
 
-Roadmap (abridged)
+---
 
-Windows worker host with KAPE/Zimmerman/RECmd, etc.
+## Credits
 
-Processors: Dissect, Volatility3, Plaso, Hayabusa, YARA, Bulk Extractor
-
-Offline kit packaging for air-gapped installs (pinned artifacts)
-
-Splunk: final indexes, props/transforms, saved searches, dashboards
-
-More wade-* services for each processor + a shared work-order schema
-
-License
-
-MIT — see LICENSE
-. 
-GitHub
-
-Credits
-
-Built by practitioners who want DFIR automation that’s simple to deploy, easy to audit, and friendly to both online and austere environments. Shout out to one Mr Speaks
+Built by practitioners who want DFIR automation that’s simple to deploy, easy to audit, and comfortable both online and in austere environments.
+Shout-out to **Mr. Speaks**.
