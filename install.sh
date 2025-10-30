@@ -726,12 +726,13 @@ run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
       "${DATAS_ROOT}/Hosts" "${DATAS_ROOT}/Network" "${DATAS_ROOT}/${QUEUE_DIR}"
 
   # Use a unit from the repo if present, else write a secure default
-  if [[ -f "'"${SCRIPT_DIR}"'/wade-staging.service" ]]; then
-    install -m 0644 "'"${SCRIPT_DIR}"'/wade-staging.service" /etc/systemd/system/wade-staging.service
+  if [[ -f "'"${SCRIPT_DIR}"'/scritps/wade-staging.service" ]]; then
+    install -m 0644 "'"${SCRIPT_DIR}"'/scripts/wade-staging.service" /etc/systemd/system/wade-staging.service
     # Ensure the unit runs as the chosen owner (override if necessary)
     sed -i -E "s|^User=.*|User='"'"''"${LWADEUSER}"''"'"'|; s|^Group=.*|Group='"'"''"${LWADEUSER}"''"'"'|" /etc/systemd/system/wade-staging.service
   else
     cat >/etc/systemd/system/wade-staging.service <<EOF
+
 [Unit]
 Description=WADE Staging Daemon (full vs light)
 After=network-online.target
@@ -742,18 +743,23 @@ ConditionPathExists=/opt/wade/stage_daemon.py
 Type=simple
 User='"${LWADEUSER}"'
 Group='"${LWADEUSER}"'
+# Uncomment if your Splunk UF runs as 'splunk' and you created the group:
+SupplementaryGroups=splunk
+
 EnvironmentFile=-/etc/wade/wade.env
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/opt/wade
 ExecStart=/usr/bin/python3 /opt/wade/stage_daemon.py
 Restart=on-failure
 RestartSec=5s
+
+# Make files group-readable for UF; keep group on new dirs/files
+UMask=002
+
+# Sandboxing — allow access to /home and /var/wade for moves & logs
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-# IMPORTANT:
-# The daemon must read/write under /home and /var/wade to move images and write logs/queue.
-# If you keep ProtectHome, you *must* allow writes explicitly:
 ProtectHome=false
 ReadWritePaths=/home/'"${LWADEUSER}"' /var/wade
 
@@ -813,9 +819,6 @@ EOF
 
   echo "$(date -Iseconds)" > "${STEPS_DIR}/vol3-runtime.ver"
 ' || fail_note "vol3-runtime" "wrapper/setup failed"
-
- chown root:autopsy /etc/wade/wade.env
- chmod 0640 /etc/wade/wade.env
 
 run_step "pipx-dissect" "installed" get_ver_pipx_dissect '
   set -e
@@ -1522,7 +1525,9 @@ SPLUNK_FORWARD_PORT="\${SPLUNK_FORWARD_PORT}"
 
 WADE_SERVICE_PORTS_CSV="\${SSH_PORT},\${SMB_TCP_139},\${SMB_TCP_445},\${SMB_UDP_137},\${SMB_UDP_138},\${ZK_CLIENT_PORT},\${ZK_QUORUM_PORT},\${ZK_ELECTION_PORT},\${SOLR_PORT},\${ACTIVEMQ_OPENWIRE_PORT},\${ACTIVEMQ_WEB_CONSOLE_PORT},\${ACTIVEMQ_AMQP_PORT},\${ACTIVEMQ_STOMP_PORT},\${ACTIVEMQ_MQTT_PORT},\${ACTIVEMQ_WS_PORT},\${POSTGRES_PORT},\${PIRANHA_PORT},\${BARRACUDA_PORT},\${SPLUNK_WEB_PORT},\${SPLUNK_MGMT_PORT},\${SPLUNK_HEC_PORT},\${SPLUNK_FORWARD_PORT}"
 ENV
-chmod 600 "$ENV_FILE"
+
+ chown root:autopsy "$ENV_FILE"
+ chmod 0640 "$ENV_FILE"
 
 
 echo
