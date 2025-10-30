@@ -1,190 +1,145 @@
-# WADE
-Automation Framework
+WADE — Wide-Area Data Extraction
 
-WADE – Linux Install & Staging (Heuristic)
+WADE is a DFIR automation framework for staging, routing, and processing forensic artifacts at scale, with outputs designed for Splunk search and visualization. It aims to be:
 
-Build a lightweight, heuristic-driven staging daemon on Linux that classifies and routes forensic artifacts (disk images, memory dumps, network configs) into a shared pipeline with full vs light processing profiles — all while maintaining idempotency, auditability, and zero heavy tooling in staging
+Idempotent & auditable: predictable installs, per-file JSON logs, state tracking
 
-This doc captures the current Linux side of WADE: install, the staging daemon (Python), how to use wade.env, the systemd service .conf, how the “full vs light” intake works, and the new work‑order queue in the share for remote pipeline servers.
-⸻
-1) Components at a glance
+Modular: small wade-* services (start with wade-stage) you can add over time
 
-- Install script: install_beta.sh (sets up base packages, users, dirs; see your script for specifics).
-- Staging daemon: /opt/wade/stage_daemon.py (Python, heuristic classification; no heavy tools required).
-- Systemd service: /etc/systemd/system/wade-staging.service (manages the daemon).
-- Environment: /etc/wade/wade.env (all tunables live here).
-- Shared folders (exported via SMB/NFS as you prefer):
-    - Staging intake: /home/<owner>/<Staging>/full and /home/<owner>/<Staging>/light
-    - Data deposit: /home/<owner>/<DataSources>
-    - Queue (work‑orders): configurable; default is /home/<owner>/<DataSources>/_queue
+Online or offline: install works with pinned packages and offline kits (road-mapped)
 
-<owner> defaults to autopsy. <Staging> defaults to Staging. <DataSources> defaults to DataSources. All are configurable via wade.env.
-⸻
-2) Directory layout (default)
+Ops-friendly: sane defaults, systemd units, logrotate, single .env
 
-/home/autopsy/
-  ├─ Staging/
-  │   ├─ full/          # drop images here for FULL pipeline
-  │   └─ light/         # drop images here for LIGHT pipeline
-  └─ DataSources/
-      ├─ Hosts/<hostname>/...           # images moved/renamed here
-      ├─ Network/<hostname>/cfg_*.txt   # router/switch configs
-      └─ _queue/                        # JSON work-orders for remote workers
-/var/wade/
-  ├─ logs/stage/*.json   # one JSON per processed file
-  └─ state/*.sqlite3     # local idempotency index (metadata signatures)
+Core repo layout: scripts/, splunkapp/, stigs/, top-level install.sh and Python helpers. 
+GitHub
 
-⸻
-3) What the staging daemon does
+What WADE does (today)
 
-- Watches two intake folders: Staging/full and Staging/light.
-- Waits for file writes to stabilize, then classifies using signatures (no heavy tools):
-    - E01 (EWF) by extension / file(1); notes fragmentation siblings .E02+.
-    - Disk images (disk_raw) via GPT ("EFI PART" @ LBA1), MBR (0x55AA), or common FS boot markers (e.g., NTFS, FAT32).
-    - Memory dumps (mem) via header hints (HIBR, LiME) or filename hints (e.g., .mem, hiberfil.sys), provided it doesn’t also look like a disk.
-    - Network configs (network_config) as plain text with vendor fingerprints (Cisco IOS/IOS‑XE, Juniper, VyOS/EdgeOS, Arista EOS, MikroTik). Extracts hostname and version when available.
-- Moves + renames into DataSources/Hosts/<hostname>/ or DataSources/Network/<hostname>/.
-- Writes a per‑file JSON log to /var/wade/logs/stage/ with start/finish time, duration, classification, profile (full|light), and metadata.
-- Creates a work‑order JSON in the shared queue (see §6) for downstream workers.
+Staging daemon (wade-stage)
 
-Idempotency: instead of hashing TB‑sized files, the daemon records a metadata signature (device, inode, size, mtime_ns) in a tiny SQLite DB. No re‑processing unless the file actually changes.
-⸻
-4) The .env – /etc/wade/wade.env
+Watches Staging/{full,light} for new files
 
-Add or edit keys like this (no quotes required, though supported):
+Classifies artifacts without heavy tooling (headers & hints): E01/EWF, raw disks, memory dumps, network configs
 
-# Core identities/paths
-WADE_OWNER_USER=autopsy
-WADE_DATADIR=DataSources
-WADE_STAGINGDIR=Staging
+Moves/renames into DataSources/… with a consistent host/date naming scheme
 
-# Scanner timing
-WADE_STAGE_SCAN_INTERVAL=30       # seconds between sweeps
-WADE_STAGE_STABLE_SECONDS=10      # how long size must remain stable
+Writes a per-file JSON log to /var/wade/logs/stage/
 
-# Heuristic scan sizes
-WADE_STAGE_HEAD_SCAN_BYTES=1048576        # read up to 1 MiB of header
-WADE_STAGE_KDBG_SCAN_BYTES=0              # off (set >0 for tiny KDBG probe)
-WADE_STAGE_TEXT_SNIFF_BYTES=131072        # text check for network configs
-WADE_STAGE_TEXT_MIN_PRINTABLE_RATIO=0.92
+Drops a work-order JSON in a share _queue/ for downstream workers (Dissect, Volatility, Plaso, etc.) to pick up later
 
-# Queue location (in the share)
-# If absolute (/path/...), use as-is. If relative, it's joined under /home/<owner>/<DataSources>/
-WADE_QUEUE_DIR=_queue
+All tunables live in /etc/wade/wade.env. Service is managed by systemd and ships with a logrotate policy (USR1 reopen). These pieces are reflected in the current README and script set. 
+GitHub
+
+Repo structure
+WADE/
+├─ scripts/           # helper scripts & service bits (growing over time)
+├─ splunkapp/         # Splunk app scaffolding (indexes/props/transforms & more)
+├─ stigs/             # STIG-ish hardening bits and checklists
+├─ install.sh         # idempotent installer (Linux host bootstrap & config)
+└─ loader_patch.py    # helper/loader utility (dev)
 
 
-Reload after edits: sudo systemctl restart wade-staging.
-⸻
-5) The systemd service .conf
+Browse the tree for the latest content. 
+GitHub
 
-/etc/systemd/system/wade-staging.service (key bits):
+Quick start (Linux host)
 
-[Service]
-User=autopsy
-Group=autopsy
-EnvironmentFile=-/etc/wade/wade.env
-WorkingDirectory=/opt/wade
-ExecStart=/usr/bin/python3 /opt/wade/stage_daemon.py
-Restart=on-failure
+Tested as a Linux-first flow; Windows workers come later (KAPE/Zimmerman/etc.).
+
+Clone & run installer
+
+git clone https://github.com/imcconnell15/WADE.git
+cd WADE
+sudo -E bash ./install.sh
 
 
-Lifecycle:
+The installer bootstraps packages, users/dirs, env files, and the wade-stage service.
+
+Splunk UF and app packaging are included in the project plan; see splunkapp/.
+
+Service lifecycle
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now wade-staging.service
-sudo systemctl status wade-staging.service
-sudo journalctl -u wade-staging -f
-
-⸻
-6) Work‑order queue in the share
-
-By default, queue files are written under:
-
-/home/<owner>/<DataSources>/_queue/<classification>/<profile>/<uuid>.json
+sudo systemctl enable --now wade-stage.service
+sudo systemctl status wade-stage.service
+journalctl -u wade-stage -f
 
 
-Why: Remote pipeline servers (Windows/Linux) can just watch this folder over SMB/NFS, pick up JSONs, and run the right tools based on classification and profile.
+Where to drop things
 
-Work‑order schema (v1)
-
-{
-  "schema": "wade.queue.workorder",
-  "version": 1,
-  "id": "d95e6ed6-4a2b-43db-8a4b-8f2d15f9e4e2",
-  "created_utc": "2025-10-24T15:30:12Z",
-  "profile": "full",                     // or "light"
-  "classification": "mem",               // e01 | mem | disk_raw | network_config
-  "original_name": "HERMES.mem",
-  "source_host": "zagreus",              // optional; producer host
-  "dest_path": "/home/autopsy/DataSources/Hosts/HERMES/HERMES_2025-10-09.mem",
-  "size_bytes": 123456789,
-  "sig": "st_dev:st_ino:st_size:st_mtime_ns",
-
-  // optional enrichments by type
-  "hostname": "HERMES",
-  "date_collected": "2025-10-09",
-  "vendor": "cisco_ios",
-  "os_version": "16.12",
-  "fragmentation": { "fragmented": false, "parts": [] }
-}
+/home/autopsy/Staging/
+├─ full/   # full pipeline targets (full tooling downstream)
+└─ light/  # minimal pipeline / triage
 
 
-Atomicity: files are written as *.json.tmp then renamed to *.json to avoid half‑reads. Consumers should only read *.json and write their own, separate ack files or move completed JSONs to an archival subfolder (_done/…) to prevent reprocessing.
-⸻
-7) Full vs Light profiles (what runs later)
+What shows up
 
-- full: run all tools (Linux + Windows) once your worker boxes are wired: Dissect, Hayabusa, YARA, Volatility, Plaso/log2timeline, Autopsy, and Zimmermann (RECmd, MFTECmd, etc.).
-- light: skip heavy/GUI or long‑running steps (e.g., Autopsy, Plaso, RECmd), but still do the fast pass for triage.
+Processed data → /home/autopsy/DataSources/Hosts/<HOST>/... (and /Network/... for configs)
 
-The choice is encoded in the work‑order (profile), so your downstream workers can enforce it automatically.
-⸻
-8) Logs & troubleshooting
+Per-file JSON logs → /var/wade/logs/stage/
 
-- Per‑file logs: /var/wade/logs/stage/*.json (searchable by Splunk or jq).
-- Service logs: journalctl -u wade-staging -f
-- Defragmentation helper (E01 multi‑part notice): DataSources/images_to_be_defragmented.log
-⸻
-9) Samba/NFS sharing notes (example)
+Work orders (JSON) → <share>/_queue/… for your processors to consume
 
-Export Staging and DataSources (and thus _queue) over SMB:
+These behaviors match the current project docs and scripts. 
+GitHub
 
-- Share roots: /home/autopsy/Staging, /home/autopsy/DataSources
-- Ensure autopsy owns these trees; disable “oplocks” if you see stale handle issues during large writes.
-- For NFS, prefer sync and adequate rsize/wsize. Consider a dedicated _queue export for consumers.
-⸻
-10) Placeholders for upcoming pipeline stages
+Configuration
 
-- Dissect: consume disk_raw and e01 work‑orders; output JSONL to wade_dissect index.
-- Hayabusa: consume disk_raw/mounted, or host‑logs; output JSONL to wade_hayabusa.
-- Volatility: consume mem; output JSONL to wade_volatility.
-- YARA: consume any class; output to wade_yara.
-- Plaso: (full only) consume disk_raw/e01; output to wade_plaso.
-- Autopsy: (full only) receive images; keep artifacts under case dirs; export JSON for Splunk.
+All runtime tunables live in /etc/wade/wade.env. Examples you’ll see in the docs:
 
-Each consumer should:
-1. Watch _queue/<classification>/<profile>/*.json
-2. Process the dest_path
-3. Write its own results into tool‑specific folders and Splunk‑shippable JSON
-4. Move the work‑order to _queue/_done/… (or write an .ack) to prevent re‑runs
-⸻
-11) Extending detection
+Identity/paths: WADE_OWNER_USER, WADE_DATADIR, WADE_STAGINGDIR
 
-- Add more vendors in stage_daemon.py (detect_network_config()): Cisco ASA/NX‑OS, FortiOS, PAN‑OS, etc.
-- Tweak heuristics with WADE_STAGE_* env vars (see §4).
-- If you need hostname extraction for memory without using Volatility in staging: we can defer hostname to the Volatility worker and update Splunk later; staging falls back to filename stem.
-⸻
-12) Security & performance tips
+Scanner cadence & stabilization windows
 
-- Keep _queue small: consumers should drain and archive promptly.
-- Consider read‑only exports for DataSources/Hosts/* to workers; only the _queue needs write for acks/moves.
-- Avoid huge head scans: 1 MiB is usually enough to identify disk vs mem.
-- The idempotency signature avoids multi‑TB hashing; switch to full hashing only in a downstream verification step if needed.
-⸻
-13) TL;DR workflow (operator POV)
+Header/text sniff sizes for classification
 
-1. Drop an image in Staging/full (or light).
-2. Wait a minute: it’s moved to DataSources/..., a log shows up in /var/wade/logs/stage/, and a work‑order JSON appears under DataSources/_queue/....
-3. Remote workers see the JSON, run the right tools, and ship results to Splunk.
-4. Work‑order is archived by the worker when done.
+Queue directory (absolute or relative under ~autopsy)
 
-Semper staging. 💪
+The README in-repo outlines these keys and restart steps. 
+GitHub
+
+Logging & rotation
+
+Logs are written per artifact to /var/wade/logs/stage/ as JSON.
+
+A logrotate policy rotates daily, keeps 14 compressed archives, and signals the service with SIGUSR1 so it reopens its log file (no copytruncate).
+
+install.sh wires this automatically during service setup.
+
+This pattern is baked into the repo’s service guidance. 
+GitHub
+
+Splunk
+
+A WADE Splunk app scaffold lives under splunkapp/ to centralize:
+
+indexes / sourcetypes
+
+props/transforms for JSONL/JSON tools
+
+deployment packaging for UFs (road-mapped)
+
+Use this as your starting point for index naming like wade_<tool> and the dashboards you build on top. Repo contains the app folder today. 
+GitHub
+
+Roadmap (abridged)
+
+Windows worker host with KAPE/Zimmerman/RECmd, etc.
+
+Processors: Dissect, Volatility3, Plaso, Hayabusa, YARA, Bulk Extractor
+
+Offline kit packaging for air-gapped installs (pinned artifacts)
+
+Splunk: final indexes, props/transforms, saved searches, dashboards
+
+More wade-* services for each processor + a shared work-order schema
+
+License
+
+MIT — see LICENSE
+. 
+GitHub
+
+Credits
+
+Built by practitioners who want DFIR automation that’s simple to deploy, easy to audit, and friendly to both online and austere environments. Shout out to one Mr Speaks
