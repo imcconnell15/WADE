@@ -1445,6 +1445,119 @@ DCONF
 ' || fail_note "splunk-uf" "install/config failed"
 
 #####################################
+# WADE: logrotate setup (multi-service)
+#####################################
+
+# Ensure logrotate is installed (best-effort for offline)
+_wade_ensure_logrotate() {
+  if command -v logrotate >/dev/null 2>&1; then return 0; fi
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y logrotate >/dev/null 2>&1 || true
+  fi
+}
+
+# Derive default logdir from service name: wade-XYZ -> /var/wade/logs/XYZ
+_wade_default_logdir_for_service() {
+  local svc="$1"
+  local base="${svc#wade-}"
+  printf "/var/wade/logs/%s" "${base}"
+}
+
+# Configure logrotate + systemd override for a single service
+# Args:
+#   1: service name (e.g., wade-stage)  [required]
+#   2: logdir (default: auto from svc)  [optional]
+#   3: user  (default: autopsy)         [optional]
+#   4: group (default: same as user)    [optional]
+#   5: rotate count (default: 14)       [optional]
+#   6: period: daily|weekly|monthly (default: daily) [optional]
+#   7: method: signal:USR1|signal:HUP|copytruncate (default: signal:USR1) [optional]
+install_wade_logrotate() {
+  local svc="${1:?service name required}"
+  local logdir="${2:-$(_wade_default_logdir_for_service "$svc")}"
+  local user="${3:-autopsy}"
+  local group="${4:-$user}"
+  local rotate_count="${5:-14}"
+  local period="${6:-daily}"
+  local method="${7:-signal:USR1}"
+
+  echo "[wade] configuring logrotate for ${svc} → ${logdir}"
+
+  _wade_ensure_logrotate
+
+  # Ensure log dir and ownership
+  mkdir -p "${logdir}"
+  if id -u "${user}" >/dev/null 2>&1 && getent group "${group}" >/dev/null 2>&1; then
+    chown -R "${user}:${group}" "${logdir}" || true
+  else
+    echo "[wade] note: user/group ${user}:${group} not present; defaulting to root:root for ${logdir}"
+    user="root"; group="root"
+    chown -R root:root "${logdir}" || true
+  fi
+  chmod 0750 "${logdir}" || true
+
+  # Per-service systemd override (only when signaling)
+  if [[ "${method}" == signal:* ]]; then
+    local sig="${method#signal:}"
+    mkdir -p "/etc/systemd/system/${svc}.service.d"
+    cat > "/etc/systemd/system/${svc}.service.d/logrotate-reload.conf" <<EOF
+[Service]
+ExecReload=
+ExecReload=/bin/kill -s ${sig} \$MAINPID
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+
+  # Build postrotate script based on method
+  local postrotate_cmd
+  if [[ "${method}" == copytruncate ]]; then
+    # No signal; rely on copytruncate directive
+    postrotate_cmd=": # no signal; using copytruncate"
+  else
+    # Default or explicit signal:<SIG>
+    local sig="${method#signal:}"
+    postrotate_cmd="systemctl kill -s ${sig} ${svc}.service 2>/dev/null || true"
+  fi
+
+  # Per-service logrotate policy file
+  local policy="/etc/logrotate.d/${svc}"
+  cat > "${policy}" <<EOF
+${logdir%/}/*.log {
+  ${period}
+  rotate ${rotate_count}
+  compress
+  missingok
+  notifempty
+  su ${user} ${group}
+  create 0640 ${user} ${group}
+  sharedscripts
+$( [[ "${method}" == copytruncate ]] && echo "  copytruncate" )
+  postrotate
+    ${postrotate_cmd}
+  endscript
+}
+EOF
+
+  chmod 0644 "${policy}"
+  chown root:root "${policy}"
+
+  echo "[wade] logrotate policy: ${policy}"
+}
+
+# Bulk helper:
+# Accepts any number of tokens in the form:
+#   "service[:logdir[:user[:group[:rotate[:period[:method]]]]]]"
+# Example token: "wade-stage:/var/wade/logs/stage:autopsy:autopsy:14:daily:signal:USR1"
+install_wade_logrotate_bulk() {
+  local token svc logdir user group rotate period method
+  for token in "$@"; do
+    IFS=':' read -r svc logdir user group rotate period method <<<"${token}"
+    install_wade_logrotate "${svc:?}" "${logdir:-}" "${user:-}" "${group:-}" "${rotate:-}" "${period:-}" "${method:-}"
+  done
+}
+
+#####################################
 # Persist facts & endpoints
 #####################################
 ENV_FILE="${WADE_ETC}/wade.env"
