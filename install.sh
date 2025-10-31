@@ -182,11 +182,7 @@ get_ver_uf(){
   /opt/splunkforwarder/bin/splunk version 2>/dev/null \
     | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) {print $i; exit}}'
 }
-get_ver_capa(){
-  /usr/local/bin/capa --version 2>/dev/null \
-    | sed -nE 's/.* v?([0-9]+(\.[0-9]+)+).*/\1/p' \
-    | head -1 || echo ""
-}
+get_ver_capa(){ /usr/local/bin/capa --version 2>/dev/null | sed -nE "s/.* ([0-9]+(\.[0-9]+)+).*/\1/p" | head -1 || echo ""; }
 get_ver_capa_rules(){
   local dir="${WADE_CAPA_RULES_DIR:-/opt/capa-rules}"
   if [[ -d "$dir/.git" ]]; then
@@ -217,9 +213,9 @@ get_ver_wade_mwex(){
 
 # === Staging & Malware Extractor source (from repo) ===
 STAGE_SRC="${SCRIPT_DIR}/scripts/staging/stage_daemon.py"
-STAGE_EXPECT_SHA="$(sha256_of "$STAGE_SRC" 2>/dEv/null || true)"
+STAGE_EXPECT_SHA="$(sha256_of "$STAGE_SRC" 2>/dev/null || true)"
 
-MWEX_SRC="${SCRIPT_DIR}/scripts/malware/stage_daemon.py"
+MWEX_SRC="${SCRIPT_DIR}/scripts/malware/wade_mw_extract.py"
 MWEX_EXPECT_SHA="$(sha256_of "$MWEX_SRC" 2>/dev/null || true)"
 
 #####################################
@@ -577,7 +573,7 @@ fi
 # Core packages (+ headless Java & truststore)
 #####################################
 ( set -e
-  WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools inotify-simple plocate libewf2 ewf-tools pipx zip unzip)
+  WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools plocate libewf2 ewf-tools pipx zip unzip p7zip-full)
   if [[ "$PM" == "apt" ]]; then
     JAVA_PKG="${JAVA_PACKAGE_APT:-default-jre-headless}"
     bash -lc "$PKG_UPDATE"
@@ -610,7 +606,28 @@ get_ver_samba(){
 run_step "samba" "configured" get_ver_samba '
   set -e
 
+  # Ensure samba present
+  if [[ "$PM" == "apt" ]]; then
+    bash -lc "$PKG_INSTALL samba cifs-utils" >/dev/null 2>&1 || true
+  else
+    bash -lc "$PKG_INSTALL samba cifs-utils" >/dev/null 2>&1 || true
+  fi
+
   SMB_CONF="/etc/samba/smb.conf"
+  install -d /etc/samba
+
+  # Seed minimal config if missing
+  if [[ ! -f "$SMB_CONF" ]]; then
+    cat >"$SMB_CONF"<<EOF
+[global]
+   workgroup = WORKGROUP
+   server string = WADE
+   security = user
+   map to guest = Bad User
+   dns proxy = no
+EOF
+  fi
+
   [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
 
   DATADIR="/home/${LWADEUSER}/${WADE_DATADIR}"
@@ -626,9 +643,9 @@ run_step "samba" "configured" get_ver_samba '
     HOSTS_ALLOW_BLOCK="   hosts allow ="
     for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_ALLOW_BLOCK+=" ${n}"; done
   fi
-
   VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed "s/[[:space:]]//g")"
 
+  # Strip our managed block if present, then append new one
   awk '"'"'BEGIN{skip=0} /^\[WADE-BEGIN\]/{skip=1;next} /^\[WADE-END\]/{skip=0;next} skip==0{print}'"'"' "$SMB_CONF" > "${SMB_CONF}.tmp" && mv "${SMB_CONF}.tmp" "$SMB_CONF"
 
   cat >>"$SMB_CONF"<<EOF
@@ -674,41 +691,33 @@ EOF
     exit 1
   fi
 
+  # Set Samba passwords (only in interactive)
   if [[ "$NONINTERACTIVE" -eq 0 ]]; then
     for u in "${SMBUSERS[@]}"; do
-      u="$(echo "$u" | xargs)"
-      [[ -z "$u" ]] && continue
-      echo "[*] Set Samba password for $u"
-      while :; do
-        read -s -p "Password for $u: " sp1; echo
-        read -s -p "Confirm: " sp2; echo
-        [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break
-        echo "Mismatch/empty. Try again."
-      done
-      ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -s -a "$u" >/dev/null
+      u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
+      if ! pdbedit -L | cut -d: -f1 | grep -qx "$u"; then
+        echo "[*] Set Samba password for $u"
+        while :; do
+          read -s -p "Password for $u: " sp1; echo
+          read -s -p "Confirm: " sp2; echo
+          [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break
+          echo "Mismatch/empty. Try again."
+        done
+        ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -s -a "$u" >/dev/null
+      fi
     done
   fi
 
-  if command -v getenforce >/dev/null 2>&1; then
-    SEL=$(getenforce || echo Disabled)
-    if [[ "$SEL" == "Enforcing" || "$SEL" == "Permissive" ]]; then
-      setsebool -P samba_enable_home_dirs on || true
-      semanage fcontext -a -t samba_share_t "/home/${LWADEUSER}(/.*)?" 2>/dev/null || true
-      restorecon -Rv "/home/${LWADEUSER}" || true
-    fi
-  fi
-
+  # Enable services
   if systemctl list-unit-files | grep -q "^smbd\.service"; then
     systemctl enable smbd --now
     systemctl list-unit-files | grep -q "^nmbd\.service" && systemctl enable nmbd --now || true
   elif systemctl list-unit-files | grep -q "^smb\.service"; then
     systemctl enable smb --now
     systemctl list-unit-files | grep -q "^nmb\.service" && systemctl enable nmb --now || true
-  else
-    systemctl enable smbd --now 2>/dev/null || systemctl enable smb --now || true
-    systemctl enable nmbd --now 2>/dev/null || systemctl enable nmb --now || true
   fi
 
+  # Firewall
   if [[ "$FIREWALL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
     ufw allow Samba || true
   elif command -v firewall-cmd >/dev/null 2>&1; then
@@ -825,10 +834,43 @@ EOF
 #####################################
 run_step "pipx-vol3" "installed" get_ver_pipx_vol3 '
   set -e
-  export PIPX_HOME=/opt/pipx; export PIPX_BIN_DIR=/usr/local/bin; mkdir -p "$PIPX_HOME"
+  export PIPX_HOME=/opt/pipx
+  export PIPX_BIN_DIR=/usr/local/bin
+  mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
+
+  if ! command -v pipx >/dev/null 2>&1; then
+    if [[ "$PM" == "apt" ]]; then
+      bash -lc "$PKG_UPDATE"
+      bash -lc "$PKG_INSTALL pipx"
+    else
+      python3 -m pip install --upgrade pip || true
+      python3 -m pip install pipx || true
+    fi
+  fi
+
   python3 -m pipx ensurepath || true
-  pipx install volatility3
+  pipx install volatility3 || pipx upgrade volatility3
 ' || fail_note "pipx-vol3" "install failed"
+
+run_step "pipx-dissect" "installed" get_ver_pipx_dissect '
+  set -e
+  export PIPX_HOME=/opt/pipx
+  export PIPX_BIN_DIR=/usr/local/bin
+  mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
+
+  if ! command -v pipx >/dev/null 2>&1; then
+    if [[ "$PM" == "apt" ]]; then
+      bash -lc "$PKG_UPDATE"
+      bash -lc "$PKG_INSTALL pipx"
+    else
+      python3 -m pip install --upgrade pip || true
+      python3 -m pip install pipx || true
+    fi
+  fi
+
+  python3 -m pipx ensurepath || true
+  pipx install "dissect[cli]" --include-deps || pipx upgrade "dissect[cli]"
+' || fail_note "pipx-dissect" "install failed"
 
 run_step "vol3-runtime" "ready" 'get_mark_ver vol3-runtime' '
   set -e
@@ -865,23 +907,12 @@ EOF
   echo "$(date -Iseconds)" > "${STEPS_DIR}/vol3-runtime.ver"
 ' || fail_note "vol3-runtime" "wrapper/setup failed"
 
-run_step "pipx-dissect" "installed" get_ver_pipx_dissect '
-  set -e
-  export PIPX_HOME=/opt/pipx; export PIPX_BIN_DIR=/usr/local/bin; mkdir -p "$PIPX_HOME"
-  python3 -m pipx ensurepath || true
-  pipx install dissect --include-deps
-' || fail_note "pipx-dissect" "install failed"
-
 #####################################
 # Mandiant capa (engine)
 #####################################
 run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
   set -e
-
-  # Read config (defend against unset)
   : "${WADE_CAPA_VENV:=/opt/wade/venvs/capa}"
-  : "${WADE_CAPA_RULES_DIR:=/opt/capa-rules}"
-  : "${CAPA_VERSION:=}"
 
   # Pre-reqs
   if [[ "$PM" == "apt" ]]; then
@@ -896,9 +927,9 @@ run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
   [[ -x "$WADE_CAPA_VENV/bin/python" ]] || python3 -m venv "$WADE_CAPA_VENV"
   "$WADE_CAPA_VENV/bin/python" -m pip install -U pip wheel setuptools >/dev/null 2>&1 || true
 
-  # Online/offline wheels
-  CAPA_PKG="capa"
-  [[ -n "$CAPA_VERSION" ]] && CAPA_PKG="capa==${CAPA_VERSION}"
+  # Correct package is flare-capa (provides "capa" CLI)
+  PKG="flare-capa"
+  [[ -n "${CAPA_VERSION:-}" ]] && PKG="flare-capa==${CAPA_VERSION}"
 
   WHEEL_DIR=""
   if [[ -d "${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels" ]]; then
@@ -908,16 +939,14 @@ run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
   fi
 
   if [[ -n "$WHEEL_DIR" ]]; then
-    "$WADE_CAPA_VENV/bin/pip" install --no-index --find-links "$WHEEL_DIR" "$CAPA_PKG"
+    "$WADE_CAPA_VENV/bin/pip" install --no-index --find-links "$WHEEL_DIR" "$PKG"
   else
-    "$WADE_CAPA_VENV/bin/pip" install "$CAPA_PKG"
+    "$WADE_CAPA_VENV/bin/pip" install "$PKG"
   fi
 
-  # Shim
   install -d /usr/local/bin
   ln -sf "$WADE_CAPA_VENV/bin/capa" /usr/local/bin/capa
 
-  # Smoke test
   /usr/local/bin/capa --version >/dev/null 2>&1 || { echo "capa not runnable"; exit 1; }
 ' || fail_note "capa" "engine install failed"
 
