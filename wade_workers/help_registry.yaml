@@ -1,0 +1,19 @@
+volatility:
+  windows.pslist: "Process listings from memory. Useful to see active processes, detect hollowing/injection by correlating with other plugins."
+  windows.netscan: "Raw net conn table carved from memory. Great for spotting suspicious remote IPs and ephemeral listeners."
+  linux.pslist: "Linux task list from memory. Baseline active processes at capture time."
+  mac.pslist: "macOS process list from memory."
+
+hayabusa:
+  hayabusa.detect: "Windows Event Log hunting ruleset. Converts EVTX into detections with MITRE context for triage."
+
+bulk_extractor:
+  email: "Potential email addresses carved from data. Treat as leads, not ground truth."
+  url:   "Potential URLs carved from data. Can guide web activity hypotheses."
+  ccn:   "Credit card number heuristics (false positives possible). Handle with care."
+
+dissect:
+  evtx_copy: "Copies EVTX from image to host’s winevtlog to enable fast parsers (Hayabusa)."
+
+autopsy:
+  manifest: "Minimal case XML to seed Autopsy case creation next to the source image."
