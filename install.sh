@@ -563,16 +563,6 @@ if ! id -u "$LWADEUSER" >/dev/null 2>&1; then
 fi
 for u in "${SMBUSERS[@]}"; do u=$(echo "$u" | xargs); id -u "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u" || warn_note "useradd" "failed creating $u"; done
 
-if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-  echo; echo "===== Summary ====="
-  echo " Hostname     : $LWADE"
-  echo " Linux Owner  : $LWADEUSER"
-  echo " SMB users    : ${SMB_USERS_CSV}"
-  echo " Allow nets   : ${ALLOW_NETS_CSV:-<none>}"
-  echo " Offline mode : ${OFFLINE}"
-  confirm "Proceed with installation?" || exit 0
-fi
-
 #####################################
 # Unified Prompt Stack (run once, early)
 #####################################
@@ -650,6 +640,16 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
 fi
 export RUN_STIG_NOW
 
+if [[ "$NONINTERACTIVE" -eq 0 ]]; then
+  echo; echo "===== Summary ====="
+  echo " Hostname     : $LWADE"
+  echo " Linux Owner  : $LWADEUSER"
+  echo " SMB users    : ${SMB_USERS_CSV}"
+  echo " Allow nets   : ${ALLOW_NETS_CSV:-<none>}"
+  echo " Offline mode : ${OFFLINE}"
+  confirm "Proceed with installation?" || exit 0
+fi
+
 #####################################
 # Core packages (+ headless Java & truststore)
 #####################################
@@ -672,28 +672,28 @@ export RUN_STIG_NOW
   fi
 ) || fail_note "core_packages" "base packages failed"
 
+
 #####################################
 # Samba shares (DataSources, Cases, Staging)
 #####################################
 get_ver_samba(){
   local SMB_CONF="/etc/samba/smb.conf"
   grep -q '^\[WADE-BEGIN\]' "$SMB_CONF" 2>/dev/null || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_DATADIR}" ]]   || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_CASESDIR}" ]]  || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_STAGINGDIR}" ]]|| { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_DATADIR}" ]]    || { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_CASESDIR}" ]]   || { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_STAGINGDIR}" ]] || { echo ""; return; }
   echo configured
 }
 
 run_step "samba" "configured" get_ver_samba '
   set -e
 
-  # Ensure samba present
+  # Ensure Samba packages (correct packages per family; no stray commands)
   if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL samba cifs-utils" >/dev/null 2>&1 || true
-    samba-common-bin
+    bash -lc "$PKG_INSTALL samba samba-common-bin cifs-utils" >/dev/null 2>&1 || true
   else
-    bash -lc "$PKG_INSTALL samba cifs-utils samba-common-bin" >/dev/null 2>&1 || true
-    samba-common-bin
+    # RHEL/OL family uses samba-common-tools instead of -bin
+    bash -lc "$PKG_INSTALL samba samba-common-tools cifs-utils" >/dev/null 2>&1 || true
   fi
 
   SMB_CONF="/etc/samba/smb.conf"
@@ -774,27 +774,30 @@ EOF
     exit 1
   fi
 
-  # Set Samba passwords (only in interactive)
+  # Set Samba passwords
   if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-    for u in "${SMBUSERS[@]}"; do
     if [[ -n "${SMB_ALL_PW:-}" ]]; then
-  for u in "${SMBUSERS[@]}"; do
-    u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
-    ( printf "%s\n%s\n" "$SMB_ALL_PW" "$SMB_ALL_PW" ) | smbpasswd -s -a "$u" >/dev/null || true
-  done
-    elif [[ "$NONINTERACTIVE" -eq 0 ]]; then
-      u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
-      if ! pdbedit -L | cut -d: -f1 | grep -qx "$u"; then
-        echo "[*] Set Samba password for $u"
-        while :; do
-          read -s -p "Password for $u: " sp1; echo
-          read -s -p "Confirm: " sp2; echo
-          [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break
-          echo "Mismatch/empty. Try again."
-        done
-        ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -s -a "$u" >/dev/null
-      fi
-    done
+      # One password for everyone (from early prompt stack)
+      for u in "${SMBUSERS[@]}"; do
+        u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
+        ( printf "%s\n%s\n" "$SMB_ALL_PW" "$SMB_ALL_PW" ) | smbpasswd -s -a "$u" >/dev/null || true
+      done
+    else
+      # Prompt per user only if interactive and not already present in tdbsam
+      for u in "${SMBUSERS[@]}"; do
+        u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
+        if ! pdbedit -L | cut -d: -f1 | grep -qx "$u"; then
+          echo "[*] Set Samba password for $u"
+          while :; do
+            read -s -p "Password for $u: " sp1; echo
+            read -s -p "Confirm: " sp2; echo
+            [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break
+            echo "Mismatch/empty. Try again."
+          done
+          ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -s -a "$u" >/dev/null
+        fi
+      done
+    fi
   fi
 
   # Enable services
@@ -1645,13 +1648,14 @@ run_step "splunk-uf" "installed" get_ver_uf '
   mkdir -p /opt/splunkforwarder/etc/system/local
 
   # ---- defaults from wade.conf (with sane fallbacks) ----
-  local DEFAULT_HOSTS="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
-  local DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
-  local COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
-  local USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
-  local SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
-  local SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
-  local DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
+DEFAULT_HOSTS="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
+DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
+COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
+USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
+SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
+SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
+DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
+
 
   local SERVER_LINE=""
 
