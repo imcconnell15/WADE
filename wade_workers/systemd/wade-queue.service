@@ -1,0 +1,23 @@
+[Unit]
+Description=WADE Queue Runner
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/opt/wade/WADE/bin/wade_queue_runner.py
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+EnvironmentFile=-/etc/wade/wade.env
+WorkingDirectory=/opt/wade/WADE
+ExecStart=/usr/bin/env python3 /opt/wade/WADE/bin/wade_queue_runner.py
+Restart=on-failure
+RestartSec=3
+UMask=002
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/home/%i /var/wade
+
+[Install]
+WantedBy=multi-user.target

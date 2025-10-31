@@ -1,0 +1,11 @@
+[Unit]
+Description=Trigger WADE Queue Runner on new tickets
+
+[Path]
+PathChanged=/home/%i/%s/%s
+# expanded by systemd? No; replace %s yourself if you prefer a static unit.
+# If you want a static path unit: hardcode the queue dir:
+# PathChanged=/home/autopsy/DataSources/_queue
+
+[Install]
+WantedBy=multi-user.target

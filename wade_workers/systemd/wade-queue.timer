@@ -1,0 +1,10 @@
+[Unit]
+Description=WADE Queue Runner (poll every 10s)
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=10s
+Unit=wade-queue@autopsy.service
+
+[Install]
+WantedBy=timers.target

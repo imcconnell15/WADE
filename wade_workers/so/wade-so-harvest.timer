@@ -1,0 +1,10 @@
+[Unit]
+Description=Run WADE SO Harvester every 5 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5m
+Unit=wade-so-harvest@autopsy.service
+
+[Install]
+WantedBy=timers.target

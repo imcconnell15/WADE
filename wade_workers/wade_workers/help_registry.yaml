@@ -1,0 +1,24 @@
+volatility3:
+  memory-suite: >
+    Volatility3 memory triage. Common modules: pslist, pstree, cmdline, netscan, handles, dlllist, services, malfind.
+    Use to enumerate processes, network sockets, and suspicious memory artifacts.
+
+dissect:
+  disk-facts: >
+    Dissect target-info output and harvested Windows Event Logs (EVTX) exported to winevtlog/. Useful to feed Hayabusa.
+
+hayabusa:
+  scan: >
+    Hayabusa Sigma-like analytic pass over EVTX. Indicates suspicious behavior, TTPs, and attentional leads.
+
+bulk_extractor:
+  scan: >
+    Bulk string/feature extraction (emails, URLs, CCNs). Provides coarse indicators for pivoting.
+
+yara:
+  scan: >
+    Signature-based detection. Rules curated by WADE operators; used for rapid IOC confirmation.
+
+autopsy:
+  manifest: >
+    Autopsy case seed (XML) placed beside the image. Enables creating a case quickly with the harvested source.
