@@ -182,6 +182,22 @@ get_ver_uf(){
   /opt/splunkforwarder/bin/splunk version 2>/dev/null \
     | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) {print $i; exit}}'
 }
+get_ver_capa(){
+  /usr/local/bin/capa --version 2>/dev/null \
+    | sed -nE 's/.* v?([0-9]+(\.[0-9]+)+).*/\1/p' \
+    | head -1 || echo ""
+}
+get_ver_capa_rules(){
+  local dir="${WADE_CAPA_RULES_DIR:-/opt/capa-rules}"
+  if [[ -d "$dir/.git" ]]; then
+    git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo ""
+  elif [[ -d "$dir" ]]; then
+    local n; n=$(find "$dir" -type f -name '*.yml' 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$n" =~ ^[0-9]+$ ]] && echo "files-${n}" || echo ""
+  else
+    echo ""
+  fi
+}
 
 # == WADE Staging Daemon (detector)
 get_ver_wade_stage(){
@@ -193,10 +209,18 @@ get_ver_wade_stage(){
   sha256sum "$bin" 2>/dev/null | awk '{print $1}'
 }
 
-# Expected version = hash of repo copy (stage_daemon.py sitting next to install script)
-STAGE_SRC="${SCRIPT_DIR}/scripts/stage_daemon.py"
-STAGE_EXPECT_SHA="$(sha256_of "$STAGE_SRC" 2>/dev/null || true)"
+get_ver_wade_mwex(){
+  local bin="/opt/wade/wade_mw_extract.py"
+  [[ -f "$bin" ]] || { echo ""; return; }
+  sha256sum "$bin" 2>/dev/null | awk '{print $1}'
+}
 
+# === Staging & Malware Extractor source (from repo) ===
+STAGE_SRC="${SCRIPT_DIR}/scripts/staging/stage_daemon.py"
+STAGE_EXPECT_SHA="$(sha256_of "$STAGE_SRC" 2>/dEv/null || true)"
+
+MWEX_SRC="${SCRIPT_DIR}/scripts/malware/stage_daemon.py"
+MWEX_EXPECT_SHA="$(sha256_of "$MWEX_SRC" 2>/dev/null || true)"
 
 #####################################
 # WADE Doctor (services, shares, Splunk UF)
@@ -362,6 +386,12 @@ HAYABUSA_ARCH_OVERRIDE=""
 HAYABUSA_DEST="/usr/local/bin/hayabusa"
 HAYABUSA_RULES_DIR="/etc/wade/hayabusa/rules"
 SIGMA_RULES_DIR="/etc/wade/sigma"
+
+# ---- Mandiant capa (engine + rules) ----
+CAPA_VERSION=""                         # blank = latest from PyPI
+WADE_CAPA_VENV="/opt/wade/venvs/capa"   # dedicated venv for capa
+WADE_CAPA_RULES_DIR="/opt/capa-rules"   # where rules live
+WADE_CAPA_RULES_COMMIT=""               # optionally pin: commit SHA or tag
 
 # ---- STIG (assessment only; interactive at end) ----
 MOD_STIG_EVAL_ENABLED="1"         # keep prereqs enabled; eval runs interactively at end
@@ -702,8 +732,6 @@ EOF
 # Staging Service Install (venv-managed)
 #####################################
 
-# (reuse your existing get_ver_wade_stage, STAGE_SRC, STAGE_EXPECT_SHA)
-# Venv location for the service's interpreter
 VENV_DIR="/home/${LWADEUSER}/.venvs/wade"
 
 run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
@@ -843,6 +871,147 @@ run_step "pipx-dissect" "installed" get_ver_pipx_dissect '
   python3 -m pipx ensurepath || true
   pipx install dissect --include-deps
 ' || fail_note "pipx-dissect" "install failed"
+
+#####################################
+# Mandiant capa (engine)
+#####################################
+run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
+  set -e
+
+  # Read config (defend against unset)
+  : "${WADE_CAPA_VENV:=/opt/wade/venvs/capa}"
+  : "${WADE_CAPA_RULES_DIR:=/opt/capa-rules}"
+  : "${CAPA_VERSION:=}"
+
+  # Pre-reqs
+  if [[ "$PM" == "apt" ]]; then
+    bash -lc "$PKG_INSTALL python3-venv python3-pip git ca-certificates zip p7zip-full"
+  else
+    bash -lc "$PKG_INSTALL python3 python3-virtualenv git ca-certificates zip" || true
+    bash -lc "$PKG_INSTALL p7zip p7zip-plugins" || true
+  fi
+
+  # venv
+  install -d "$(dirname "$WADE_CAPA_VENV")"
+  [[ -x "$WADE_CAPA_VENV/bin/python" ]] || python3 -m venv "$WADE_CAPA_VENV"
+  "$WADE_CAPA_VENV/bin/python" -m pip install -U pip wheel setuptools >/dev/null 2>&1 || true
+
+  # Online/offline wheels
+  CAPA_PKG="capa"
+  [[ -n "$CAPA_VERSION" ]] && CAPA_PKG="capa==${CAPA_VERSION}"
+
+  WHEEL_DIR=""
+  if [[ -d "${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels" ]]; then
+    WHEEL_DIR="${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels"
+  elif [[ "${OFFLINE:-0}" == "1" && -d "${OFFLINE_SRC:-}/pipwheels" ]]; then
+    WHEEL_DIR="${OFFLINE_SRC}/pipwheels"
+  fi
+
+  if [[ -n "$WHEEL_DIR" ]]; then
+    "$WADE_CAPA_VENV/bin/pip" install --no-index --find-links "$WHEEL_DIR" "$CAPA_PKG"
+  else
+    "$WADE_CAPA_VENV/bin/pip" install "$CAPA_PKG"
+  fi
+
+  # Shim
+  install -d /usr/local/bin
+  ln -sf "$WADE_CAPA_VENV/bin/capa" /usr/local/bin/capa
+
+  # Smoke test
+  /usr/local/bin/capa --version >/dev/null 2>&1 || { echo "capa not runnable"; exit 1; }
+' || fail_note "capa" "engine install failed"
+
+#####################################
+# Mandiant capa-rules (repo or tarball)
+#####################################
+run_step "capa-rules" "${WADE_CAPA_RULES_COMMIT:-}" get_ver_capa_rules '
+  set -e
+  : "${WADE_CAPA_RULES_DIR:=/opt/capa-rules}"
+  : "${WADE_CAPA_RULES_COMMIT:=}"
+
+  install -d /opt
+  if [[ -f "${WADE_PKG_DIR:-/var/wade/pkg}/capa-rules.tar.gz" ]]; then
+    echo "[*] Using offline rules from ${WADE_PKG_DIR}/capa-rules.tar.gz"
+    rm -rf "$WADE_CAPA_RULES_DIR.tmp" "$WADE_CAPA_RULES_DIR"
+    mkdir -p "$WADE_CAPA_RULES_DIR.tmp"
+    tar -xzf "${WADE_PKG_DIR}/capa-rules.tar.gz" -C "$WADE_CAPA_RULES_DIR.tmp" --strip-components=1
+    mv "$WADE_CAPA_RULES_DIR.tmp" "$WADE_CAPA_RULES_DIR"
+  elif [[ "${OFFLINE:-0}" == "1" && -f "${OFFLINE_SRC:-}/capa-rules.tar.gz" ]]; then
+    echo "[*] Using offline rules from ${OFFLINE_SRC}/capa-rules.tar.gz"
+    rm -rf "$WADE_CAPA_RULES_DIR.tmp" "$WADE_CAPA_RULES_DIR"
+    mkdir -p "$WADE_CAPA_RULES_DIR.tmp"
+    tar -xzf "${OFFLINE_SRC}/capa-rules.tar.gz" -C "$WADE_CAPA_RULES_DIR.tmp" --strip-components=1
+    mv "$WADE_CAPA_RULES_DIR.tmp" "$WADE_CAPA_RULES_DIR"
+  else
+    if [[ -d "$WADE_CAPA_RULES_DIR/.git" ]]; then
+      git -C "$WADE_CAPA_RULES_DIR" pull --ff-only || true
+    else
+      rm -rf "$WADE_CAPA_RULES_DIR"
+      git clone --depth=1 https://github.com/mandiant/capa-rules "$WADE_CAPA_RULES_DIR"
+    fi
+    if [[ -n "$WADE_CAPA_RULES_COMMIT" ]]; then
+      git -C "$WADE_CAPA_RULES_DIR" fetch --depth=1 origin "$WADE_CAPA_RULES_COMMIT" || true
+      git -C "$WADE_CAPA_RULES_DIR" checkout -q "$WADE_CAPA_RULES_COMMIT" || true
+    fi
+  fi
+
+  chown -R root:root "$WADE_CAPA_RULES_DIR" && chmod -R a+rX "$WADE_CAPA_RULES_DIR"
+
+  # Export for shells/tools
+  cat >/etc/profile.d/wade-capa.sh <<EOF
+export WADE_CAPA_RULES="${WADE_CAPA_RULES_DIR}"
+EOF
+  chmod 0644 /etc/profile.d/wade-capa.sh
+
+  # Handy updater (for online use)
+  cat >/usr/local/sbin/update-capa-rules <<'"'"'EOF'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+RULES_DIR="${WADE_CAPA_RULES:-/opt/capa-rules}"
+if [[ -d "$RULES_DIR/.git" ]]; then
+  git -C "$RULES_DIR" pull --ff-only
+else
+  echo "capa-rules is not a git repo (likely from tarball). Replace ${RULES_DIR} to update."
+fi
+EOF
+  chmod 0755 /usr/local/sbin/update-capa-rules
+
+  # Smoke check: have rules?
+  n=$(find "$WADE_CAPA_RULES_DIR" -type f -name "*.yml" 2>/dev/null | wc -l | tr -d " ")
+  [[ "${n:-0}" -gt 0 ]] || { echo "no rules found"; exit 1; }
+' || fail_note "capa-rules" "rules install failed"
+
+#####################################
+# WADE Malware Extractor (CLI)
+#####################################
+run_step "wade-mw-extractor" "${MWEX_EXPECT_SHA}" get_ver_wade_mwex '
+  set -e
+
+  # Install script & dirs
+  install -d -m 0755 /opt/wade /var/wade/logs/malware
+  install -m 0755 "'"$MWEX_SRC"'" /opt/wade/wade_mw_extract.py
+
+  # Lightweight wrapper in PATH (passes through args)
+  cat >/usr/local/bin/wade-mw-extract <<'"'"'EOF'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+# Default capa rules for convenience; user can override per-invocation
+export WADE_CAPA_RULES="${WADE_CAPA_RULES:-/opt/capa-rules}"
+exec /usr/bin/env python3 /opt/wade/wade_mw_extract.py "$@"
+EOF
+  chmod 0755 /usr/local/bin/wade-mw-extract
+
+  # Sanity hints (non-fatal)
+  command -v target-fs >/dev/null 2>&1     || echo "[WARN] Dissect CLI (target-fs) not found; disk mode unavailable."
+  command -v vol >/dev/null 2>&1 || command -v volatility3 >/dev/null 2>&1 \
+                                         || echo "[WARN] Volatility 3 not found; memory mode unavailable."
+  command -v capa >/dev/null 2>&1          || echo "[WARN] capa not found; capability analysis disabled."
+  command -v 7zz >/dev/null 2>&1 || command -v zip >/dev/null 2>&1 \
+                                         || echo "[WARN] Neither 7zz nor zip in PATH; passworded ZIPs unavailable."
+
+  sha256sum /opt/wade/wade_mw_extract.py | awk "{print \$1}" > "'"${STEPS_DIR}/wade-mw-extractor.ver"'"
+' || fail_note "wade-mw-extractor" "install failed"
+
 
 #####################################
 # Helpers for packages & hayabusa arch
@@ -1556,6 +1725,9 @@ install_wade_logrotate_bulk() {
     install_wade_logrotate "${svc:?}" "${logdir:-}" "${user:-}" "${group:-}" "${rotate:-}" "${period:-}" "${method:-}"
   done
 }
+
+# Rotate JSONL under /var/wade/logs/malware weekly, keep 14 copies
+install_wade_logrotate "wade-mw-extractor" "/var/wade/logs/malware" "${LWADEUSER:-autopsy}" "${LWADEUSER:-autopsy}" 14 "weekly" "copytruncate"
 
 #####################################
 # Persist facts & endpoints
