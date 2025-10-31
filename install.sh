@@ -123,6 +123,10 @@ mark_done(){ local step="$1" ver="$2"; shift 2 || true; printf '%s\n' "$ver" > "
 get_mark_ver(){ local step="$1" [[ -f "${STEPS_DIR}/${step}.ver" ]] && cat "${STEPS_DIR}/${step}.ver" || echo ""; }
 report_step(){ printf " - %-16s want=%-12s have=%-14s [%s]\n" "$1" "${2:-n/a}" "${3:-n/a}" "$4"; }
 
+# Caches/symbols for vol3 & friends
+CACHEDIR="${CACHEDIR:-/var/wade/cache}"
+mkdir -p "${CACHEDIR}"
+
 run_step(){
   local name="$1" want="$2" get_have="$3" do_install="$4"
   _inlist "$name" "$ONLY_LIST" || { report_step "$name" "$want" "$($get_have 2>/dev/null || true)" "SKIP(--only)"; return 0; }
@@ -570,6 +574,83 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
 fi
 
 #####################################
+# Unified Prompt Stack (run once, early)
+#####################################
+
+# --- Optional: set one Samba password for all users now (skip to leave unchanged) ---
+SMB_SET_PW_ALL="N"
+if [[ "$NONINTERACTIVE" -eq 0 ]]; then
+  read -r -p "Set one Samba password for ALL SMB users now? [y/N]: " SMB_SET_PW_ALL
+  SMB_SET_PW_ALL="${SMB_SET_PW_ALL:-N}"
+fi
+SMB_ALL_PW=""
+if [[ "$SMB_SET_PW_ALL" =~ ^[Yy]$ && "$NONINTERACTIVE" -eq 0 ]]; then
+  while :; do
+    read -s -p "Samba password (will apply to: ${SMB_USERS_CSV}): " p1; echo
+    read -s -p "Confirm: " p2; echo
+    [[ "$p1" == "$p2" && -n "$p1" ]] && SMB_ALL_PW="$p1" && break
+    echo "Mismatch/empty. Try again."
+  done
+fi
+
+# --- Splunk UF prompts (pre-set for later step; no more mid-run questions) ---
+# Defaults from wade.conf
+DEFAULT_HOSTS="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
+DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
+COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
+USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
+SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
+SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
+DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
+
+PRESET_SPLUNK_SERVER_LINE=""
+PRESET_SPLUNK_INDEX="$DEFAULT_INDEX"
+PRESET_SPLUNK_COMPRESSED="$COMPRESSED"
+PRESET_SPLUNK_USEACK="$USE_ACK"
+PRESET_SPLUNK_SSL_VERIFY="$SSL_VERIFY"
+PRESET_SPLUNK_SSL_CN="$SSL_CN"
+PRESET_SPLUNK_DS="$DS_TARGET"
+
+if [[ "$NONINTERACTIVE" -eq 0 ]]; then
+  echo
+  echo ">> Splunk UF configuration (captured once, used later)"
+  read -r -p "Indexer(s) host[:port], comma-separated [${DEFAULT_HOSTS}]: " IDXERS
+  IDXERS="${IDXERS:-$DEFAULT_HOSTS}"
+  DEFAULT_PORT="$(echo "${DEFAULT_HOSTS##*:}" | awk '{print $1}')"
+  NORMALIZED=""
+  IFS=',' read -r -a ARR <<< "$IDXERS"
+  for h in "${ARR[@]}"; do
+    h="$(echo "$h" | xargs)"; [[ -z "$h" ]] && continue
+    if [[ "$h" == *:* ]]; then NORMALIZED+="${h},"; else NORMALIZED+="${h}:${DEFAULT_PORT},"; fi
+  done
+  PRESET_SPLUNK_SERVER_LINE="${NORMALIZED%,}"
+
+  read -r -p "Default index for WADE logs [${DEFAULT_INDEX}]: " tmp; tmp="${tmp:-$DEFAULT_INDEX}"; PRESET_SPLUNK_INDEX="$tmp"
+
+  read -r -p "Enable compression? (true/false) [${COMPRESSED}]: " tmp; PRESET_SPLUNK_COMPRESSED="${tmp:-$COMPRESSED}"
+  read -r -p "Enable indexer ACKs? (true/false) [${USE_ACK}]: " tmp; PRESET_SPLUNK_USEACK="${tmp:-$USE_ACK}"
+
+  read -r -p "Verify indexer SSL certs? (true/false) [${SSL_VERIFY}]: " tmp; PRESET_SPLUNK_SSL_VERIFY="${tmp:-$SSL_VERIFY}"
+  if [[ "${PRESET_SPLUNK_SSL_VERIFY}" == "true" ]]; then
+    read -r -p "sslCommonNameToCheck [${SSL_CN}]: " tmp; PRESET_SPLUNK_SSL_CN="${tmp:-$SSL_CN}"
+  fi
+
+  read -r -p "Deployment server host:port (blank to skip) [${DS_TARGET}]: " tmp; PRESET_SPLUNK_DS="${tmp:-$DS_TARGET}"
+fi
+
+# Let later steps know everything is pre-captured
+export PRESET_SPLUNK=1
+export PRESET_SPLUNK_SERVER_LINE PRESET_SPLUNK_INDEX PRESET_SPLUNK_COMPRESSED PRESET_SPLUNK_USEACK PRESET_SPLUNK_SSL_VERIFY PRESET_SPLUNK_SSL_CN PRESET_SPLUNK_DS
+export SMB_ALL_PW
+
+# --- STIG run choice (only the choice now; profile is picked later when DS is found) ---
+RUN_STIG_NOW="N"
+if [[ "$NONINTERACTIVE" -eq 0 ]]; then
+  read -r -p "Run DISA STIG assessment at the end? [y/N]: " RUN_STIG_NOW; RUN_STIG_NOW="${RUN_STIG_NOW:-N}"
+fi
+export RUN_STIG_NOW
+
+#####################################
 # Core packages (+ headless Java & truststore)
 #####################################
 ( set -e
@@ -577,7 +658,7 @@ fi
   if [[ "$PM" == "apt" ]]; then
     JAVA_PKG="${JAVA_PACKAGE_APT:-default-jre-headless}"
     bash -lc "$PKG_UPDATE"
-    bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} ufw ${JAVA_PKG}"
+    bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} ufw ${JAVA_PKG} samba-common-bin"
     if command -v keytool >/dev/null 2>&1; then
       /var/lib/dpkg/info/ca-certificates-java.postinst configure || true
       bash -lc "$PKG_INSTALL --reinstall ca-certificates-java" || true
@@ -609,8 +690,10 @@ run_step "samba" "configured" get_ver_samba '
   # Ensure samba present
   if [[ "$PM" == "apt" ]]; then
     bash -lc "$PKG_INSTALL samba cifs-utils" >/dev/null 2>&1 || true
+    samba-common-bin
   else
-    bash -lc "$PKG_INSTALL samba cifs-utils" >/dev/null 2>&1 || true
+    bash -lc "$PKG_INSTALL samba cifs-utils samba-common-bin" >/dev/null 2>&1 || true
+    samba-common-bin
   fi
 
   SMB_CONF="/etc/samba/smb.conf"
@@ -694,6 +777,12 @@ EOF
   # Set Samba passwords (only in interactive)
   if [[ "$NONINTERACTIVE" -eq 0 ]]; then
     for u in "${SMBUSERS[@]}"; do
+    if [[ -n "${SMB_ALL_PW:-}" ]]; then
+  for u in "${SMBUSERS[@]}"; do
+    u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
+    ( printf "%s\n%s\n" "$SMB_ALL_PW" "$SMB_ALL_PW" ) | smbpasswd -s -a "$u" >/dev/null || true
+  done
+    elif [[ "$NONINTERACTIVE" -eq 0 ]]; then
       u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
       if ! pdbedit -L | cut -d: -f1 | grep -qx "$u"; then
         echo "[*] Set Samba password for $u"
@@ -1371,6 +1460,10 @@ run_step "hayabusa" "" get_ver_hayabusa '
   install -m 0755 "$HAY_BIN_PATH" "${HAYABUSA_DEST}"
   echo "[+] Installed Hayabusa to ${HAYABUSA_DEST}"
 
+  install -d -m 0755 "${HAYABUSA_RULES_DIR}"
+  [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules/"*  "${HAYABUSA_RULES_DIR}/"; echo "[+] Copied Hayabusa rules → ${HAYABUSA_RULES_DIR}"; }
+  [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config"    /etc/wade/hayabusa/;     echo "[+] Copied Hayabusa config → /etc/wade/hayabusa/"; }
+
   [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules"  /usr/local/bin/; echo "[+] Copied Hayabusa rules/ to /usr/local/bin/rules"; }
   [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config" /usr/local/bin/; echo "[+] Copied Hayabusa config/ to /usr/local/bin/config"; }
 
@@ -1541,10 +1634,10 @@ run_step "splunk-uf" "installed" get_ver_uf '
     PKG="$(ls "'"$SPLUNK_SRC_DIR"'"/*.deb | sort -V | tail -1)"
   fi
 
-  if [[ -z "$PKG" || ! -f "$PKG" ]]; then
-    echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/"
-    exit 1
-  fi
+    if [[ -z "$PKG" || ! -f "$PKG" ]]; then
+  echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/"
+  exit 0   # soft-skip UF so the installer keeps going
+    fi
 
   dpkg -i "$PKG" || apt-get -f install -y
   /opt/splunkforwarder/bin/splunk enable boot-start -systemd-managed 1 -user splunkfwd --accept-license --answer-yes || true
@@ -1563,31 +1656,24 @@ run_step "splunk-uf" "installed" get_ver_uf '
   local SERVER_LINE=""
 
   if [[ "${NONINTERACTIVE:-0}" -eq 0 ]]; then
-    echo
-    echo ">> Splunk UF configuration"
-    local IDXERS
-    IDXERS="$(prompt_with_default "Indexer(s) host[:port], comma-separated" "${DEFAULT_HOSTS}")"
-    local DEFAULT_PORT="$(echo "${DEFAULT_HOSTS##*:}" | awk '"'"'{print $1}'"'"')"
-    local NORMALIZED=""
-    IFS=',' read -r -a ARR <<< "$IDXERS"
-    for h in "${ARR[@]}"; do
-      h="$(echo "$h" | xargs)"
-      [[ -z "$h" ]] && continue
-      if [[ "$h" == *:* ]]; then NORMALIZED+="${h},"; else NORMALIZED+="${h}:${DEFAULT_PORT},"; fi
-    done
-    SERVER_LINE="${NORMALIZED%,}"
-
-    DEFAULT_INDEX="$(prompt_with_default "Default index for WADE logs" "$DEFAULT_INDEX")"
-    if yesno_with_default "Enable compression?" "Y"; then COMPRESSED="true"; else COMPRESSED="false"; fi
-    if yesno_with_default "Enable indexer ACKs?" "Y"; then USE_ACK="true"; else USE_ACK="false"; fi
-    if yesno_with_default "Configure a deployment server?" "N"; then
-      DS_TARGET="$(prompt_with_default "Deployment server host:port" "${SPLUNK_UF_DEPLOYMENT_SERVER:-ds.example.org:8089}")"
-    fi
-    if yesno_with_default "Verify indexer SSL certs?" "N"; then
-      SSL_VERIFY="true"
-      SSL_CN="$(prompt_with_default "sslCommonNameToCheck" "${SPLUNK_UF_SSL_COMMON_NAME:-*}")"
+# ---- derive UF settings from early prompt stack or defaults ----
+    if [[ "${PRESET_SPLUNK:-0}" -eq 1 ]]; then
+    SERVER_LINE="${PRESET_SPLUNK_SERVER_LINE}"
+    DEFAULT_INDEX="${PRESET_SPLUNK_INDEX}"
+    COMPRESSED="${PRESET_SPLUNK_COMPRESSED}"
+    USE_ACK="${PRESET_SPLUNK_USEACK}"
+    SSL_VERIFY="${PRESET_SPLUNK_SSL_VERIFY}"
+    SSL_CN="${PRESET_SPLUNK_SSL_CN}"
+    DS_TARGET="${PRESET_SPLUNK_DS}"
     else
-      SSL_VERIFY="false"
+    # fall back to wade.conf defaults silently
+    SERVER_LINE="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
+    DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
+    COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
+    USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
+    SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
+    SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
+    DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
     fi
   else
     SERVER_LINE="${DEFAULT_HOSTS}"
@@ -1638,8 +1724,11 @@ DCONF
   fi
 
   chown -R splunkfwd:splunkfwd /opt/splunkforwarder || true
-  systemctl daemon-reload
-  systemctl enable --now SplunkForwarder.service || systemctl restart SplunkForwarder.service || true
+systemctl daemon-reload
+systemctl enable --now SplunkForwarder.service \
+  || systemctl enable --now splunkforwarder.service \
+  || systemctl restart SplunkForwarder.service \
+  || systemctl restart splunkforwarder.service || true
 ' || fail_note "splunk-uf" "install/config failed"
 
 #####################################
@@ -1812,12 +1901,6 @@ SPLUNK_UF_USE_ACK="${UF_ACKS}"
 SPLUNK_UF_SSL_VERIFY="${UF_SSLV}"
 SPLUNK_UF_SSL_COMMON_NAME="${UF_SSLN}"
 SPLUNK_UF_DEPLOYMENT_SERVER="${UF_DS}"
-
-# Reference ports (for dashboards / docs)
-SPLUNK_WEB_PORT="${SPLUNK_WEB_PORT:-8000}"
-SPLUNK_MGMT_PORT="${SPLUNK_MGMT_PORT:-8089}"
-SPLUNK_HEC_PORT="${SPLUNK_HEC_PORT:-8088}"
-SPLUNK_FORWARD_PORT="${SPLUNK_FORWARD_PORT:-9997}"
 
 # Hayabusa locations
 HAYABUSA_DEST="${HAYABUSA_DEST}"
