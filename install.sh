@@ -112,6 +112,21 @@ find_offline_src(){
   return 1
 }
 
+# --- APT lock helper (Ubuntu/Debian) ---
+apt_wait() {
+  [[ "$PM" != "apt" ]] && return 0
+  local tries=60
+  local locks=(/var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+  echo "[apt] checking for package manager locks…"
+  while fuser "${locks[@]}" >/dev/null 2>&1; do
+    ((tries--)) || { echo "[apt] lock held too long; bailing"; return 1; }
+    echo "[apt] lock held by another process; retrying in 5s… ($((60-tries))/60)"
+    sleep 5
+  done
+  # clean up any half-configured state
+  dpkg --configure -a >/dev/null 2>&1 || true
+}
+
 #####################################
 # Idempotency framework (step registry)
 #####################################
@@ -1596,15 +1611,32 @@ run_step "postgresql" "configured" get_ver_pg '
 #####################################
 # STIG prerequisites (OpenSCAP + SSG)
 #####################################
+# Robust package detector: only returns "installed" when all required bits exist.
+get_ver_stig_pkgs() {
+  if [[ "$PM" == "apt" ]]; then
+    dpkg -s openscap-scanner ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications >/dev/null 2>&1 \
+      && echo "installed" || echo ""
+  else
+    # RHEL/OL/Fedora family: openscap-scanner + scap-security-guide
+    rpm -q openscap-scanner scap-security-guide >/dev/null 2>&1 && echo "installed" || echo ""
+  fi
+}
+
 if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" ]]; then
-run_step "stig-prereqs" "installed" get_ver_stig '
+run_step "stig-prereqs" "installed" get_ver_stig_pkgs '
   set -e
   if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL openscap-scanner unzip ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications" || true
+    apt_wait
+    bash -lc "$PKG_UPDATE"
+    # exactly what you installed manually, plus unzip (needed for zip STIG bundles)
+    bash -lc "$PKG_INSTALL unzip openscap-scanner"
+    bash -lc "$PKG_INSTALL ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications"
+    # scap-security-guide is split on Ubuntu; attempt if present in this release
     bash -lc "apt-cache show scap-security-guide >/dev/null 2>&1 && $PKG_INSTALL scap-security-guide || true"
   else
-    bash -lc "$PKG_INSTALL openscap-scanner unzip" || true
-    bash -lc "$PKG_INSTALL scap-security-guide" || true
+    bash -lc "$PKG_UPDATE"
+    bash -lc "$PKG_INSTALL openscap-scanner unzip"
+    bash -lc "$PKG_INSTALL scap-security-guide"
   fi
 ' || fail_note "stig" "could not install prerequisites"
 fi
@@ -1633,8 +1665,8 @@ run_step "splunk-uf" "installed" get_ver_uf '
     curl -L "${SPLUNK_UF_DEB_URL}" -o "$PKG"
   elif ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb >/dev/null 2>&1; then
     PKG="$(ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb | sort -V | tail -1)"
-  elif ls "'"$SPLUNK_SRC_DIR"'"/*.deb >/dev/null 2>&1; then
-    PKG="$(ls "'"$SPLUNK_SRC_DIR"'"/*.deb | sort -V | tail -1)"
+  elif ls "'"$SPLUNK_SRC_DIR"'"/splunkforwarder*.deb >/dev/null 2>&1; then
+    PKG="$(ls "'"$SPLUNK_SRC_DIR"'"/splunkforwarder*.deb | sort -V | tail -1)"
   fi
 
     if [[ -z "$PKG" || ! -f "$PKG" ]]; then
@@ -1910,6 +1942,12 @@ SPLUNK_UF_DEPLOYMENT_SERVER="${UF_DS}"
 HAYABUSA_DEST="${HAYABUSA_DEST}"
 HAYABUSA_RULES_DIR="${HAYABUSA_RULES_DIR}"
 SIGMA_RULES_DIR="${SIGMA_RULES_DIR}"
+
+# Staging safety & performance
+WADE_STAGE_STABLE_SECONDS=60
+WADE_STAGE_REQUIRE_CLOSE=1
+WADE_STAGE_OPENFD_STABLE_SECONDS=5
+WADE_STAGE_HEAD_SCAN_BYTES=1048576
 
 # Offline flag
 OFFLINE="${OFFLINE}"
