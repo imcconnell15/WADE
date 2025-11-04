@@ -3,14 +3,12 @@ from pathlib import Path
 from .base import BaseWorker, WorkerResult
 from .utils import wade_paths, now_iso
 
-CASE_TPL = """<?xml version="1.0" encoding="UTF-8"?>
-<autopsy>
-  <case>
-    <name>{name}</name>
-    <created>{created}</created>
-    <image>{image}</image>
-  </case>
-</autopsy>
+CASE_TPL = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<AutopsyManifest>
+    <CaseName>{name}</CaseName>
+    <IngestModule>Disk Image Ingest</IngestModule>
+    <DataSource>{image}</DataSource>
+</AutopsyManifest>
 """
 
 class AutopsyManifestWorker(BaseWorker):
