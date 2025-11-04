@@ -1,0 +1,19 @@
+[Unit]
+Description=Whiff RAG API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=whiff
+Group=whiff
+WorkingDirectory=/opt/whiff
+EnvironmentFile=/etc/whiff/whiff.env
+ExecStart=/opt/whiff/.venv/bin/uvicorn whiff_api:app --host 127.0.0.1 --port 8088 --workers 2
+Restart=on-failure
+Nice=10
+CPUQuota=120%
+Environment=OMP_NUM_THREADS=8
+Environment=TOKENIZERS_PARALLELISM=false
+
+[Install]
+WantedBy=multi-user.target
