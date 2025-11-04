@@ -1,0 +1,100 @@
+sites:
+  - name: mitre-attack
+    base: "https://attack.mitre.org"
+    allow:
+      - "^https://attack\\.mitre\\.org/(techniques|tactics|mitigations|datasources)/.*$"
+    deny: []
+    rate_per_sec: 1.0
+    max_pages: 3000
+    license: "CC BY 4.0"
+    tool: "mitre-attack"
+    version: "v14x"
+
+  - name: volatility3-docs
+    base: "https://volatility3.readthedocs.io"
+    allow:
+      - "^https://volatility3\\.readthedocs\\.io/en/(latest|stable)/.*$"
+    deny:
+      - "\\.(zip|tar|gz|jpg|png|gif|svg|ico)$"
+    rate_per_sec: 1.0
+    max_pages: 1200
+    license: "See Volatility docs license"
+    tool: "volatility3"
+    version: "docs-snapshot"
+
+  - name: hayabusa-wiki
+    base: "https://github.com/Yamato-Security/hayabusa/wiki"
+    allow:
+      - "^https://github\\.com/Yamato-Security/hayabusa/wiki/.*$"
+    deny: []
+    rate_per_sec: 0.5
+    max_pages: 600
+    license: "Repo MIT; GitHub Wiki TOS (verify)"
+    tool: "hayabusa"
+    version: "wiki"
+
+  - name: capa-docs
+    base: "https://mandiant.github.io/capa"
+    allow:
+      - "^https://mandiant\\.github\\.io/capa/.*$"
+    deny: []
+    rate_per_sec: 0.5
+    max_pages: 400
+    license: "Apache-2.0 (docs)"
+    tool: "capa"
+    version: "doc"
+
+  - name: yara-docs
+    base: "https://yara.readthedocs.io"
+    allow:
+      - "^https://yara\\.readthedocs\\.io/.*$"
+    deny: []
+    rate_per_sec: 0.8
+    max_pages: 600
+    license: "See YARA docs license"
+    tool: "yara"
+    version: "docs-snapshot"
+
+  - name: arkime-docs
+    base: "https://arkime.com"
+    allow:
+      - "^https://arkime\\.com/(learn|faq|apiv3|settings).*"
+    deny: []
+    rate_per_sec: 0.6
+    max_pages: 400
+    license: "Arkime site TOS"
+    tool: "arkime"
+    version: "site"
+
+  - name: zeek-docs
+    base: "https://docs.zeek.org"
+    allow:
+      - "^https://docs\\.zeek\\.org/.+"
+    deny: []
+    rate_per_sec: 0.8
+    max_pages: 1200
+    license: "Zeek docs site"
+    tool: "zeek"
+    version: "docs-snapshot"
+
+  - name: forensic-artifacts-kb
+    base: "https://artifacts.readthedocs.io"
+    allow:
+      - "^https://artifacts\\.readthedocs\\.io/.*$"
+    deny: []
+    rate_per_sec: 0.8
+    max_pages: 800
+    license: "Apache-2.0 (repo); docs site"
+    tool: "forensic-artifacts"
+    version: "kb"
+
+  - name: sysmon-learn
+    base: "https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon"
+    allow:
+      - "^https://learn\\.microsoft\\.com/en-us/sysinternals/downloads/sysmon.*$"
+    deny: []
+    rate_per_sec: 0.4
+    max_pages: 50
+    license: "Microsoft Learn terms"
+    tool: "sysmon"
+    version: "learn"
