@@ -115,16 +115,78 @@ find_offline_src(){
 # --- APT lock helper (Ubuntu/Debian) ---
 apt_wait() {
   [[ "$PM" != "apt" ]] && return 0
+
   local tries=60
   local locks=(/var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
   echo "[apt] checking for package manager locks…"
-  while fuser "${locks[@]}" >/dev/null 2>&1; do
-    ((tries--)) || { echo "[apt] lock held too long; bailing"; return 1; }
-    echo "[apt] lock held by another process; retrying in 5s… ($((60-tries))/60)"
-    sleep 5
-  done
-  # clean up any half-configured state
+
+  if command -v fuser >/dev/null 2>&1; then
+    while fuser "${locks[@]}" >/dev/null 2>&1; do
+      ((tries--)) || { echo "[apt] lock held too long; bailing"; return 1; }
+      echo "[apt] lock held by another process; retrying in 5s… ($((60-tries))/60)"
+      sleep 5
+    done
+  elif command -v lsof >/dev/null 2>&1; then
+    while lsof -t "${locks[@]}" >/dev/null 2>&1; do
+      ((tries--)) || { echo "[apt] lock held too long; bailing"; return 1; }
+      echo "[apt] lock held by another process (lsof); retrying in 5s… ($((60-tries))/60)"
+      sleep 5
+    done
+  else
+    echo "[apt] no fuser/lsof; skipping wait"
+  fi
+
   dpkg --configure -a >/dev/null 2>&1 || true
+}
+
+# Run apt/dnf/yum refresh exactly once
+APT_REFRESHED=0
+apt_refresh_once() {
+  (( APT_REFRESHED )) && return 0
+  if [[ -n "$PKG_UPDATE" ]]; then
+    [[ "$PM" == "apt" ]] && apt_wait
+    bash -lc "$PKG_UPDATE" || true
+  fi
+  APT_REFRESHED=1
+}
+
+# ---- pipx helpers ----
+ensure_pipx_installed() {
+  export PIPX_HOME=/opt/pipx
+  export PIPX_BIN_DIR=/usr/local/bin
+  mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
+
+  if ! command -v pipx >/dev/null 2>&1; then
+    if [[ "$PM" == "apt" ]]; then
+      apt_refresh_once
+      bash -lc "$PKG_INSTALL pipx"
+    else
+      python3 -m pip install --upgrade pip || true
+      python3 -m pip install pipx || true
+    fi
+  fi
+}
+
+# ensure_pipx_pkg <package> [install-args...]
+ensure_pipx_pkg() {
+  local name="$1"; shift || true
+  ensure_pipx_installed
+  if pipx list 2>/dev/null | grep -qE "package ${name} "; then
+    pipx upgrade "$name" || true
+  else
+    pipx install "$name" "$@" || pipx upgrade "$name" || true
+  fi
+}
+
+# Queue systemd reload/enable once at end
+_SYSTEMD_UNITS=()
+systemd_queue_enable() { _SYSTEMD_UNITS+=("$1"); }
+systemd_finalize_enable() {
+  ((${#_SYSTEMD_UNITS[@]}==0)) && return 0
+  systemctl daemon-reload || true
+  for u in "${_SYSTEMD_UNITS[@]}"; do
+    systemctl enable --now "$u" 2>/dev/null || true
+  done
 }
 
 #####################################
@@ -146,7 +208,6 @@ get_mark_ver(){
   fi
 }
 
-
 # Caches/symbols for vol3 & friends
 CACHEDIR="${CACHEDIR:-/var/wade/cache}"
 mkdir -p "${CACHEDIR}"
@@ -165,7 +226,7 @@ run_step(){
     report_step "$name" "$want" "$have" "OK"; return 0
   fi
   echo "[*] Installing/updating ${name} (want=${want:-n/a}, have=${have:-none})…"
-  if ( set -e; eval "$do_install" ); then
+  if bash -Eeuo pipefail -c "$do_install"; then
     have="$($get_have 2>/dev/null || true)"
     mark_done "$name" "${have:-unknown}"
     report_step "$name" "$want" "$have" "OK"
@@ -225,7 +286,6 @@ get_ver_capa_rules(){
 
 # == WADE Staging Daemon (detector)
 get_ver_wade_stage(){
-  # Return script hash if staged+enabled, else blank so run_step knows to install
   local svc="/etc/systemd/system/wade-staging.service"
   local bin="/opt/wade/stage_daemon.py"
   systemctl is-enabled --quiet wade-staging.service >/dev/null 2>&1 || { echo ""; return; }
@@ -371,20 +431,18 @@ PG_PERF_FULLPAGE="off"
 PG_CREATE_AUTOPSY_USER="1"
 
 # ===== Splunk (UF + ports) =====
-# Default index new WADE tools should use (kept for backwards-compat)
 SPLUNK_DEFAULT_INDEX="wade_custom"
 
 # Universal Forwarder defaults (used by the installer prompts & env)
-# One or more indexers, comma-separated, each as host:port
 SPLUNK_UF_RCVR_HOSTS="splunk.example.org:9997"
 SPLUNK_UF_DEFAULT_INDEX="wade_custom"
-SPLUNK_UF_COMPRESSED="true"     # tcpout: compressed = true|false
-SPLUNK_UF_USE_ACK="true"        # tcpout: useACK = true|false
-SPLUNK_UF_SSL_VERIFY="false"    # tcpout: sslVerifyServerCert = true|false
-SPLUNK_UF_SSL_COMMON_NAME="*"   # tcpout: sslCommonNameToCheck (only if verify true)
-SPLUNK_UF_DEPLOYMENT_SERVER=""  # e.g. "ds.example.org:8089" or blank to skip
+SPLUNK_UF_COMPRESSED="true"
+SPLUNK_UF_USE_ACK="true"
+SPLUNK_UF_SSL_VERIFY="false"
+SPLUNK_UF_SSL_COMMON_NAME="*"
+SPLUNK_UF_DEPLOYMENT_SERVER=""
 
-# Ports (for summary/UI hints; *not* proof of local Splunk Enterprise)
+# Ports (for summary/UI hints)
 SPLUNK_WEB_PORT="8000"
 SPLUNK_MGMT_PORT="8089"
 SPLUNK_HEC_PORT="8088"
@@ -397,11 +455,11 @@ MOD_PIRANHA_ENABLED="1"
 MOD_BARRACUDA_ENABLED="1"
 MOD_HAYABUSA_ENABLED="1"
 
-# Volatility3 runtime dirs (writable by primary owner)
+# Volatility3 runtime dirs
 VOL3_BASE_DIR="/var/wade/vol3"
 VOL3_SYMBOLS_DIR="${VOL3_BASE_DIR}/symbols"
 VOL3_CACHE_DIR="${VOL3_BASE_DIR}/cache"
-VOL3_PLUGIN_DIR="${VOL3_BASE_DIR}/plugins"   # optional, for custom plugins later
+VOL3_PLUGIN_DIR="${VOL3_BASE_DIR}/plugins"
 
 # Sigma disabled in this build
 SIGMA_ENABLED="0"
@@ -427,14 +485,10 @@ MOD_STIG_REMEDIATE_ENABLED="0"    # do NOT apply fixes
 # Reports
 STIG_REPORT_DIR="/var/wade/logs/stig"
 
-# Storage for a stable copy of the DS/XML we evaluated (for idempotent checks)
+# Storage
 STIG_STORE_DIR="/var/wade/stigs"
 STIG_UBU_EXTRACT_DIR="${STIG_STORE_DIR}/ubuntu2404"
-
-# Default profile (can override; menu will still be shown)
 STIG_PROFILE_ID="xccdf_mil.disa.stig_profile_MAC-1_Classified"
-
-# Optional: comma-separated rule IDs to skip
 STIG_SKIP_RULES=""
 CONF
   chmod 0644 "${WADE_ETC}/wade.conf"
@@ -463,7 +517,7 @@ for f in "${WADE_ETC}/conf.d/"*.conf; do [[ -f "$f" ]] && source "$f"; done
 for f in "${WADE_ETC}/modules/"*.conf; do [[ -f "$f" ]] && source "$f"; done
 OFFLINE="${OFFLINE:-${WADE_OFFLINE:-0}}"
 
-# ---- Guard against set -u for expected vars (defaults if config missing) ----
+# ---- Guard against set -u for expected vars ----
 : "${VOL3_BASE_DIR:=/var/wade/vol3}"
 : "${VOL3_SYMBOLS_DIR:=${VOL3_BASE_DIR}/symbols}"
 : "${VOL3_CACHE_DIR:=${VOL3_BASE_DIR}/cache}"
@@ -533,6 +587,9 @@ else
   esac
 fi
 
+# Centralized refresh once
+apt_refresh_once
+
 #####################################
 # Fresh-install bootstrap
 #####################################
@@ -540,16 +597,13 @@ bootstrap_fresh_install(){
   echo "[*] Fresh-install bootstrap…"
   if [[ "$PM" == "apt" ]]; then
     export DEBIAN_FRONTEND=noninteractive
-    bash -lc "$PKG_UPDATE"
     bash -lc "$PKG_INSTALL ca-certificates curl gnupg lsb-release git python3-venv unzip"
     bash -lc "$PKG_INSTALL ufw" || true
   else
-    bash -lc "$PKG_UPDATE"
     bash -lc "$PKG_INSTALL firewalld curl tar git python3 python3-virtualenv unzip" || true
     systemctl enable firewalld --now || true
     if [[ "$OFFLINE" != "1" ]]; then
       bash -lc "$PKG_INSTALL oracle-epel-release-el10" || bash -lc "$PKG_INSTALL oracle-epel-release-el9" || bash -lc "$PKG_INSTALL epel-release" || true
-      bash -lc "$PKG_UPDATE" || true
     fi
   fi
 }
@@ -591,10 +645,8 @@ fi
 for u in "${SMBUSERS[@]}"; do u=$(echo "$u" | xargs); id -u "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u" || warn_note "useradd" "failed creating $u"; done
 
 #####################################
-# Unified Prompt Stack (run once, early)
+# Unified Prompt Stack
 #####################################
-
-# --- Optional: set one Samba password for all users now (skip to leave unchanged) ---
 SMB_SET_PW_ALL="N"
 if [[ "$NONINTERACTIVE" -eq 0 ]]; then
   read -r -p "Set one Samba password for ALL SMB users now? [y/N]: " SMB_SET_PW_ALL
@@ -610,8 +662,7 @@ if [[ "$SMB_SET_PW_ALL" =~ ^[Yy]$ && "$NONINTERACTIVE" -eq 0 ]]; then
   done
 fi
 
-# --- Splunk UF prompts (pre-set for later step; no more mid-run questions) ---
-# Defaults from wade.conf
+# Splunk UF prompts (pre-captured)
 DEFAULT_HOSTS="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
 DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
 COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
@@ -643,24 +694,19 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
   PRESET_SPLUNK_SERVER_LINE="${NORMALIZED%,}"
 
   read -r -p "Default index for WADE logs [${DEFAULT_INDEX}]: " tmp; tmp="${tmp:-$DEFAULT_INDEX}"; PRESET_SPLUNK_INDEX="$tmp"
-
   read -r -p "Enable compression? (true/false) [${COMPRESSED}]: " tmp; PRESET_SPLUNK_COMPRESSED="${tmp:-$COMPRESSED}"
   read -r -p "Enable indexer ACKs? (true/false) [${USE_ACK}]: " tmp; PRESET_SPLUNK_USEACK="${tmp:-$USE_ACK}"
-
   read -r -p "Verify indexer SSL certs? (true/false) [${SSL_VERIFY}]: " tmp; PRESET_SPLUNK_SSL_VERIFY="${tmp:-$SSL_VERIFY}"
   if [[ "${PRESET_SPLUNK_SSL_VERIFY}" == "true" ]]; then
     read -r -p "sslCommonNameToCheck [${SSL_CN}]: " tmp; PRESET_SPLUNK_SSL_CN="${tmp:-$SSL_CN}"
   fi
-
   read -r -p "Deployment server host:port (blank to skip) [${DS_TARGET}]: " tmp; PRESET_SPLUNK_DS="${tmp:-$DS_TARGET}"
 fi
 
-# Let later steps know everything is pre-captured
 export PRESET_SPLUNK=1
 export PRESET_SPLUNK_SERVER_LINE PRESET_SPLUNK_INDEX PRESET_SPLUNK_COMPRESSED PRESET_SPLUNK_USEACK PRESET_SPLUNK_SSL_VERIFY PRESET_SPLUNK_SSL_CN PRESET_SPLUNK_DS
 export SMB_ALL_PW
 
-# --- STIG run choice (only the choice now; profile is picked later when DS is found) ---
 RUN_STIG_NOW="N"
 if [[ "$NONINTERACTIVE" -eq 0 ]]; then
   read -r -p "Run DISA STIG assessment at the end? [y/N]: " RUN_STIG_NOW; RUN_STIG_NOW="${RUN_STIG_NOW:-N}"
@@ -684,7 +730,6 @@ fi
   WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools plocate libewf2 ewf-tools pipx zip unzip p7zip-full)
   if [[ "$PM" == "apt" ]]; then
     JAVA_PKG="${JAVA_PACKAGE_APT:-default-jre-headless}"
-    bash -lc "$PKG_UPDATE"
     bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} ufw ${JAVA_PKG} samba-common-bin"
     if command -v keytool >/dev/null 2>&1; then
       /var/lib/dpkg/info/ca-certificates-java.postinst configure || true
@@ -692,13 +737,11 @@ fi
     fi
   else
     JAVA_PKG="${JAVA_PACKAGE_RPM:-java-11-openjdk-headless}"
-    bash -lc "$PKG_UPDATE"
     EXTRA_RPM=(policycoreutils policycoreutils-python-utils setools-console "$JAVA_PKG")
     bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} firewalld ${EXTRA_RPM[*]}" || true
     systemctl enable firewalld --now || true
   fi
 ) || fail_note "core_packages" "base packages failed"
-
 
 #####################################
 # Samba shares (DataSources, Cases, Staging)
@@ -715,18 +758,15 @@ get_ver_samba(){
 run_step "samba" "configured" get_ver_samba '
   set -e
 
-  # Ensure Samba packages (correct packages per family; no stray commands)
   if [[ "$PM" == "apt" ]]; then
     bash -lc "$PKG_INSTALL samba samba-common-bin cifs-utils" >/dev/null 2>&1 || true
   else
-    # RHEL/OL family uses samba-common-tools instead of -bin
     bash -lc "$PKG_INSTALL samba samba-common-tools cifs-utils" >/dev/null 2>&1 || true
   fi
 
   SMB_CONF="/etc/samba/smb.conf"
   install -d /etc/samba
 
-  # Seed minimal config if missing
   if [[ ! -f "$SMB_CONF" ]]; then
     cat >"$SMB_CONF"<<EOF
 [global]
@@ -744,21 +784,19 @@ EOF
   CASESDIR="/home/${LWADEUSER}/${WADE_CASESDIR}"
   STAGINGDIR="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
   mkdir -p "$DATADIR" "$CASESDIR" "$STAGINGDIR"
-  chown -R "${LWADEUSER}:${LWADEUSER}" "/home/${LWADEUSER}/${WADE_DATADIR}" \
-                                     "/home/${LWADEUSER}/${WADE_CASESDIR}" \
-                                     "/home/${LWADEUSER}/${WADE_STAGINGDIR}"
+  chown -R "${LWADEUSER}:${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
   chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
-  HOSTS_DENY_LINE="   hosts deny = 0.0.0.0/0"
-  HOSTS_ALLOW_BLOCK=""
+  HOSTS_BLOCK=""
   if [[ "${#ALLOW_NETS_ARR[@]}" -gt 0 ]]; then
-    HOSTS_ALLOW_BLOCK="   hosts allow ="
-    for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_ALLOW_BLOCK+=" ${n}"; done
+    HOSTS_BLOCK="   hosts allow ="
+    for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_BLOCK+=" ${n}"; done
+    HOSTS_BLOCK+=$'\n''   hosts deny = 0.0.0.0/0'
   fi
   VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed "s/[[:space:]]//g")"
 
-  # Strip our managed block if present, then append new one
-  awk '"'"'BEGIN{skip=0} /^\[WADE-BEGIN\]/{skip=1;next} /^\[WADE-END\]/{skip=0;next} skip==0{print}'"'"' "$SMB_CONF" > "${SMB_CONF}.tmp" && mv "${SMB_CONF}.tmp" "$SMB_CONF"
+  # Delete previous managed block, if any
+  sed -e "/^\[WADE-BEGIN\]/,/^\[WADE-END\]/d" -i "$SMB_CONF"
 
   cat >>"$SMB_CONF"<<EOF
 [WADE-BEGIN]
@@ -770,8 +808,7 @@ EOF
    guest ok = no
    writable = yes
    valid users = ${VALID_USERS}
-${HOSTS_ALLOW_BLOCK}
-${HOSTS_DENY_LINE}
+${HOSTS_BLOCK}
 
 [Cases]
    path = ${CASESDIR}
@@ -781,8 +818,7 @@ ${HOSTS_DENY_LINE}
    guest ok = no
    writable = yes
    valid users = ${VALID_USERS}
-${HOSTS_ALLOW_BLOCK}
-${HOSTS_DENY_LINE}
+${HOSTS_BLOCK}
 
 [Staging]
    path = ${STAGINGDIR}
@@ -792,8 +828,7 @@ ${HOSTS_DENY_LINE}
    guest ok = no
    writable = yes
    valid users = ${VALID_USERS}
-${HOSTS_ALLOW_BLOCK}
-${HOSTS_DENY_LINE}
+${HOSTS_BLOCK}
 [WADE-END]
 EOF
 
@@ -803,16 +838,14 @@ EOF
     exit 1
   fi
 
-  # Set Samba passwords
+  # Samba passwords
   if [[ "$NONINTERACTIVE" -eq 0 ]]; then
     if [[ -n "${SMB_ALL_PW:-}" ]]; then
-      # One password for everyone (from early prompt stack)
       for u in "${SMBUSERS[@]}"; do
         u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
         ( printf "%s\n%s\n" "$SMB_ALL_PW" "$SMB_ALL_PW" ) | smbpasswd -s -a "$u" >/dev/null || true
       done
     else
-      # Prompt per user only if interactive and not already present in tdbsam
       for u in "${SMBUSERS[@]}"; do
         u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
         if ! pdbedit -L | cut -d: -f1 | grep -qx "$u"; then
@@ -829,14 +862,9 @@ EOF
     fi
   fi
 
-  # Enable services
-  if systemctl list-unit-files | grep -q "^smbd\.service"; then
-    systemctl enable smbd --now
-    systemctl list-unit-files | grep -q "^nmbd\.service" && systemctl enable nmbd --now || true
-  elif systemctl list-unit-files | grep -q "^smb\.service"; then
-    systemctl enable smb --now
-    systemctl list-unit-files | grep -q "^nmb\.service" && systemctl enable nmb --now || true
-  fi
+  # Enable services (queued; single daemon-reload later)
+  systemd_queue_enable smbd || systemd_queue_enable smb
+  systemd_queue_enable nmbd || systemd_queue_enable nmb || true
 
   # Firewall
   if [[ "$FIREWALL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
@@ -846,12 +874,12 @@ EOF
     if [[ "${WADE_STRICT_FIREWALL:-0}" -eq 1 ]]; then
       firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true
       for n in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='"'"'ipv4'"'"' source address='"'"'${n}'"'"' service name='"'"'samba'"'"' accept" || true
+        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${n}' service name='samba' accept" || true
       done
     else
       firewall-cmd --permanent --add-service=samba || true
       for n in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='"'"'ipv4'"'"' source address='"'"'${n}'"'"' service name='"'"'samba'"'"' accept" || true
+        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${n}' service name='samba' accept" || true
       done
     fi
     firewall-cmd --reload || true
@@ -861,30 +889,21 @@ EOF
 #####################################
 # Staging Service Install (venv-managed)
 #####################################
-
 VENV_DIR="/home/${LWADEUSER}/.venvs/wade"
 
 run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
   set -e
 
-  # Load config if present (non-fatal)
-  . "'"${WADE_ETC}/wade.conf"'" 2>/dev/null || true
-  . "'"${WADE_ETC}/wade.env"'" 2>/dev/null || true
-
-  # 1) Install the daemon script
   install -d -m 0755 /opt/wade
   install -m 0755 "'"$STAGE_SRC"'" /opt/wade/stage_daemon.py
 
-  # 2) Create the WADE venv for the service (owned by the runtime user)
   install -d -m 0755 "/home/'"${LWADEUSER}"'/.venvs"
   python3 -m venv "'"$VENV_DIR"'"
   chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "'"$VENV_DIR"'"
 
-  # 3) Install deps into the venv (no system Python writes → PEP 668-safe)
   "'"$VENV_DIR"'/bin/python" -m pip install -U pip setuptools wheel
   "'"$VENV_DIR"'/bin/pip" install inotify-simple
 
-  # 4) Smoke test: verify all imports you listed resolve from the venv
   "'"$VENV_DIR"'/bin/python" - <<'"'"'PY'"'"'
 import json, os, re, shutil, signal, sqlite3, subprocess, sys, time, string, uuid
 from datetime import datetime, timezone
@@ -895,7 +914,6 @@ import difflib
 print("WADE staging imports OK from", sys.executable)
 PY
 
-  # 5) Ensure logs/state + staging/share structure exists
   install -d -m 0755 /var/wade/logs/stage /var/wade/state
   chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /var/wade
 
@@ -907,7 +925,6 @@ PY
       "${STAGING_ROOT}/full" "${STAGING_ROOT}/light" \
       "${DATAS_ROOT}/Hosts" "${DATAS_ROOT}/Network" "${DATAS_ROOT}/${QUEUE_DIR}"
 
-  # 6) Systemd unit — explicitly run with the venv’s interpreter
   cat >/etc/systemd/system/wade-staging.service <<EOF
 [Unit]
 Description=WADE Staging Daemon (full vs light)
@@ -919,8 +936,6 @@ ConditionPathExists=/opt/wade/stage_daemon.py
 Type=simple
 User=${LWADEUSER}
 Group=${LWADEUSER}
-# If your Splunk UF runs as another user and needs to read outputs, consider:
-# SupplementaryGroups=splunk
 EnvironmentFile=-/etc/wade/wade.env
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/opt/wade
@@ -938,65 +953,29 @@ ReadWritePaths=/home/${LWADEUSER} /var/wade
 WantedBy=multi-user.target
 EOF
 
-  # 7) Enable & start
-  systemctl daemon-reload
-  systemctl enable --now wade-staging.service
+  systemd_queue_enable wade-staging.service
 
-  # 8) Version marker (lets your idempotency skip next run)
   sha256sum /opt/wade/stage_daemon.py | awk '"'"'{print $1}'"'"' > "'"${STEPS_DIR}/wade-stage.ver"'"
 
-  # Optional: freeze for reproducibility alongside your repo
   install -d -m 0755 /home/'"${LWADEUSER}"'/WADE 2>/dev/null || true
   "'"$VENV_DIR"'/bin/pip" freeze > /home/'"${LWADEUSER}"'/WADE/requirements.lock || true
 ' || fail_note "wade-stage" "service install/start failed"
 
 #####################################
-# pipx tools: volatility3 + dissect
+# pipx tools: volatility3 + dissect (consolidated)
 #####################################
 run_step "pipx-vol3" "" get_ver_pipx_vol3 '
   set -e
-  export PIPX_HOME=/opt/pipx
-  export PIPX_BIN_DIR=/usr/local/bin
-  mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
-
-  if ! command -v pipx >/dev/null 2>&1; then
-    if [[ "$PM" == "apt" ]]; then
-      bash -lc "$PKG_UPDATE"
-      bash -lc "$PKG_INSTALL pipx"
-    else
-      python3 -m pip install --upgrade pip || true
-      python3 -m pip install pipx || true
-    fi
-  fi
-
-  python3 -m pipx ensurepath || true
-  pipx install volatility3 || pipx upgrade volatility3
+  ensure_pipx_pkg volatility3
 ' || fail_note "pipx-vol3" "install failed"
 
 run_step "pipx-dissect" "" get_ver_pipx_dissect '
   set -e
-  export PIPX_HOME=/opt/pipx
-  export PIPX_BIN_DIR=/usr/local/bin
-  mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
-
-  if ! command -v pipx >/dev/null 2>&1; then
-    if [[ "$PM" == "apt" ]]; then
-      bash -lc "$PKG_UPDATE"
-      bash -lc "$PKG_INSTALL pipx"
-    else
-      python3 -m pip install --upgrade pip || true
-      python3 -m pip install pipx || true
-    fi
-  fi
-
-  python3 -m pipx ensurepath || true
-  pipx install "dissect[cli]" --include-deps || pipx upgrade "dissect[cli]"
+  ensure_pipx_pkg "dissect[cli]" --include-deps
 ' || fail_note "pipx-dissect" "install failed"
 
 run_step "vol3-runtime" "ready" 'get_mark_ver vol3-runtime' '
   set -e
-
-  # Safe defaults inside the subshell too (defend against set -u and --only runs)
   : "${VOL3_BASE_DIR:=/var/wade/vol3}"
   : "${VOL3_SYMBOLS_DIR:=${VOL3_BASE_DIR}/symbols}"
   : "${VOL3_CACHE_DIR:=${VOL3_BASE_DIR}/cache}"
@@ -1006,11 +985,9 @@ run_step "vol3-runtime" "ready" 'get_mark_ver vol3-runtime' '
   install -d -m 2775 "$VOL3_SYMBOLS_DIR" "$VOL3_CACHE_DIR" "$VOL3_PLUGIN_DIR"
   chown -R "$LWADEUSER:$LWADEUSER" "$VOL3_BASE_DIR" || true
 
-  # Locate vol (ensure pipx step ran, or fail clearly)
   VOL_BIN="$(command -v vol || true)"
   [[ -x "$VOL_BIN" ]] || { echo "vol not found; run with --only=pipx-vol3,vol3-runtime or full install"; exit 1; }
 
-  # Wrapper that forces writable symbols/cache/plugin dirs
   cat >/usr/local/bin/vol3 <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1035,7 +1012,6 @@ run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
   set -e
   : "${WADE_CAPA_VENV:=/opt/wade/venvs/capa}"
 
-  # Pre-reqs
   if [[ "$PM" == "apt" ]]; then
     bash -lc "$PKG_INSTALL python3-venv python3-pip git ca-certificates zip p7zip-full"
   else
@@ -1043,12 +1019,10 @@ run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
     bash -lc "$PKG_INSTALL p7zip p7zip-plugins" || true
   fi
 
-  # venv
   install -d "$(dirname "$WADE_CAPA_VENV")"
   [[ -x "$WADE_CAPA_VENV/bin/python" ]] || python3 -m venv "$WADE_CAPA_VENV"
   "$WADE_CAPA_VENV/bin/python" -m pip install -U pip wheel setuptools >/dev/null 2>&1 || true
 
-  # Correct package is flare-capa (provides "capa" CLI)
   PKG="flare-capa"
   [[ -n "${CAPA_VERSION:-}" ]] && PKG="flare-capa==${CAPA_VERSION}"
 
@@ -1107,13 +1081,11 @@ run_step "capa-rules" "${WADE_CAPA_RULES_COMMIT:-}" get_ver_capa_rules '
 
   chown -R root:root "$WADE_CAPA_RULES_DIR" && chmod -R a+rX "$WADE_CAPA_RULES_DIR"
 
-  # Export for shells/tools
   cat >/etc/profile.d/wade-capa.sh <<EOF
 export WADE_CAPA_RULES="${WADE_CAPA_RULES_DIR}"
 EOF
   chmod 0644 /etc/profile.d/wade-capa.sh
 
-  # Handy updater (for online use)
   cat >/usr/local/sbin/update-capa-rules <<'"'"'EOF'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1126,7 +1098,6 @@ fi
 EOF
   chmod 0755 /usr/local/sbin/update-capa-rules
 
-  # Smoke check: have rules?
   n=$(find "$WADE_CAPA_RULES_DIR" -type f -name "*.yml" 2>/dev/null | wc -l | tr -d " ")
   [[ "${n:-0}" -gt 0 ]] || { echo "no rules found"; exit 1; }
 ' || fail_note "capa-rules" "rules install failed"
@@ -1137,21 +1108,17 @@ EOF
 run_step "wade-mw-extractor" "${MWEX_EXPECT_SHA}" get_ver_wade_mwex '
   set -e
 
-  # Install script & dirs
   install -d -m 0755 /opt/wade /var/wade/logs/malware
   install -m 0755 "'"$MWEX_SRC"'" /opt/wade/wade_mw_extract.py
 
-  # Lightweight wrapper in PATH (passes through args)
   cat >/usr/local/bin/wade-mw-extract <<'"'"'EOF'"'"'
 #!/usr/bin/env bash
 set -euo pipefail
-# Default capa rules for convenience; user can override per-invocation
 export WADE_CAPA_RULES="${WADE_CAPA_RULES:-/opt/capa-rules}"
 exec /usr/bin/env python3 /opt/wade/wade_mw_extract.py "$@"
 EOF
   chmod 0755 /usr/local/bin/wade-mw-extract
 
-  # Sanity hints (non-fatal)
   command -v target-fs >/dev/null 2>&1     || echo "[WARN] Dissect CLI (target-fs) not found; disk mode unavailable."
   command -v vol >/dev/null 2>&1 || command -v volatility3 >/dev/null 2>&1 \
                                          || echo "[WARN] Volatility 3 not found; memory mode unavailable."
@@ -1161,7 +1128,6 @@ EOF
 
   sha256sum /opt/wade/wade_mw_extract.py | awk "{print \$1}" > "'"${STEPS_DIR}/wade-mw-extractor.ver"'"
 ' || fail_note "wade-mw-extractor" "install failed"
-
 
 #####################################
 # Helpers for packages & hayabusa arch
@@ -1177,11 +1143,10 @@ fetch_pkg(){
   return 1
 }
 detect_hayabusa_arch(){
-  local arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) echo "lin-x64-gnu" ;;
-    aarch64|arm64) echo "lin-aarch64-gnu" ;;
-    *) echo "lin-x64-gnu" ;;
+  case "$(uname -m)" in
+    x86_64|amd64)  echo "linux-x64" ;;
+    aarch64|arm64) echo "linux-arm64" ;;
+    *)             echo "linux-x64" ;;
   esac
 }
 
@@ -1191,18 +1156,16 @@ detect_hayabusa_arch(){
 if [[ "${MOD_VOL_SYMBOLS_ENABLED:-1}" == "1" ]]; then
 run_step "vol3-symbols" "current" 'get_mark_ver vol3-symbols' '
   set -e
-  mkdir -p "'"${VOL3_SYMBOLS_DIR}"'"
+  : "${VOL3_SYMBOLS_DIR:=/var/wade/vol3/symbols}"
+  mkdir -p "${VOL3_SYMBOLS_DIR}"
 
-  # Pull the official prebuilt packs when online, or use offline cache if present
   for z in windows.zip mac.zip linux.zip; do
-    [[ -f "${VOL3_SYMBOLS_DIR}/$z" ]] && continue
+    [[ -f "${VOL3_SYMBOLS_DIR}/${z}" ]] && continue
     fetch_pkg "volatility3/symbols" "$z" || curl -L "https://downloads.volatilityfoundation.org/volatility3/symbols/${z}" -o "$z"
     cp -f "$z" "${VOL3_SYMBOLS_DIR}/"
   done
 
-  # Ownership so your primary operator can add symbols later
-  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "'"${VOL3_SYMBOLS_DIR}"'" || true
-
+  chown -R "${LWADEUSER}:${LWADEUSER}" "${VOL3_SYMBOLS_DIR}" || true
   echo "$(date -Iseconds)" > "${STEPS_DIR}/vol3-symbols.ver"
 ' || fail_note "volatility_symbols" "download/verify failed"
 fi
@@ -1365,7 +1328,7 @@ run_step "piranha" "installed" get_ver_piranha '
 fi
 
 #####################################
-# Barracuda (soft-fail; fetch MITRE JSON; cd wrapper; absolute JSON path)
+# Barracuda (soft-fail)
 #####################################
 get_ver_barracuda(){
   [[ -x /usr/local/bin/barracuda && -d /opt/barracuda/.venv ]] || { echo ""; return; }
@@ -1442,8 +1405,7 @@ ProtectSystem=full
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now barracuda.service || true
+  systemd_queue_enable barracuda.service
 ' || fail_note "barracuda" "setup failed"
 fi
 
@@ -1472,7 +1434,7 @@ run_step "hayabusa" "" get_ver_hayabusa '
     if have_cmd curl && have_cmd jq; then
       echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
       DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
-        | jq -r --arg pat "${HAY_ARCH:-}" ".assets[] | select(.name | test(\$pat)) | .browser_download_url" | head -1)"
+        | jq -r --arg pat "${HAY_ARCH:-}" --arg pat2 "${HAY_ARCH/-/}" '.assets[] | select(.name | test($pat) or test($pat2) or test("lin-x64-gnu") or test("lin-aarch64-gnu")) | .browser_download_url' | head -1)"
       [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH:-}"; exit 1; }
       HAY_ZIP="$(basename "$DL_URL")"
       curl -L "$DL_URL" -o "$HAY_ZIP"
@@ -1539,7 +1501,7 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload; systemctl enable zookeeper --now
+  systemd_queue_enable zookeeper
 ' || fail_note "zookeeper" "install/config failed"
 
 #####################################
@@ -1551,7 +1513,7 @@ run_step "solr" "${SOLR_VER}" get_ver_solr '
   fetch_pkg solr "$SOLR_TGZ" || curl -L "https://archive.apache.org/dist/lucene/solr/${SOLR_VER}/${SOLR_TGZ}" -o "$SOLR_TGZ"
   [[ -f "$SOLR_TGZ" ]] || { echo "Solr tgz missing"; exit 1; }
   tar -xvzf "$SOLR_TGZ" "solr-${SOLR_VER}/bin/install_solr_service.sh" --strip-components=2
-  bash ./install_solr_service.sh "$SOLR_TGZ"
+  bash ./install_solr_service.sh "$SOLR_TGZ" || true
   IPV4=$(hostname -I 2>/dev/null | awk '"'"'{print $1}'"'"')
   sed -i "s/^#\?SOLR_HEAP=.*/SOLR_HEAP=\"${SOLR_HEAP}\"/" /etc/default/solr.in.sh
   sed -i "s|^#\?SOLR_JAVA_MEM=.*|SOLR_JAVA_MEM=\"${SOLR_JAVA_MEM}\"|" /etc/default/solr.in.sh
@@ -1596,7 +1558,7 @@ ExecStop=/opt/activemq/bin/activemq stop
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload; systemctl enable activemq --now
+  systemd_queue_enable activemq
 ' || fail_note "activemq" "install/config failed"
 
 #####################################
@@ -1625,13 +1587,11 @@ run_step "postgresql" "configured" get_ver_pg '
 #####################################
 # STIG prerequisites (OpenSCAP + SSG)
 #####################################
-# Robust package detector: only returns "installed" when all required bits exist.
 get_ver_stig_pkgs() {
   if [[ "$PM" == "apt" ]]; then
     dpkg -s openscap-scanner ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications >/dev/null 2>&1 \
       && echo "installed" || echo ""
   else
-    # RHEL/OL/Fedora family: openscap-scanner + scap-security-guide
     rpm -q openscap-scanner scap-security-guide >/dev/null 2>&1 && echo "installed" || echo ""
   fi
 }
@@ -1640,21 +1600,15 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" ]]; then
 run_step "stig-prereqs" "installed" get_ver_stig_pkgs '
   set -e
   if [[ "$PM" == "apt" ]]; then
-    apt_wait
-    bash -lc "$PKG_UPDATE"
-    # exactly what you installed manually, plus unzip (needed for zip STIG bundles)
     bash -lc "$PKG_INSTALL unzip openscap-scanner"
     bash -lc "$PKG_INSTALL ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications"
-    # scap-security-guide is split on Ubuntu; attempt if present in this release
     bash -lc "apt-cache show scap-security-guide >/dev/null 2>&1 && $PKG_INSTALL scap-security-guide || true"
   else
-    bash -lc "$PKG_UPDATE"
     bash -lc "$PKG_INSTALL openscap-scanner unzip"
     bash -lc "$PKG_INSTALL scap-security-guide"
   fi
 ' || fail_note "stig" "could not install prerequisites"
 fi
-
 
 #####################################
 # Splunk Universal Forwarder (UF-only)
@@ -1662,17 +1616,13 @@ fi
 run_step "splunk-uf" "installed" get_ver_splunkuf '
   set -e
 
-  # Basic deps
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || true
-    apt-get install -y --no-install-recommends procps curl
+    apt-get install -y --no-install-recommends procps curl || true
   fi
 
-  # System user for UF
   id splunkfwd >/dev/null 2>&1 || useradd --system --home-dir /opt/splunkforwarder --shell /usr/sbin/nologin splunkfwd || true
 
-  # ---- locate UF package (env URL, /var/wade/pkg, or script dir) ----
   PKG=""
   if [[ -n "${SPLUNK_UF_DEB_URL:-}" ]]; then
     PKG="/tmp/$(basename "${SPLUNK_UF_DEB_URL}")"
@@ -1683,7 +1633,6 @@ run_step "splunk-uf" "installed" get_ver_splunkuf '
     PKG="$(ls "${SPLUNK_SRC_DIR}"/splunkforwarder*.deb | sort -V | tail -1)"
   fi
 
-  # Soft-skip if you didn't provide a UF package
   if [[ -z "$PKG" || ! -f "$PKG" ]]; then
     echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/"
     exit 0
@@ -1691,10 +1640,8 @@ run_step "splunk-uf" "installed" get_ver_splunkuf '
 
   dpkg -i "$PKG" || apt-get -f install -y
 
-  # Accept license + enable at boot under splunkfwd
   /opt/splunkforwarder/bin/splunk enable boot-start -systemd-managed 1 -user splunkfwd --accept-license --answer-yes || true
 
-  # ---- defaults from wade.conf (with sane fallbacks) ----
   SERVER_LINE="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
   DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
   COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
@@ -1703,7 +1650,6 @@ run_step "splunk-uf" "installed" get_ver_splunkuf '
   SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
   DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
 
-  # If early prompts pre-set values, prefer them
   if [[ "${PRESET_SPLUNK:-0}" -eq 1 ]]; then
     SERVER_LINE="${PRESET_SPLUNK_SERVER_LINE:-$SERVER_LINE}"
     DEFAULT_INDEX="${PRESET_SPLUNK_INDEX:-$DEFAULT_INDEX}"
@@ -1726,7 +1672,6 @@ compressed = ${COMPRESSED}
 useACK = ${USE_ACK}
 EOF
 
-  # Optional SSL common name pinning
   if [[ "$SSL_VERIFY" == "true" ]]; then
     cat >>/opt/splunkforwarder/etc/system/local/outputs.conf <<EOF
 sslVerifyServerCert = true
@@ -1734,7 +1679,6 @@ sslCommonNameToCheck = ${SSL_CN}
 EOF
   fi
 
-  # Optional Deployment Server
   if [[ -n "$DS_TARGET" ]]; then
     cat >/opt/splunkforwarder/etc/system/local/deploymentclient.conf <<EOF
 [deployment-client]
@@ -1749,34 +1693,19 @@ EOF
 ' || fail_note "splunk-uf" "install/config failed"
 
 #####################################
-# WADE: logrotate setup (multi-service)
+# WADE: logrotate setup (per-service)
 #####################################
-
-# Ensure logrotate is installed (best-effort for offline)
 _wade_ensure_logrotate() {
   if command -v logrotate >/dev/null 2>&1; then return 0; fi
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
     apt-get install -y logrotate >/dev/null 2>&1 || true
   fi
 }
-
-# Derive default logdir from service name: wade-XYZ -> /var/wade/logs/XYZ
 _wade_default_logdir_for_service() {
   local svc="$1"
   local base="${svc#wade-}"
   printf "/var/wade/logs/%s" "${base}"
 }
-
-# Configure logrotate + systemd override for a single service
-# Args:
-#   1: service name (e.g., wade-stage)  [required]
-#   2: logdir (default: auto from svc)  [optional]
-#   3: user  (default: autopsy)         [optional]
-#   4: group (default: same as user)    [optional]
-#   5: rotate count (default: 14)       [optional]
-#   6: period: daily|weekly|monthly (default: daily) [optional]
-#   7: method: signal:USR1|signal:HUP|copytruncate (default: signal:USR1) [optional]
 install_wade_logrotate() {
   local svc="${1:?service name required}"
   local logdir="${2:-$(_wade_default_logdir_for_service "$svc")}"
@@ -1790,7 +1719,6 @@ install_wade_logrotate() {
 
   _wade_ensure_logrotate
 
-  # Ensure log dir and ownership
   mkdir -p "${logdir}"
   if id -u "${user}" >/dev/null 2>&1 && getent group "${group}" >/dev/null 2>&1; then
     chown -R "${user}:${group}" "${logdir}" || true
@@ -1801,7 +1729,6 @@ install_wade_logrotate() {
   fi
   chmod 0750 "${logdir}" || true
 
-  # Per-service systemd override (only when signaling)
   if [[ "${method}" == signal:* ]]; then
     local sig="${method#signal:}"
     mkdir -p "/etc/systemd/system/${svc}.service.d"
@@ -1810,21 +1737,17 @@ install_wade_logrotate() {
 ExecReload=
 ExecReload=/bin/kill -s ${sig} \$MAINPID
 EOF
-    systemctl daemon-reload 2>/dev/null || true
+    # don't reload yet; queued globally
   fi
 
-  # Build postrotate script based on method
   local postrotate_cmd
   if [[ "${method}" == copytruncate ]]; then
-    # No signal; rely on copytruncate directive
     postrotate_cmd=": # no signal; using copytruncate"
   else
-    # Default or explicit signal:<SIG>
     local sig="${method#signal:}"
     postrotate_cmd="systemctl kill -s ${sig} ${svc}.service 2>/dev/null || true"
   fi
 
-  # Per-service logrotate policy file
   local policy="/etc/logrotate.d/${svc}"
   cat > "${policy}" <<EOF
 ${logdir%/}/*.log {
@@ -1845,25 +1768,9 @@ EOF
 
   chmod 0644 "${policy}"
   chown root:root "${policy}"
-
-  echo "[wade] logrotate policy: ${policy}"
 }
 
-# Bulk helper:
-# Accepts any number of tokens in the form:
-#   "service[:logdir[:user[:group[:rotate[:period[:method]]]]]]"
-# Example token: "wade-stage:/var/wade/logs/stage:autopsy:autopsy:14:daily:signal:USR1"
-install_wade_logrotate_bulk() {
-  local token svc logdir user group rotate period method
-  for token in "$@"; do
-    IFS=':' read -r svc logdir user group rotate period method <<<"${token}"
-    install_wade_logrotate "${svc:?}" "${logdir:-}" "${user:-}" "${group:-}" "${rotate:-}" "${period:-}" "${method:-}"
-  done
-}
-
-# Rotate JSONL under /var/wade/logs/malware weekly, keep 14 copies
 install_wade_logrotate "wade-mw-extractor" "/var/wade/logs/malware" "${LWADEUSER:-autopsy}" "${LWADEUSER:-autopsy}" 14 "weekly" "copytruncate"
-
 install_wade_logrotate "wade-staging" "/var/wade/logs/stage" "${LWADEUSER:-autopsy}" "${LWADEUSER:-autopsy}" 14 "daily" "copytruncate"
 
 #####################################
@@ -1872,7 +1779,6 @@ install_wade_logrotate "wade-staging" "/var/wade/logs/stage" "${LWADEUSER:-autop
 ENV_FILE="${WADE_ETC}/wade.env"
 IPV4="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
-# — Derive Splunk UF settings if present (fall back to conf defaults) —
 OUTCONF="/opt/splunkforwarder/etc/system/local/outputs.conf"
 INCONF="/opt/splunkforwarder/etc/system/local/inputs.conf"
 DCONF="/opt/splunkforwarder/etc/system/local/deploymentclient.conf"
@@ -1885,7 +1791,6 @@ UF_SSLN="$(awk -F= '/^\s*sslCommonNameToCheck\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2
 UF_DS="$(awk -F= '/^\s*targetUri\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$DCONF" 2>/dev/null)"
 UF_IDX="$(awk -F= '/^\s*index\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$INCONF" 2>/dev/null)"
 
-# fallbacks to defaults from wade.conf
 UF_RCVR="${UF_RCVR:-${SPLUNK_UF_RCVR_HOSTS:-${SPLUNK_UF_RCVR_HOST:-}}}"
 UF_COMP="${UF_COMP:-${SPLUNK_UF_COMPRESSED:-true}}"
 UF_ACKS="${UF_ACKS:-${SPLUNK_UF_USE_ACK:-true}}"
@@ -1972,9 +1877,8 @@ SPLUNK_FORWARD_PORT="\${SPLUNK_FORWARD_PORT}"
 WADE_SERVICE_PORTS_CSV="\${SSH_PORT},\${SMB_TCP_139},\${SMB_TCP_445},\${SMB_UDP_137},\${SMB_UDP_138},\${ZK_CLIENT_PORT},\${ZK_QUORUM_PORT},\${ZK_ELECTION_PORT},\${SOLR_PORT},\${ACTIVEMQ_OPENWIRE_PORT},\${ACTIVEMQ_WEB_CONSOLE_PORT},\${ACTIVEMQ_AMQP_PORT},\${ACTIVEMQ_STOMP_PORT},\${ACTIVEMQ_MQTT_PORT},\${ACTIVEMQ_WS_PORT},\${POSTGRES_PORT},\${PIRANHA_PORT},\${BARRACUDA_PORT},\${SPLUNK_WEB_PORT},\${SPLUNK_MGMT_PORT},\${SPLUNK_HEC_PORT},\${SPLUNK_FORWARD_PORT}"
 ENV
 
- chown root:"${LWADEUSER}" "$ENV_FILE"
- chmod 0640 "$ENV_FILE"
-
+chown root:"${LWADEUSER}" "$ENV_FILE"
+chmod 0640 "$ENV_FILE"
 
 echo
 echo "[+] WADE install attempted."
@@ -1983,7 +1887,7 @@ echo "    Zookeeper : 127.0.0.1:${ZK_CLIENT_PORT:-2181}"
 echo "    Solr (UI) : http://${IPV4}:${SOLR_PORT:-8983}/solr/#/~cloud"
 echo "    ActiveMQ  : ${IPV4}:${ACTIVEMQ_OPENWIRE_PORT:-61616} (web console :${ACTIVEMQ_WEB_CONSOLE_PORT:-8161})"
 echo "    Postgres  : ${IPV4}:${POSTGRES_PORT:-5432}"
-echo "    Barracuda  : ${IPV4}:5000"
+echo "    Barracuda : ${IPV4}:5000"
 echo "    Tools     : vol3, dissect, bulk_extractor (+ piranha, barracuda, hayabusa)"
 echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
 echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
@@ -2009,7 +1913,6 @@ echo "NOTE: New tools default to SPLUNK index: '${SPLUNK_DEFAULT_INDEX:-wade_cus
 #####################################
 # Call The Doctor
 #####################################
-
 wade_doctor
 
 #####################################
@@ -2123,5 +2026,8 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
     fi
   fi
 fi
+
+# One-and-done systemd reload/enables
+systemd_finalize_enable
 
 finish_summary
