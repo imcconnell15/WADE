@@ -628,6 +628,10 @@ bootstrap_fresh_install(){
     fi
   fi
 }
+
+export PM PKG_INSTALL PKG_UPDATE PKG_REFRESH FIREWALL
+export NONINTERACTIVE OFFLINE LWADEUSER SMB_USERS_CSV ALLOW_NETS_CSV
+
 bootstrap_fresh_install
 
 #####################################
@@ -810,11 +814,10 @@ EOF
   chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
     HOSTS_BLOCK=""
-  # Only build the allow/deny lines if we really have nets; safe under set -u
   if [[ -n "${ALLOW_NETS_ARR+x}" && ${#ALLOW_NETS_ARR[@]} -gt 0 ]]; then
     HOSTS_BLOCK="   hosts allow ="
     for net in "${ALLOW_NETS_ARR[@]}"; do HOSTS_BLOCK+=" ${net}"; done
-    HOSTS_BLOCK+=$'\n''   hosts deny = 0.0.0.0/0'
+    HOSTS_BLOCK+=$'\n   hosts deny = 0.0.0.0/0'
   fi
 
   # Delete previous managed block, if any
