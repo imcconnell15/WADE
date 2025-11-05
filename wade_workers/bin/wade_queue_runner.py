@@ -9,24 +9,29 @@ except Exception:
     from wade_workers.utils import load_env  # type: ignore
 
 RUNNING = True
-def _stop(*_):  # graceful exit
+def _stop(*_):
+    # Graceful exit on SIGINT/SIGTERM
     global RUNNING
     RUNNING = False
 
 def _queue_root(env: dict) -> Path:
-    u = env.get("WADE_OWNER_USER","autopsy")
+    # Resolve queue root exactly like staging does
+    owner   = env.get("WADE_OWNER_USER","autopsy")
     datadir = env.get("WADE_DATADIR","DataSources")
-    q = env.get("WADE_QUEUE_DIR","_queue")
-    base = Path(f"/home/{u}")/datadir
-    return Path(q) if Path(q).is_absolute() else (base/Path(q))
+    qdir    = env.get("WADE_QUEUE_DIR","_queue")
+    base = Path(f"/home/{owner}")/datadir
+    q = Path(qdir)
+    return q if q.is_absolute() else (base/q)
 
 def _tickets(qroot: Path):
+    # Expect _queue/<classification>/<profile>/*.json (not .work/.done/.dead)
     for p in qroot.glob("*/*/*.json"):
         if any(s in p.suffixes for s in (".work",".done",".dead",".tmp")):
             continue
         yield p
 
 def _lock(p: Path) -> Path | None:
+    # Single-host atomic lock by rename -> *.work-<pid>.json
     locked = p.with_name(p.stem + f".work-{os.getpid()}" + "".join(p.suffixes))
     try:
         p.rename(locked)
@@ -53,17 +58,21 @@ def main():
                 continue
             worked += 1
             try:
+                # Call the worker CLI ON the ticket
                 rc = subprocess.call([sys.executable, str(cli), str(l)])
-                base = l.with_suffix("")  # drop one suffix
-                (base.with_suffix(".done.json") if rc == 0 else base.with_suffix(".dead.json")).write_bytes(l.read_bytes())
+                base = l.with_suffix("")                 # drop one suffix
+                dst  = base.with_suffix(".done.json") if rc == 0 else base.with_suffix(".dead.json")
+                dst.write_bytes(l.read_bytes())          # keep a record
                 l.unlink(missing_ok=True)
             except Exception:
+                # Catastrophic handling → dead-letter
                 try:
                     base = l.with_suffix("")
                     base.with_suffix(".dead.json").write_bytes(l.read_bytes())
                     l.unlink(missing_ok=True)
                 except Exception:
                     pass
+
         if worked == 0:
             time.sleep(2)
 
