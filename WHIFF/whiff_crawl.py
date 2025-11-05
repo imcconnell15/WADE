@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os, time, re, json, hashlib, urllib.parse, queue
 import requests
+import uuid
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 import psycopg2
@@ -48,11 +49,7 @@ def fetch(session, url):
 def index_chunks(conn, title, url, tool, version, license_, chunks, embs):
     rows=[]
     for chunk, emb in zip(chunks, embs):
-        rows.append((
-            os.popen("uuidgen").read().strip(),
-            title[:512], url, tool, version, license_,
-            chunk, str(hash(chunk)), json.dumps({"source_url":url}), emb.tolist()
-        ))
+        rows.append((str(uuid.uuid4()), title[:512], url, tool, version, license_, c, str(hash(c)), json.dumps({"source_url":url}), e.tolist()))
     cur = conn.cursor()
     cur.executemany("""
       INSERT INTO sage_docs (id,title,source_url,tool,version,license,chunk,chunk_hash,meta,embedding)
