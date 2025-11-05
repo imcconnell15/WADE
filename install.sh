@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # WADE - Wide-Area Data Extraction :: Idempotent Installer (soft-fail + interactive STIG)
 # Author: Ian McConnell
-
 # NOTE: keep LF endings (use `dos2unix install.sh` if needed)
 
 ### ---------- Prompt helpers ----------
@@ -43,7 +42,6 @@ if [[ "$WADE_DEBUG" = "1" ]]; then
 fi
 
 # Pretty error frames without killing soft-fail flow
-# (Don’t exit here; let run_step() capture failures.)
 trap 'rc=$?; line=${BASH_LINENO[0]:-$LINENO}; cmd=${BASH_COMMAND}
 echo "[ERR] ${BASH_SOURCE##*/}:${line} rc=${rc}  cmd: ${cmd}" >&2' ERR
 
@@ -135,27 +133,22 @@ find_offline_src(){
 # --- APT lock helper (Ubuntu/Debian) ---
 apt_wait() {
   [[ "$PM" != "apt" ]] && return 0
-
   local tries=60
   local locks=(/var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
   echo "[apt] checking for package manager locks…"
-
   if command -v fuser >/dev/null 2>&1; then
     while fuser "${locks[@]}" >/dev/null 2>&1; do
       ((tries--)) || { echo "[apt] lock held too long; bailing"; return 1; }
-      echo "[apt] lock held by another process; retrying in 5s… ($((60-tries))/60)"
-      sleep 5
+      echo "[apt] lock held by another process; retrying in 5s… ($((60-tries))/60)"; sleep 5
     done
   elif command -v lsof >/dev/null 2>&1; then
     while lsof -t "${locks[@]}" >/dev/null 2>&1; do
       ((tries--)) || { echo "[apt] lock held too long; bailing"; return 1; }
-      echo "[apt] lock held by another process (lsof); retrying in 5s… ($((60-tries))/60)"
-      sleep 5
+      echo "[apt] lock held by another process (lsof); retrying in 5s… ($((60-tries))/60)"; sleep 5
     done
   else
     echo "[apt] no fuser/lsof; skipping wait"
   fi
-
   dpkg --configure -a >/dev/null 2>&1 || true
 }
 
@@ -175,11 +168,10 @@ ensure_pipx_installed() {
   export PIPX_HOME=/opt/pipx
   export PIPX_BIN_DIR=/usr/local/bin
   mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
-
   if ! command -v pipx >/dev/null 2>&1; then
     if [[ "$PM" == "apt" ]]; then
       apt_refresh_once
-      bash -lc "$PKG_INSTALL pipx"
+      bash -lc "$PKG_INSTALL pipx" || true
     else
       python3 -m pip install --upgrade pip || true
       python3 -m pip install pipx || true
@@ -207,6 +199,42 @@ systemd_finalize_enable() {
   for u in "${_SYSTEMD_UNITS[@]}"; do
     systemctl enable --now "$u" 2>/dev/null || true
   done
+}
+
+#####################################
+# NEW: Package bundle aggregator (single install)
+#####################################
+APT_BUNDLE=()
+RPM_BUNDLE=()
+pkg_add() {
+  # usage: pkg_add <apt_pkg> [<rpm_pkg>]
+  if [[ "$PM" == "apt" ]]; then
+    APT_BUNDLE+=("$1")
+  else
+    # if rpm alias not given, reuse $1
+    RPM_BUNDLE+=("${2:-$1}")
+  fi
+}
+pkg_install_bundle_once() {
+  (( ${#APT_BUNDLE[@]} + ${#RPM_BUNDLE[@]} == 0 )) && return 0
+  if [[ "$PM" == "apt" ]]; then
+    apt_refresh_once
+    mapfile -t APT_BUNDLE < <(printf '%s\n' "${APT_BUNDLE[@]}" | awk '!seen[$0]++')
+    [[ ${#APT_BUNDLE[@]} -gt 0 ]] && bash -lc "$PKG_INSTALL ${APT_BUNDLE[*]}"
+  else
+    mapfile -t RPM_BUNDLE < <(printf '%s\n' "${RPM_BUNDLE[@]}" | awk '!seen[$0]++')
+    [[ ${#RPM_BUNDLE[@]} -gt 0 ]] && bash -lc "$PKG_INSTALL ${RPM_BUNDLE[*]}"
+  fi
+}
+
+# NEW: shared wheelhouse helper for venvs
+pip_cached_install() {
+  # usage: pip_cached_install <venv_bin_dir> <reqs_or_pkgs...>
+  local vbin="$1"; shift
+  local wheelhouse="${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels"
+  mkdir -p "$wheelhouse"
+  "$vbin/pip" download -d "$wheelhouse" "$@" >/dev/null 2>&1 || true
+  "$vbin/pip" install --no-index --find-links "$wheelhouse" "$@" || "$vbin/pip" install "$@"
 }
 
 #####################################
@@ -401,6 +429,80 @@ echo "[*] Detected OS: ${PRETTY}"
 PKG_INSTALL=""; PKG_UPDATE=""; PKG_REFRESH=""; FIREWALL=""; PM=""
 
 #####################################
+# OFFLINE repo setup & pkg managers
+#####################################
+OFFLINE_SRC=""
+if [[ "$OFFLINE" == "1" ]]; then
+  echo "[*] OFFLINE mode enabled…"
+  OFFLINE_SRC="$(find_offline_src)" || die "Could not find 'wade-offline' media."
+  echo "[+] Offline repo root: $OFFLINE_SRC"
+fi
+
+if [[ "$OFFLINE" == "1" ]]; then
+  case "$OS_ID:$OS_LIKE" in
+    ubuntu:*|*:"debian"*)
+      echo "deb [trusted=yes] file:${OFFLINE_SRC}/ubuntu noble main" > /etc/apt/sources.list.d/wade-offline.list
+      APT_FLAGS='-o Dir::Etc::sourcelist="sources.list.d/wade-offline.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"'
+      PKG_UPDATE="apt-get update ${APT_FLAGS}"
+      PKG_INSTALL="apt-get install -y --no-install-recommends ${APT_FLAGS}"
+      PKG_REFRESH="$PKG_INSTALL"; FIREWALL="ufw"; PM="apt"
+      ;;
+    ol:*|*:"rhel"*|*:"fedora"*)
+      cat >/etc/yum.repos.d/wade-offline.repo <<EOF
+[WadeOffline]
+name=Wade Offline
+baseurl=file://${OFFLINE_SRC}/oracle10
+enabled=1
+gpgcheck=0
+EOF
+      if have_cmd dnf; then
+        PKG_UPDATE="dnf -y --disablerepo='*' --enablerepo='WadeOffline' makecache"
+        PKG_INSTALL="dnf -y --disablerepo='*' --enablerepo='WadeOffline' install"
+        PKG_REFRESH="$PKG_INSTALL"; PM="dnf"
+      else
+        PKG_UPDATE="yum -y --disablerepo='*' --enablerepo='WadeOffline' makecache"
+        PKG_INSTALL="yum -y --disablerepo='*' --enablerepo='WadeOffline' install"
+        PKG_REFRESH="$PKG_INSTALL"; PM="yum"
+      fi
+      FIREWALL="firewalld"
+      ;;
+    *) die "Offline: unsupported distro ${OS_ID}/${OS_LIKE}." ;;
+  esac
+else
+  case "$OS_ID:$OS_LIKE" in
+    ubuntu:*|*:"debian"*)
+      PKG_UPDATE="apt-get update -y"
+      PKG_INSTALL="apt-get install -y --no-install-recommends"
+      PKG_REFRESH="$PKG_INSTALL"; FIREWALL="ufw"; PM="apt"
+      ;;
+    ol:*|*:"rhel"*|*:"fedora"*)
+      if have_cmd dnf; then
+        PKG_UPDATE="dnf -y makecache"
+        PKG_INSTALL="dnf -y install"
+        PKG_REFRESH="$PKG_INSTALL"; PM="dnf"
+      else
+        PKG_UPDATE="yum -y makecache"
+        PKG_INSTALL="yum -y install"
+        PKG_REFRESH="$PKG_INSTALL"; PM="yum"
+      fi
+      FIREWALL="firewalld"
+      ;;
+    *) die "Unsupported distro (ID=${OS_ID}, LIKE=${OS_LIKE})." ;;
+  esac
+fi
+
+# Minimal bootstrap: enable EPEL on RPM if online (package bundle below handles the rest)
+bootstrap_fresh_install(){
+  if [[ "$PM" != "apt" && "$OFFLINE" != "1" ]]; then
+    bash -lc "$PKG_INSTALL oracle-epel-release-el10" || bash -lc "$PKG_INSTALL oracle-epel-release-el9" || bash -lc "$PKG_INSTALL epel-release" || true
+  fi
+}
+export PM PKG_INSTALL PKG_UPDATE PKG_REFRESH FIREWALL
+export NONINTERACTIVE OFFLINE LWADEUSER SMB_USERS_CSV ALLOW_NETS_CSV
+
+bootstrap_fresh_install
+
+#####################################
 # WADE scaffolding & default config
 #####################################
 WADE_ETC="/etc/wade"
@@ -524,6 +626,10 @@ STIG_STORE_DIR="/var/wade/stigs"
 STIG_UBU_EXTRACT_DIR="${STIG_STORE_DIR}/ubuntu2404"
 STIG_PROFILE_ID="xccdf_mil.disa.stig_profile_MAC-1_Classified"
 STIG_SKIP_RULES=""
+
+# ---- bulk_extractor installation mode ----
+# "source" (build from GitHub) or "repo" (use distro package if available)
+BULK_EXTRACTOR_MODE="source"
 CONF
   chmod 0644 "${WADE_ETC}/wade.conf"
 fi
@@ -559,93 +665,74 @@ OFFLINE="${OFFLINE:-${WADE_OFFLINE:-0}}"
 : "${LWADEUSER:=${WADE_OWNER_USER:-autopsy}}"
 
 #####################################
-# OFFLINE repo setup & pkg managers
+# NEW: Build the package bundle & install once
 #####################################
-OFFLINE_SRC=""
-if [[ "$OFFLINE" == "1" ]]; then
-  echo "[*] OFFLINE mode enabled…"
-  OFFLINE_SRC="$(find_offline_src)" || die "Could not find 'wade-offline' media."
-  echo "[+] Offline repo root: $OFFLINE_SRC"
+# Core
+pkg_add samba
+pkg_add samba-common-bin samba-common-tools
+pkg_add cifs-utils
+pkg_add jq
+pkg_add inotify-tools
+pkg_add plocate
+pkg_add zip
+pkg_add unzip
+pkg_add p7zip-full 'p7zip p7zip-plugins'
+# Python/venv/pip
+pkg_add python3-venv 'python3-virtualenv'
+pkg_add python3-pip 'python3-pip'
+# Java (for Solr)
+pkg_add "${JAVA_PACKAGE_APT:-default-jre-headless}" "${JAVA_PACKAGE_RPM:-java-11-openjdk-headless}"
+# Firewalls
+if [[ "$PM" == "apt" ]]; then pkg_add ufw; else pkg_add firewalld; fi
+# Qt/X11 libs only if Piranha/Barracuda toggles are on (apt only)
+if [[ "$PM" == "apt" && ( "${MOD_PIRANHA_ENABLED:-1}" == "1" || "${MOD_BARRACUDA_ENABLED:-1}" == "1" ) ]]; then
+  pkg_add libegl1
+  pkg_add libopengl0
+  pkg_add libgl1
+  pkg_add libxkbcommon-x11-0
+  pkg_add libxcb-icccm4
+  pkg_add libxcb-image0
+  pkg_add libxcb-keysyms1
+  pkg_add libxcb-randr0
+  pkg_add libxcb-render-util0
+  pkg_add libxcb-shape0
+  pkg_add libxcb-xfixes0
+  pkg_add libxcb-xinerama0
+  pkg_add libxcb-xkb1
+  pkg_add libxcb-cursor0
+  pkg_add fonts-dejavu-core
 fi
-
-if [[ "$OFFLINE" == "1" ]]; then
-  case "$OS_ID:$OS_LIKE" in
-    ubuntu:*|*:"debian"*)
-      echo "deb [trusted=yes] file:${OFFLINE_SRC}/ubuntu noble main" > /etc/apt/sources.list.d/wade-offline.list
-      APT_FLAGS='-o Dir::Etc::sourcelist="sources.list.d/wade-offline.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"'
-      PKG_UPDATE="apt-get update ${APT_FLAGS}"
-      PKG_INSTALL="apt-get install -y --no-install-recommends ${APT_FLAGS}"
-      PKG_REFRESH="$PKG_INSTALL"; FIREWALL="ufw"; PM="apt"
-      ;;
-    ol:*|*:"rhel"*|*:"fedora"*)
-      cat >/etc/yum.repos.d/wade-offline.repo <<EOF
-[WadeOffline]
-name=Wade Offline
-baseurl=file://${OFFLINE_SRC}/oracle10
-enabled=1
-gpgcheck=0
-EOF
-      if have_cmd dnf; then
-        PKG_UPDATE="dnf -y --disablerepo='*' --enablerepo='WadeOffline' makecache"
-        PKG_INSTALL="dnf -y --disablerepo='*' --enablerepo='WadeOffline' install"
-        PKG_REFRESH="$PKG_INSTALL"; PM="dnf"
-      else
-        PKG_UPDATE="yum -y --disablerepo='*' --enablerepo='WadeOffline' makecache"
-        PKG_INSTALL="yum -y --disablerepo='*' --enablerepo='WadeOffline' install"
-        PKG_REFRESH="$PKG_INSTALL"; PM="yum"
-      fi
-      FIREWALL="firewalld"
-      ;;
-    *) die "Offline: unsupported distro ${OS_ID}/${OS_LIKE}." ;;
-  esac
-else
-  case "$OS_ID:$OS_LIKE" in
-    ubuntu:*|*:"debian"*)
-      PKG_UPDATE="apt-get update -y"
-      PKG_INSTALL="apt-get install -y --no-install-recommends"
-      PKG_REFRESH="$PKG_INSTALL"; FIREWALL="ufw"; PM="apt"
-      ;;
-    ol:*|*:"rhel"*|*:"fedora"*)
-      if have_cmd dnf; then
-        PKG_UPDATE="dnf -y makecache"
-        PKG_INSTALL="dnf -y install"
-        PKG_REFRESH="$PKG_INSTALL"; PM="dnf"
-      else
-        PKG_UPDATE="yum -y makecache"
-        PKG_INSTALL="yum -y install"
-        PKG_REFRESH="$PKG_INSTALL"; PM="yum"
-      fi
-      FIREWALL="firewalld"
-      ;;
-    *) die "Unsupported distro (ID=${OS_ID}, LIKE=${OS_LIKE})." ;;
-  esac
-fi
-
-# Centralized refresh once
-apt_refresh_once
-
-#####################################
-# Fresh-install bootstrap
-#####################################
-bootstrap_fresh_install(){
-  echo "[*] Fresh-install bootstrap…"
+# X11 fwd bits if using GUI tools
+if [[ "${MOD_PIRANHA_ENABLED:-1}" == "1" || "${MOD_BARRACUDA_ENABLED:-1}" == "1" ]]; then
   if [[ "$PM" == "apt" ]]; then
-    export DEBIAN_FRONTEND=noninteractive
-    bash -lc "$PKG_INSTALL ca-certificates curl gnupg lsb-release git python3-venv unzip"
-    bash -lc "$PKG_INSTALL ufw" || true
+    pkg_add xauth
+    pkg_add x11-apps
   else
-    bash -lc "$PKG_INSTALL firewalld curl tar git python3 python3-virtualenv unzip" || true
-    systemctl enable firewalld --now || true
-    if [[ "$OFFLINE" != "1" ]]; then
-      bash -lc "$PKG_INSTALL oracle-epel-release-el10" || bash -lc "$PKG_INSTALL oracle-epel-release-el9" || bash -lc "$PKG_INSTALL epel-release" || true
-    fi
+    pkg_add xorg-x11-xauth
   fi
-}
+fi
+# STIG prereqs gated
+if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" ]]; then
+  if [[ "$PM" == "apt" ]]; then
+    pkg_add openscap-scanner
+    pkg_add ssg-base
+    pkg_add ssg-debderived
+    pkg_add ssg-debian
+    pkg_add ssg-nondebian
+    pkg_add ssg-applications
+    # scap-security-guide may or may not exist on Ubuntu; leave to best-effort in the step
+  else
+    pkg_add openscap-scanner
+    pkg_add scap-security-guide
+  fi
+fi
+# Postgres (Ubuntu)
+if [[ "$PM" == "apt" ]]; then
+  pkg_add postgresql
+fi
 
-export PM PKG_INSTALL PKG_UPDATE PKG_REFRESH FIREWALL
-export NONINTERACTIVE OFFLINE LWADEUSER SMB_USERS_CSV ALLOW_NETS_CSV
-
-bootstrap_fresh_install
+# Do the single consolidated install
+pkg_install_bundle_once
 
 #####################################
 # Prompts (noninteractive honors defaults)
@@ -761,7 +848,7 @@ PRESET_WHIFF_PORT="$DEFAULT_WHIFF_PORT"
 PRESET_WHIFF_BACKEND="$DEFAULT_WHIFF_BACKEND"
 PRESET_WHIFF_MODEL="$DEFAULT_WHIFF_MODEL"
 PRESET_WHIFF_ENDPOINT="$DEFAULT_WHIFF_ENDPOINT"
-PRESET_WHIFF_API_KEY=""   # do NOT persist by default; ephemeral unless user opts in
+PRESET_WHIFF_API_KEY=""
 
 if [[ "$NONINTERACTIVE" -eq 0 ]]; then
   echo
@@ -771,20 +858,12 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
     PRESET_WHIFF_ENABLE="1"
     read -r -p "Bind address [${DEFAULT_WHIFF_BIND}]: " tmp; PRESET_WHIFF_BIND="${tmp:-$DEFAULT_WHIFF_BIND}"
     read -r -p "Port [${DEFAULT_WHIFF_PORT}]: " tmp; PRESET_WHIFF_PORT="${tmp:-$DEFAULT_WHIFF_PORT}"
-
-    read -r -p "Backend (ollama|openai|http) [${DEFAULT_WHIFF_BACKEND}]: " tmp
-    PRESET_WHIFF_BACKEND="${tmp:-$DEFAULT_WHIFF_BACKEND}"
-
-    read -r -p "Model name/tag [${DEFAULT_WHIFF_MODEL}]: " tmp
-    PRESET_WHIFF_MODEL="${tmp:-$DEFAULT_WHIFF_MODEL}"
-
-    # Optional endpoint (for http/vLLM or custom gateways)
+    read -r -p "Backend (ollama|openai|http) [${DEFAULT_WHIFF_BACKEND}]: " tmp; PRESET_WHIFF_BACKEND="${tmp:-$DEFAULT_WHIFF_BACKEND}"
+    read -r -p "Model name/tag [${DEFAULT_WHIFF_MODEL}]: " tmp; PRESET_WHIFF_MODEL="${tmp:-$DEFAULT_WHIFF_MODEL}"
     if [[ "$PRESET_WHIFF_BACKEND" != "ollama" ]]; then
       read -r -p "Backend endpoint URL (blank to skip) [${DEFAULT_WHIFF_ENDPOINT}]: " tmp
       PRESET_WHIFF_ENDPOINT="${tmp:-$DEFAULT_WHIFF_ENDPOINT}"
     fi
-
-    # Optional API key (OpenAI or other hosted APIs). Do not persist unless user explicitly asks.
     if [[ "$PRESET_WHIFF_BACKEND" == "openai" ]]; then
       echo "If using OpenAI (or compatible) enter API key (leave blank to skip)."
       read -r -s -p "API key: " tmp; echo
@@ -824,26 +903,6 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
 fi
 
 #####################################
-# Core packages (+ headless Java & truststore)
-#####################################
-( set -e
-  WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools plocate libewf2 ewf-tools pipx zip unzip p7zip-full)
-  if [[ "$PM" == "apt" ]]; then
-    JAVA_PKG="${JAVA_PACKAGE_APT:-default-jre-headless}"
-    bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} ufw ${JAVA_PKG} samba-common-bin"
-    if command -v keytool >/dev/null 2>&1; then
-      /var/lib/dpkg/info/ca-certificates-java.postinst configure || true
-      bash -lc "$PKG_INSTALL --reinstall ca-certificates-java" || true
-    fi
-  else
-    JAVA_PKG="${JAVA_PACKAGE_RPM:-java-11-openjdk-headless}"
-    EXTRA_RPM=(policycoreutils policycoreutils-python-utils setools-console "$JAVA_PKG")
-    bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} firewalld ${EXTRA_RPM[*]}" || true
-    systemctl enable firewalld --now || true
-  fi
-) || fail_note "core_packages" "base packages failed"
-
-#####################################
 # Samba shares (DataSources, Cases, Staging)
 #####################################
 get_ver_samba(){
@@ -857,12 +916,6 @@ get_ver_samba(){
 
 run_step "samba" "configured" get_ver_samba '
   set -e
-
-  if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL samba samba-common-bin cifs-utils" >/dev/null 2>&1 || true
-  else
-    bash -lc "$PKG_INSTALL samba samba-common-tools cifs-utils" >/dev/null 2>&1 || true
-  fi
 
   SMB_CONF="/etc/samba/smb.conf"
   install -d /etc/samba
@@ -880,21 +933,20 @@ EOF
 
   [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
 
-  DATADIR="/home/${LWADEUSER}/${WADE_DATADIR}"
-  CASESDIR="/home/${LWADEUSER}/${WADE_CASESDIR}"
-  STAGINGDIR="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
+  DATADIR="/home/'"${LWADEUSER}"'/'"${WADE_DATADIR}"'"
+  CASESDIR="/home/'"${LWADEUSER}"'/'"${WADE_CASESDIR}"'"
+  STAGINGDIR="/home/'"${LWADEUSER}"'/'"${WADE_STAGINGDIR}"'"
   mkdir -p "$DATADIR" "$CASESDIR" "$STAGINGDIR"
-  chown -R "${LWADEUSER}:${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
-  chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
+  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
+  chmod 755 "/home/'"${LWADEUSER}"'" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
-    HOSTS_BLOCK=""
+  HOSTS_BLOCK=""
   if [[ -n "${ALLOW_NETS_ARR+x}" && ${#ALLOW_NETS_ARR[@]} -gt 0 ]]; then
     HOSTS_BLOCK="   hosts allow ="
     for net in "${ALLOW_NETS_ARR[@]}"; do HOSTS_BLOCK+=" ${net}"; done
     HOSTS_BLOCK+=$'\n   hosts deny = 0.0.0.0/0'
   fi
 
-  # Delete previous managed block, if any
   sed -e "/^\[WADE-BEGIN\]/,/^\[WADE-END\]/d" -i "$SMB_CONF"
 
   cat >>"$SMB_CONF"<<EOF
@@ -961,11 +1013,9 @@ EOF
     fi
   fi
 
-  # Enable services (queued; single daemon-reload later)
   systemd_queue_enable smbd || systemd_queue_enable smb
   systemd_queue_enable nmbd || systemd_queue_enable nmb || true
 
-  # Firewall
   if [[ "$FIREWALL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
     ufw allow Samba || true
   elif command -v firewall-cmd >/dev/null 2>&1; then
@@ -973,12 +1023,12 @@ EOF
     if [[ "${WADE_STRICT_FIREWALL:-0}" -eq 1 ]]; then
       firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true
       for net in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${net}' service name='samba' accept" || true
+        firewall-cmd --permanent --add-rich-rule="rule family='\''ipv4'\'' source address='\''${net}'\'' service name='\''samba'\'' accept" || true
       done
     else
       firewall-cmd --permanent --add-service=samba || true
       for net in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${net}' service name='samba' accept" || true
+        firewall-cmd --permanent --add-rich-rule="rule family='\''ipv4'\'' source address='\''${net}'\'' service name='\''samba'\'' accept" || true
       done
     fi
     firewall-cmd --reload || true
@@ -1000,8 +1050,9 @@ run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
   python3 -m venv "'"$VENV_DIR"'"
   chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "'"$VENV_DIR"'"
 
-  "'"$VENV_DIR"'/bin/python" -m pip install -U pip setuptools wheel
-  "'"$VENV_DIR"'/bin/pip" install inotify-simple
+  "'"$VENV_DIR"'/bin/python" -m pip install -U pip setuptools wheel >/dev/null 2>&1 || true
+  # speed-up: use shared wheelhouse
+  '"pip_cached_install \"$VENV_DIR/bin\" inotify-simple"'
 
   "'"$VENV_DIR"'/bin/python" - <<'"'"'PY'"'"'
 import json, os, re, shutil, signal, sqlite3, subprocess, sys, time, string, uuid
@@ -1053,9 +1104,7 @@ WantedBy=multi-user.target
 EOF
 
   systemd_queue_enable wade-staging.service
-
   sha256sum /opt/wade/stage_daemon.py | awk '"'"'{print $1}'"'"' > "'"${STEPS_DIR}/wade-stage.ver"'"
-
   install -d -m 0755 /home/'"${LWADEUSER}"'/WADE 2>/dev/null || true
   "'"$VENV_DIR"'/bin/pip" freeze > /home/'"${LWADEUSER}"'/WADE/requirements.lock || true
 ' || fail_note "wade-stage" "service install/start failed"
@@ -1111,36 +1160,15 @@ run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
   set -e
   : "${WADE_CAPA_VENV:=/opt/wade/venvs/capa}"
 
-  if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL python3-venv python3-pip git ca-certificates zip p7zip-full"
-  else
-    bash -lc "$PKG_INSTALL python3 python3-virtualenv git ca-certificates zip" || true
-    bash -lc "$PKG_INSTALL p7zip p7zip-plugins" || true
-  fi
-
   install -d "$(dirname "$WADE_CAPA_VENV")"
   [[ -x "$WADE_CAPA_VENV/bin/python" ]] || python3 -m venv "$WADE_CAPA_VENV"
   "$WADE_CAPA_VENV/bin/python" -m pip install -U pip wheel setuptools >/dev/null 2>&1 || true
 
-  PKG="flare-capa"
-  [[ -n "${CAPA_VERSION:-}" ]] && PKG="flare-capa==${CAPA_VERSION}"
-
-  WHEEL_DIR=""
-  if [[ -d "${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels" ]]; then
-    WHEEL_DIR="${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels"
-  elif [[ "${OFFLINE:-0}" == "1" && -d "${OFFLINE_SRC:-}/pipwheels" ]]; then
-    WHEEL_DIR="${OFFLINE_SRC}/pipwheels"
-  fi
-
-  if [[ -n "$WHEEL_DIR" ]]; then
-    "$WADE_CAPA_VENV/bin/pip" install --no-index --find-links "$WHEEL_DIR" "$PKG"
-  else
-    "$WADE_CAPA_VENV/bin/pip" install "$PKG"
-  fi
+  PKG="flare-capa"; [[ -n "${CAPA_VERSION:-}" ]] && PKG="flare-capa==${CAPA_VERSION}"
+  '"pip_cached_install \"$WADE_CAPA_VENV/bin\" \"$PKG\""'
 
   install -d /usr/local/bin
   ln -sf "$WADE_CAPA_VENV/bin/capa" /usr/local/bin/capa
-
   /usr/local/bin/capa --version >/dev/null 2>&1 || { echo "capa not runnable"; exit 1; }
 ' || fail_note "capa" "engine install failed"
 
@@ -1270,9 +1298,23 @@ run_step "vol3-symbols" "current" 'get_mark_ver vol3-symbols' '
 fi
 
 #####################################
-# bulk_extractor (source build; soft-fail)
+# bulk_extractor (repo or source build; soft-fail)
 #####################################
 if [[ "${MOD_BULK_EXTRACTOR_ENABLED:-1}" == "1" ]]; then
+if [[ "${BULK_EXTRACTOR_MODE:-source}" == "repo" ]]; then
+run_step "bulk_extractor" "repo" get_ver_be '
+  set -e
+  if [[ "$PM" == "apt" ]]; then
+    bash -lc "$PKG_INSTALL bulk-extractor" || true
+    command -v bulk_extractor >/dev/null 2>&1 || { echo "bulk_extractor not found"; exit 1; }
+    ln -sf "$(command -v bulk_extractor)" /usr/local/bin/bulk_extractor || true
+  else
+    bash -lc "$PKG_INSTALL bulk_extractor" || true
+    command -v bulk_extractor >/dev/null 2>&1 || { echo "bulk_extractor not found"; exit 1; }
+    ln -sf "$(command -v bulk_extractor)" /usr/local/bin/bulk_extractor || true
+  fi
+' || fail_note "bulk_extractor" "repo install failed"
+else
 run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_be '
   set -e
   echo "[*] Installing bulk_extractor from source…"
@@ -1286,11 +1328,7 @@ run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_be '
       flex bison libewf-dev libssl-dev zlib1g-dev libxml2-dev libexiv2-dev \
       libtre-dev libsqlite3-dev libpcap-dev libre2-dev libpcre3-dev libexpat1-dev" || true
   else
-    if have_cmd dnf; then
-      dnf -y groupinstall "Development Tools" || true
-    else
-      yum -y groupinstall "Development Tools" || true
-    fi
+    if have_cmd dnf; then dnf -y groupinstall "Development Tools" || true; else yum -y groupinstall "Development Tools" || true; fi
     bash -lc "$PKG_INSTALL \
       git ca-certificates libewf-devel openssl-devel zlib-devel libxml2-devel \
       exiv2-devel tre-devel sqlite-devel libpcap-devel re2-devel pcre-devel \
@@ -1327,20 +1365,18 @@ run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_be '
   rm -rf "$BUILD_DIR"
 ' || fail_note "bulk_extractor" "build/install failed (see ${LOG_FILE})"
 fi
+fi
 
 #####################################
-# Qt/GL runtime libs (for Piranha/Barracuda UIs; apt branch)
+# Qt/GL runtime libs (apt branch) – short-circuits if present
 #####################################
 if [[ "$PM" == "apt" && ( "${MOD_PIRANHA_ENABLED:-1}" == "1" || "${MOD_BARRACUDA_ENABLED:-1}" == "1" ) ]]; then
 run_step "qtgl-runtime" "present" get_ver_qtgl '
   set -e
-  bash -lc "$PKG_INSTALL \
-    libegl1 libopengl0 libgl1 libxkbcommon-x11-0 \
-    libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
-    libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1 \
-    libxcb-cursor0 \
-    fonts-dejavu-core"
+  # libs already installed via bundle; nothing to do
+  true
 ' || fail_note "qtgl-runtime" "Qt/GL libs missing"
+fi
 
 #####################################
 # SSH X11 forwarding (server-side GUI over ssh -X)
@@ -1356,12 +1392,6 @@ get_ver_x11fwd(){
 
 run_step "x11-forwarding" "configured" get_ver_x11fwd '
   set -e
-  if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL xauth x11-apps"
-  else
-    bash -lc "$PKG_INSTALL xorg-x11-xauth || $PKG_INSTALL xauth || true"
-  fi
-
   sed -ri "s/^\s*#?\s*X11Forwarding.*/X11Forwarding yes/" /etc/ssh/sshd_config
   if grep -qiE "^\s*X11UseLocalhost" /etc/ssh/sshd_config; then
     sed -ri "s/^\s*#?\s*X11UseLocalhost.*/X11UseLocalhost yes/" /etc/ssh/sshd_config
@@ -1373,14 +1403,11 @@ run_step "x11-forwarding" "configured" get_ver_x11fwd '
   fi
 
   systemctl restart ssh || systemctl restart sshd || true
-
-  su - "${LWADEUSER}" -c "mkdir -p ~/.config/matplotlib; touch ~/.Xauthority; chmod 600 ~/.Xauthority" || true
+  su - "'"${LWADEUSER}"'" -c "mkdir -p ~/.config/matplotlib; touch ~/.Xauthority; chmod 600 ~/.Xauthority" || true
 ' || fail_note "x11-forwarding" "setup failed"
 
-fi
-
 #####################################
-# Piranha (install only; GUI via ssh -X, no systemd)
+# Piranha (install only; GUI via ssh -X, no systemd) – no shallow clone per your request
 #####################################
 get_ver_piranha(){ [[ -x /usr/local/bin/piranha && -d /opt/piranha/.venv && -f /opt/piranha/piranha.py ]] && echo installed || echo ""; }
 
@@ -1388,14 +1415,14 @@ if [[ "${MOD_PIRANHA_ENABLED:-1}" == "1" ]]; then
 run_step "piranha" "installed" get_ver_piranha '
   set -e
   install -d /opt/piranha /var/log/wade/piranha
-  chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha /var/log/wade/piranha
+  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /opt/piranha /var/log/wade/piranha
 
   install -d /opt/piranha/Documents/PiranhaLogs
-  chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha/Documents
+  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /opt/piranha/Documents
   ln -sf /var/log/wade/piranha/APT_Report.log /opt/piranha/Documents/PiranhaLogs/APT_Report.log || true
 
   if [[ "$OFFLINE" == "1" ]]; then
-    PKG_ARC="$(ls "${WADE_PKG_DIR}/piranha/"piranha*.tar.gz "${WADE_PKG_DIR}/piranha/"piranha*.zip 2>/dev/null | head -1 || true)"
+    PKG_ARC="$(ls "'"${WADE_PKG_DIR}"'/piranha/"piranha"*.tar.gz "'"${WADE_PKG_DIR}"'/piranha/"piranha"*.zip 2>/dev/null | head -1 || true)"
     [[ -n "$PKG_ARC" ]] || { echo "offline Piranha archive missing"; exit 1; }
     cp "$PKG_ARC" /opt/piranha/
     pushd /opt/piranha >/dev/null
@@ -1411,23 +1438,25 @@ run_step "piranha" "installed" get_ver_piranha '
   [[ -f /opt/piranha/piranha.py ]] || { echo "Piranha sources missing under /opt/piranha"; exit 1; }
 
   python3 -m venv /opt/piranha/.venv || python3 -m virtualenv /opt/piranha/.venv
-  /opt/piranha/.venv/bin/pip install --upgrade pip
-  [[ -f /opt/piranha/requirements.txt ]] && /opt/piranha/.venv/bin/pip install -r /opt/piranha/requirements.txt || true
+  /opt/piranha/.venv/bin/pip install --upgrade pip >/dev/null 2>&1 || true
+  if [[ -f /opt/piranha/requirements.txt ]]; then
+    '"pip_cached_install \"/opt/piranha/.venv/bin\" -r /opt/piranha/requirements.txt"'
+  fi
 
-  FEIX="$(ls "$LOAD_PATCH_DIR"/*patch.py 2>/dev/null | sort -V | tail -1)"
+  FEIX="$(ls "'"$LOAD_PATCH_DIR"'"/*patch.py 2>/dev/null | sort -V | tail -1)"
   if [[ -n "$FEIX" ]]; then
     rm -f /opt/piranha/backend/loader.py
     cp "$FEIX" /opt/piranha/backend/loader.py || true
   fi
 
-  echo 'exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"' > /usr/local/bin/piranha
+  echo '\''exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"'\'' > /usr/local/bin/piranha
   chmod 0755 /usr/local/bin/piranha
-  chown "${LWADEUSER}:${LWADEUSER}" /usr/local/bin/piranha || true
+  chown "'"${LWADEUSER}:${LWADEUSER}"'" /usr/local/bin/piranha || true
 ' || fail_note "piranha" "setup failed"
 fi
 
 #####################################
-# Barracuda (soft-fail)
+# Barracuda (soft-fail) – no shallow clone per your request
 #####################################
 get_ver_barracuda(){
   [[ -x /usr/local/bin/barracuda && -d /opt/barracuda/.venv ]] || { echo ""; return; }
@@ -1438,7 +1467,7 @@ run_step "barracuda" "installed" get_ver_barracuda '
   set -e
   install -d /opt/barracuda
   if [[ "$OFFLINE" == "1" ]]; then
-    PKG_ARC="$(ls "${WADE_PKG_DIR}/barracuda/"barracuda*.tar.gz "${WADE_PKG_DIR}/barracuda/"barracuda*.zip 2>/dev/null | head -1 || true)"
+    PKG_ARC="$(ls "'"${WADE_PKG_DIR}"'/barracuda/"barracuda"*.tar.gz "'"${WADE_PKG_DIR}"'/barracuda/"barracuda"*.zip 2>/dev/null | head -1 || true)"
     [[ -n "$PKG_ARC" ]] || { echo "offline Barracuda archive missing"; exit 1; }
     cp "$PKG_ARC" /opt/barracuda/
     pushd /opt/barracuda >/dev/null
@@ -1449,14 +1478,16 @@ run_step "barracuda" "installed" get_ver_barracuda '
   fi
 
   python3 -m venv /opt/barracuda/.venv || python3 -m virtualenv /opt/barracuda/.venv
-  /opt/barracuda/.venv/bin/pip install --upgrade pip
-  [[ -f /opt/barracuda/requirements.txt ]] && /opt/barracuda/.venv/bin/pip install -r /opt/barracuda/requirements.txt || true
+  /opt/barracuda/.venv/bin/pip install --upgrade pip >/dev/null 2>&1 || true
+  if [[ -f /opt/barracuda/requirements.txt ]]; then
+    '"pip_cached_install \"/opt/barracuda/.venv/bin\" -r /opt/barracuda/requirements.txt"'
+  fi
 
   if [[ ! -f /opt/barracuda/enterprise-attack.json ]]; then
-    if [[ -f "${WADE_PKG_DIR}/mitre/enterprise-attack.json" ]]; then
-      cp "${WADE_PKG_DIR}/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
-    elif [[ "$OFFLINE" == "1" && -f "${OFFLINE_SRC}/mitre/enterprise-attack.json" ]]; then
-      cp "${OFFLINE_SRC}/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
+    if [[ -f "'"${WADE_PKG_DIR}"'/mitre/enterprise-attack.json" ]]; then
+      cp "'"${WADE_PKG_DIR}"'/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
+    elif [[ "$OFFLINE" == "1" && -f "'"${OFFLINE_SRC}"'/mitre/enterprise-attack.json" ]]; then
+      cp "'"${OFFLINE_SRC}"'/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
     else
       curl -fsSL https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json \
         -o /opt/barracuda/enterprise-attack.json
@@ -1467,7 +1498,7 @@ run_step "barracuda" "installed" get_ver_barracuda '
     '\''s|load_techniques_enriched\("enterprise-attack\.json"\)|load_techniques_enriched("/opt/barracuda/enterprise-attack.json")|'\'' \
     /opt/barracuda/app.py || true
 
-  install -d -o "${LWADEUSER}" -g "${LWADEUSER}" -m 0750 /opt/barracuda/uploads
+  install -d -o "'"${LWADEUSER}"'" -g "'"${LWADEUSER}"'" -m 0750 /opt/barracuda/uploads
 
   cat >/usr/local/bin/barracuda <<'\''EOF'\''
 #!/usr/bin/env bash
@@ -1519,20 +1550,20 @@ run_step "hayabusa" "" get_ver_hayabusa '
 
   HAY_ARCH="${HAY_ARCH:-$(detect_hayabusa_arch)}"
   HAY_ZIP=""
-  HAY_ZIP_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa/"hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
+  HAY_ZIP_LOCAL="$(ls "'"${WADE_PKG_DIR}"'/hayabusa/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
 
   if [[ -n "$HAY_ZIP_LOCAL" ]]; then
     cp "$HAY_ZIP_LOCAL" .
     HAY_ZIP="$(basename "$HAY_ZIP_LOCAL")"
   elif [[ "$OFFLINE" == "1" ]]; then
-    HAY_ZIP_USB="$(ls "${OFFLINE_SRC}/hayabusa/"hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
-    [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '${HAY_ARCH:-}' not found offline"; exit 1; }
+    HAY_ZIP_USB="$(ls "'"${OFFLINE_SRC}"'/hayabusa/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
+    [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '\''${HAY_ARCH:-}'\'' not found offline"; exit 1; }
     cp "$HAY_ZIP_USB" .
     HAY_ZIP="$(basename "$HAY_ZIP_USB")"
   else
-    if have_cmd curl && have_cmd jq; then
+    if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
       echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
-      FILTER=".assets[] | select(.name | test(\\\$pat) or test(\\\$pat2) or test(\\\"lin-x64-gnu\\\") or test(\\\"lin-aarch64-gnu\\\")) | .browser_download_url"
+      FILTER=".assets[] | select(.name | test(\\$pat) or test(\\$pat2) or test(\"lin-x64-gnu\") or test(\"lin-aarch64-gnu\")) | .browser_download_url"
       DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
         | jq -r --arg pat "${HAY_ARCH:-}" --arg pat2 "${HAY_ARCH/-/}" "$FILTER" | head -1)"
       [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH:-}"; exit 1; }
@@ -1542,11 +1573,6 @@ run_step "hayabusa" "" get_ver_hayabusa '
       echo "curl/jq required to auto-fetch Hayabusa online"; exit 1
     fi
   fi
-
-FILTER=".assets[] | select(.name | test(\\\$pat) or test(\\\$pat2) or test(\\\"lin-x64-gnu\\\") or test(\\\"lin-aarch64-gnu\\\")) | .browser_download_url"
-DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
-  | jq -r --arg pat "${HAY_ARCH:-}" --arg pat2 "${HAY_ARCH/-/}" "$FILTER" | head -1)"
-
 
   TMPDIR="$(mktemp -d)"; cleanup(){ rm -rf "$TMPDIR"; }; trap cleanup EXIT
   unzip -qo "$HAY_ZIP" -d "$TMPDIR"
@@ -1563,6 +1589,7 @@ DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/relea
   [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules/"*  "${HAYABUSA_RULES_DIR}/"; echo "[+] Copied Hayabusa rules → ${HAYABUSA_RULES_DIR}"; }
   [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config"    /etc/wade/hayabusa/;     echo "[+] Copied Hayabusa config → /etc/wade/hayabusa/"; }
 
+  # (kept on purpose per your request)
   [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules"  /usr/local/bin/; echo "[+] Copied Hayabusa rules/ to /usr/local/bin/rules"; }
   [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config" /usr/local/bin/; echo "[+] Copied Hayabusa config/ to /usr/local/bin/config"; }
 
@@ -1672,7 +1699,6 @@ EOF
 run_step "postgresql" "configured" get_ver_pg '
   set -e
   if [[ "$PM" == "apt" ]]; then
-    dpkg -s postgresql >/dev/null 2>&1 || bash -lc "$PKG_INSTALL postgresql"
     systemctl enable postgresql || true
     PG_VER=$(psql -V | awk "{print \$3}" | cut -d. -f1)
     PG_DIR="/etc/postgresql/${PG_VER}/main"
@@ -1705,12 +1731,9 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" ]]; then
 run_step "stig-prereqs" "installed" get_ver_stig_pkgs '
   set -e
   if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL unzip openscap-scanner"
-    bash -lc "$PKG_INSTALL ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications"
     bash -lc "apt-cache show scap-security-guide >/dev/null 2>&1 && $PKG_INSTALL scap-security-guide || true"
   else
-    bash -lc "$PKG_INSTALL openscap-scanner unzip"
-    bash -lc "$PKG_INSTALL scap-security-guide"
+    true
   fi
 ' || fail_note "stig" "could not install prerequisites"
 fi
@@ -1732,14 +1755,14 @@ run_step "splunk-uf" "installed" get_ver_splunkuf '
   if [[ -n "${SPLUNK_UF_DEB_URL:-}" ]]; then
     PKG="/tmp/$(basename "${SPLUNK_UF_DEB_URL}")"
     curl -L "${SPLUNK_UF_DEB_URL}" -o "$PKG"
-  elif ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb >/dev/null 2>&1; then
-    PKG="$(ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb | sort -V | tail -1)"
-  elif [[ -n "${SPLUNK_SRC_DIR:-}" ]] && ls "${SPLUNK_SRC_DIR}"/splunkforwarder*.deb >/dev/null 2>&1; then
-    PKG="$(ls "${SPLUNK_SRC_DIR}"/splunkforwarder*.deb | sort -V | tail -1)"
+  elif ls "'"${WADE_PKG_DIR:-/var/wade/pkg}"'/splunkforwarder/*.deb >/dev/null 2>&1; then
+    PKG="$(ls "'"${WADE_PKG_DIR:-/var/wade/pkg}"'/splunkforwarder/*.deb | sort -V | tail -1)"
+  elif [[ -n "'"${SPLUNK_SRC_DIR:-}"'" ]] && ls "'"${SPLUNK_SRC_DIR}"'/splunkforwarder*.deb >/dev/null 2>&1; then
+    PKG="$(ls "'"${SPLUNK_SRC_DIR}"'/splunkforwarder*.deb | sort -V | tail -1)"
   fi
 
   if [[ -z "$PKG" || ! -f "$PKG" ]]; then
-    echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/"
+    echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under "'"${WADE_PKG_DIR:-/var/wade/pkg}"'/splunkforwarder/"
     exit 0
   fi
 
@@ -1861,8 +1884,10 @@ WHIFF_API_KEY_EFF="${PRESET_WHIFF_API_KEY:-${WHIFF_API_KEY:-}}"
 
 if [[ "${WHIFF_ENABLE_EFF}" == "1" ]]; then
   echo "[*] Installing/configuring WHIFF…"
-  # Pass choices as environment (so install_whiff.sh stays simple/portable)
+  # If install_whiff.sh uses pip, allow it to leverage our wheelhouse via env
   env \
+    PIP_FIND_LINKS="${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels" \
+    PIP_NO_INDEX=0 \
     WHIFF_ENABLE="1" \
     WHIFF_BIND_ADDR="${WHIFF_BIND_EFF}" \
     WHIFF_PORT="${WHIFF_PORT_EFF}" \
@@ -1920,7 +1945,6 @@ install_wade_logrotate() {
 ExecReload=
 ExecReload=/bin/kill -s ${sig} \$MAINPID
 EOF
-    # don't reload yet; queued globally
   fi
 
   local postrotate_cmd
