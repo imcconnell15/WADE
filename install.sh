@@ -1532,7 +1532,7 @@ run_step "hayabusa" "" get_ver_hayabusa '
   else
     if have_cmd curl && have_cmd jq; then
       echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
-      FILTER='.assets[] | select(.name | test(\$pat) or test(\$pat2) or test("lin-x64-gnu") or test("lin-aarch64-gnu")) | .browser_download_url'
+      FILTER=".assets[] | select(.name | test(\\\$pat) or test(\\\$pat2) or test(\\\"lin-x64-gnu\\\") or test(\\\"lin-aarch64-gnu\\\")) | .browser_download_url"
       DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
         | jq -r --arg pat "${HAY_ARCH:-}" --arg pat2 "${HAY_ARCH/-/}" "$FILTER" | head -1)"
       [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH:-}"; exit 1; }
@@ -1542,6 +1542,11 @@ run_step "hayabusa" "" get_ver_hayabusa '
       echo "curl/jq required to auto-fetch Hayabusa online"; exit 1
     fi
   fi
+
+FILTER=".assets[] | select(.name | test(\\\$pat) or test(\\\$pat2) or test(\\\"lin-x64-gnu\\\") or test(\\\"lin-aarch64-gnu\\\")) | .browser_download_url"
+DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
+  | jq -r --arg pat "${HAY_ARCH:-}" --arg pat2 "${HAY_ARCH/-/}" "$FILTER" | head -1)"
+
 
   TMPDIR="$(mktemp -d)"; cleanup(){ rm -rf "$TMPDIR"; }; trap cleanup EXIT
   unzip -qo "$HAY_ZIP" -d "$TMPDIR"
