@@ -246,7 +246,7 @@ run_step(){
     report_step "$name" "$want" "$have" "OK"; return 0
   fi
   echo "[*] Installing/updating ${name} (want=${want:-n/a}, have=${have:-none})…"
-  if bash -Eeuo pipefail -c "$do_install"; then
+  if ( set -Eeuo pipefail; eval "$do_install" ); then
     have="$($get_have 2>/dev/null || true)"
     mark_done "$name" "${have:-unknown}"
     report_step "$name" "$want" "$have" "OK"
@@ -321,10 +321,10 @@ get_ver_wade_mwex(){
 }
 
 # === Staging & Malware Extractor source (from repo) ===
-STAGE_SRC="${SCRIPT_DIR}/scripts/staging/stage_daemon.py"
+STAGE_SRC="${SCRIPT_DIR}/staging/stage_daemon.py"
 STAGE_EXPECT_SHA="$(sha256_of "$STAGE_SRC" 2>/dev/null || true)"
 
-MWEX_SRC="${SCRIPT_DIR}/scripts/malware/wade_mw_extract.py"
+MWEX_SRC="${SCRIPT_DIR}/malware/wade_mw_extract.py"
 MWEX_EXPECT_SHA="$(sha256_of "$MWEX_SRC" 2>/dev/null || true)"
 
 #####################################
@@ -653,6 +653,7 @@ hostnamectl set-hostname "$LWADE" || true
 IFS=',' read -ra ALLOW_NETS_ARR <<< "${ALLOW_NETS_CSV// /}"
 for net in "${ALLOW_NETS_ARR[@]:-}"; do [[ -n "$net" ]] && ! validate_cidr "$net" && warn_note "precheck" "Invalid CIDR ignored: $net"; done
 IFS=',' read -ra SMBUSERS <<< "${SMB_USERS_CSV}"
+VALID_USERS="$(printf '%s\n' "${SMB_USERS_CSV:-}" | tr ',;' '  ' | xargs)"
 
 if ! id -u "$LWADEUSER" >/dev/null 2>&1; then
   echo "[*] Creating user ${LWADEUSER}…"
@@ -1454,8 +1455,9 @@ run_step "hayabusa" "" get_ver_hayabusa '
   else
     if have_cmd curl && have_cmd jq; then
       echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
+      FILTER='.assets[] | select(.name | test(\$pat) or test(\$pat2) or test("lin-x64-gnu") or test("lin-aarch64-gnu")) | .browser_download_url'
       DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
-        | jq -r --arg pat "${HAY_ARCH:-}" --arg pat2 "${HAY_ARCH/-/}" '.assets[] | select(.name | test($pat) or test($pat2) or test("lin-x64-gnu") or test("lin-aarch64-gnu")) | .browser_download_url' | head -1)"
+        | jq -r --arg pat "${HAY_ARCH:-}" --arg pat2 "${HAY_ARCH/-/}" "$FILTER" | head -1)"
       [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH:-}"; exit 1; }
       HAY_ZIP="$(basename "$DL_URL")"
       curl -L "$DL_URL" -o "$HAY_ZIP"
