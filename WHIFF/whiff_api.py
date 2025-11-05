@@ -28,7 +28,7 @@ class AskBody(BaseModel):
 class AnnotateBody(BaseModel):
     event: dict
 
-def search_docs(q_emb: np.ndarray, k=6, tool=None, version=None):
+def search_docs(q_: np.ndarray, k=6, tool=None, version=None):
     conn = db(); cur = conn.cursor()
     where, params = [], []
     if tool:    where.append("tool = %s"); params.append(tool)
@@ -38,7 +38,7 @@ def search_docs(q_emb: np.ndarray, k=6, tool=None, version=None):
       SELECT title, chunk, source_url, tool, version, (embedding <#> %s::vector) AS score
       FROM sage_docs
       {where_sql}
-      ORDER BY embedding <#> %s::vector
+      ORDER BY embedding <=> %s::vector
       LIMIT %s
     """
     params.extend([q_emb.tolist(), q_emb.tolist(), k])
