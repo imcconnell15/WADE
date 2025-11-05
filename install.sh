@@ -499,6 +499,19 @@ WADE_CAPA_VENV="/opt/wade/venvs/capa"   # dedicated venv for capa
 WADE_CAPA_RULES_DIR="/opt/capa-rules"   # where rules live
 WADE_CAPA_RULES_COMMIT=""               # optionally pin: commit SHA or tag
 
+# ---- WHIFF (analyst assistant / KB) ----
+WHIFF_ENABLE="1"                       # 1=offer install by default; will be prompted
+WHIFF_BIND_ADDR="127.0.0.1"
+WHIFF_PORT="8088"
+# Backend choices you support in install_whiff.sh: ollama | openai | http
+WHIFF_BACKEND="ollama"
+# Default to Meta Llama (avoids Qwen, per your constraint)
+WHIFF_MODEL="llama3.1:8b-instruct"
+# For backends that need it (e.g., http/vLLM or hosted endpoints)
+WHIFF_ENDPOINT=""
+# API keys/creds should NOT be persisted by default; leave empty.
+WHIFF_API_KEY=""
+
 # ---- STIG (assessment only; interactive at end) ----
 MOD_STIG_EVAL_ENABLED="1"         # keep prereqs enabled; eval runs interactively at end
 MOD_STIG_REMEDIATE_ENABLED="0"    # do NOT apply fixes
@@ -733,6 +746,66 @@ export PRESET_SPLUNK=1
 export PRESET_SPLUNK_SERVER_LINE PRESET_SPLUNK_INDEX PRESET_SPLUNK_COMPRESSED PRESET_SPLUNK_USEACK PRESET_SPLUNK_SSL_VERIFY PRESET_SPLUNK_SSL_CN PRESET_SPLUNK_DS
 export SMB_ALL_PW
 
+# ===== WHIFF (AI assistant / KB) prompts =====
+DEFAULT_WHIFF_ENABLE="${WHIFF_ENABLE:-1}"
+DEFAULT_WHIFF_BIND="${WHIFF_BIND_ADDR:-127.0.0.1}"
+DEFAULT_WHIFF_PORT="${WHIFF_PORT:-8088}"
+DEFAULT_WHIFF_BACKEND="${WHIFF_BACKEND:-ollama}"      # ollama|openai|http
+DEFAULT_WHIFF_MODEL="${WHIFF_MODEL:-llama3.1:8b-instruct}"
+DEFAULT_WHIFF_ENDPOINT="${WHIFF_ENDPOINT:-}"
+DEFAULT_WHIFF_API_KEY="${WHIFF_API_KEY:-}"
+
+PRESET_WHIFF_ENABLE="$DEFAULT_WHIFF_ENABLE"
+PRESET_WHIFF_BIND="$DEFAULT_WHIFF_BIND"
+PRESET_WHIFF_PORT="$DEFAULT_WHIFF_PORT"
+PRESET_WHIFF_BACKEND="$DEFAULT_WHIFF_BACKEND"
+PRESET_WHIFF_MODEL="$DEFAULT_WHIFF_MODEL"
+PRESET_WHIFF_ENDPOINT="$DEFAULT_WHIFF_ENDPOINT"
+PRESET_WHIFF_API_KEY=""   # do NOT persist by default; ephemeral unless user opts in
+
+if [[ "$NONINTERACTIVE" -eq 0 ]]; then
+  echo
+  echo ">> WHIFF (analyst assistant / knowledge base)"
+  read -r -p "Install and configure WHIFF now? (y/N) [$( [[ "$DEFAULT_WHIFF_ENABLE" = "1" ]] && echo y || echo N )]: " __ans
+  if [[ "${__ans:-}" =~ ^[Yy]$ ]]; then
+    PRESET_WHIFF_ENABLE="1"
+    read -r -p "Bind address [${DEFAULT_WHIFF_BIND}]: " tmp; PRESET_WHIFF_BIND="${tmp:-$DEFAULT_WHIFF_BIND}"
+    read -r -p "Port [${DEFAULT_WHIFF_PORT}]: " tmp; PRESET_WHIFF_PORT="${tmp:-$DEFAULT_WHIFF_PORT}"
+
+    read -r -p "Backend (ollama|openai|http) [${DEFAULT_WHIFF_BACKEND}]: " tmp
+    PRESET_WHIFF_BACKEND="${tmp:-$DEFAULT_WHIFF_BACKEND}"
+
+    read -r -p "Model name/tag [${DEFAULT_WHIFF_MODEL}]: " tmp
+    PRESET_WHIFF_MODEL="${tmp:-$DEFAULT_WHIFF_MODEL}"
+
+    # Optional endpoint (for http/vLLM or custom gateways)
+    if [[ "$PRESET_WHIFF_BACKEND" != "ollama" ]]; then
+      read -r -p "Backend endpoint URL (blank to skip) [${DEFAULT_WHIFF_ENDPOINT}]: " tmp
+      PRESET_WHIFF_ENDPOINT="${tmp:-$DEFAULT_WHIFF_ENDPOINT}"
+    fi
+
+    # Optional API key (OpenAI or other hosted APIs). Do not persist unless user explicitly asks.
+    if [[ "$PRESET_WHIFF_BACKEND" == "openai" ]]; then
+      echo "If using OpenAI (or compatible) enter API key (leave blank to skip)."
+      read -r -s -p "API key: " tmp; echo
+      PRESET_WHIFF_API_KEY="${tmp:-}"
+      if [[ -n "$PRESET_WHIFF_API_KEY" ]]; then
+        read -r -p "Persist API key to /etc/wade/wade.env? (NOT RECOMMENDED) [y/N]: " tmp
+        if [[ "${tmp:-}" =~ ^[Yy]$ ]]; then
+          WHIFF_PERSIST_API_KEY="1"
+        else
+          WHIFF_PERSIST_API_KEY="0"
+        fi
+      fi
+    fi
+  else
+    PRESET_WHIFF_ENABLE="0"
+  fi
+fi
+
+export PRESET_WHIFF="1"
+export PRESET_WHIFF_ENABLE PRESET_WHIFF_BIND PRESET_WHIFF_PORT PRESET_WHIFF_BACKEND PRESET_WHIFF_MODEL PRESET_WHIFF_ENDPOINT PRESET_WHIFF_API_KEY WHIFF_PERSIST_API_KEY
+
 RUN_STIG_NOW="N"
 if [[ "$NONINTERACTIVE" -eq 0 ]]; then
   read -r -p "Run DISA STIG assessment at the end? [y/N]: " RUN_STIG_NOW; RUN_STIG_NOW="${RUN_STIG_NOW:-N}"
@@ -745,6 +818,7 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
   echo " Linux Owner  : $LWADEUSER"
   echo " SMB users    : ${SMB_USERS_CSV}"
   echo " Allow nets   : ${ALLOW_NETS_CSV:-<none>}"
+  echo " WHIFF       : $( [[ "$PRESET_WHIFF_ENABLE" = "1" ]] && echo enabled || echo disabled )  backend=${PRESET_WHIFF_BACKEND}  model=${PRESET_WHIFF_MODEL}  bind=${PRESET_WHIFF_BIND}:${PRESET_WHIFF_PORT}"
   echo " Offline mode : ${OFFLINE}"
   confirm "Proceed with installation?" || exit 0
 fi
@@ -1769,10 +1843,31 @@ EOF
 fi
 
 #####################################
-# Whiff
+# WHIFF (install & configure)
 #####################################
-if [[ "${WHIFF_ENABLE:-1}" == "1" ]]; then
-  bash "${SCRIPT_DIR}/WHIFF/install_whiff.sh"
+# Decide final values (prompted if interactive; else defaults from wade.conf/env)
+WHIFF_ENABLE_EFF="${PRESET_WHIFF_ENABLE:-${WHIFF_ENABLE:-1}}"
+WHIFF_BIND_EFF="${PRESET_WHIFF_BIND:-${WHIFF_BIND_ADDR:-127.0.0.1}}"
+WHIFF_PORT_EFF="${PRESET_WHIFF_PORT:-${WHIFF_PORT:-8088}}"
+WHIFF_BACKEND_EFF="${PRESET_WHIFF_BACKEND:-${WHIFF_BACKEND:-ollama}}"
+WHIFF_MODEL_EFF="${PRESET_WHIFF_MODEL:-${WHIFF_MODEL:-llama3.1:8b-instruct}}"
+WHIFF_ENDPOINT_EFF="${PRESET_WHIFF_ENDPOINT:-${WHIFF_ENDPOINT:-}}"
+WHIFF_API_KEY_EFF="${PRESET_WHIFF_API_KEY:-${WHIFF_API_KEY:-}}"
+
+if [[ "${WHIFF_ENABLE_EFF}" == "1" ]]; then
+  echo "[*] Installing/configuring WHIFF…"
+  # Pass choices as environment (so install_whiff.sh stays simple/portable)
+  env \
+    WHIFF_ENABLE="1" \
+    WHIFF_BIND_ADDR="${WHIFF_BIND_EFF}" \
+    WHIFF_PORT="${WHIFF_PORT_EFF}" \
+    WHIFF_BACKEND="${WHIFF_BACKEND_EFF}" \
+    WHIFF_MODEL="${WHIFF_MODEL_EFF}" \
+    WHIFF_ENDPOINT="${WHIFF_ENDPOINT_EFF}" \
+    WHIFF_API_KEY="${WHIFF_API_KEY_EFF}" \
+    bash "${SCRIPT_DIR}/WHIFF/install_whiff.sh" || warn_note "whiff" "install reported issues"
+else
+  echo "[*] WHIFF disabled by user choice."
 fi
 
 #####################################
@@ -1929,9 +2024,19 @@ OFFLINE="${OFFLINE}"
 # Queue 
 WADE_QUEUE_DIR=_queue
 
-# WHIFF
-WHIFF_ENABLE=1
-WHIFF_URL=http://127.0.0.1:8088/annotate
+# WHIFF (non-secret settings)
+WHIFF_ENABLE="${WHIFF_ENABLE_EFF}"
+WHIFF_BIND_ADDR="${WHIFF_BIND_EFF}"
+WHIFF_PORT="${WHIFF_PORT_EFF}"
+WHIFF_BACKEND="${WHIFF_BACKEND_EFF}"
+WHIFF_MODEL="${WHIFF_MODEL_EFF}"
+WHIFF_ENDPOINT="${WHIFF_ENDPOINT_EFF}"
+
+# Derived convenience URL used by dashboards/integrations
+WHIFF_URL="http://${WHIFF_BIND_ADDR}:${WHIFF_PORT}/annotate"
+
+# NOTE: If you must persist tokens (NOT RECOMMENDED), uncomment the next line and paste carefully.
+# WHIFF_API_KEY="<REDACTED>"
 
 # ===== Network ports in use =====
 SSH_PORT="22"
@@ -1957,7 +2062,7 @@ SPLUNK_MGMT_PORT="\${SPLUNK_MGMT_PORT}"
 SPLUNK_HEC_PORT="\${SPLUNK_HEC_PORT}"
 SPLUNK_FORWARD_PORT="\${SPLUNK_FORWARD_PORT}"
 
-WADE_SERVICE_PORTS_CSV="\${SSH_PORT},\${SMB_TCP_139},\${SMB_TCP_445},\${SMB_UDP_137},\${SMB_UDP_138},\${ZK_CLIENT_PORT},\${ZK_QUORUM_PORT},\${ZK_ELECTION_PORT},\${SOLR_PORT},\${ACTIVEMQ_OPENWIRE_PORT},\${ACTIVEMQ_WEB_CONSOLE_PORT},\${ACTIVEMQ_AMQP_PORT},\${ACTIVEMQ_STOMP_PORT},\${ACTIVEMQ_MQTT_PORT},\${ACTIVEMQ_WS_PORT},\${POSTGRES_PORT},\${PIRANHA_PORT},\${BARRACUDA_PORT},\${SPLUNK_WEB_PORT},\${SPLUNK_MGMT_PORT},\${SPLUNK_HEC_PORT},\${SPLUNK_FORWARD_PORT}"
+WADE_SERVICE_PORTS_CSV="\${SSH_PORT},\${SMB_TCP_139},\${SMB_TCP_445},\${SMB_UDP_137},\${SMB_UDP_138},\${ZK_CLIENT_PORT},\${ZK_QUORUM_PORT},\${ZK_ELECTION_PORT},\${SOLR_PORT},\${ACTIVEMQ_OPENWIRE_PORT},\${ACTIVEMQ_WEB_CONSOLE_PORT},\${ACTIVEMQ_AMQP_PORT},\${ACTIVEMQ_STOMP_PORT},\${ACTIVEMQ_MQTT_PORT},\${ACTIVEMQ_WS_PORT},\${POSTGRES_PORT},\${PIRANHA_PORT},\${BARRACUDA_PORT},\${WHIFF_PORT},\${SPLUNK_WEB_PORT},\${SPLUNK_MGMT_PORT},\${SPLUNK_HEC_PORT},\${SPLUNK_FORWARD_PORT}"
 ENV
 
 chown root:"${LWADEUSER}" "$ENV_FILE"
@@ -1971,7 +2076,8 @@ echo "    Solr (UI) : http://${IPV4}:${SOLR_PORT:-8983}/solr/#/~cloud"
 echo "    ActiveMQ  : ${IPV4}:${ACTIVEMQ_OPENWIRE_PORT:-61616} (web console :${ACTIVEMQ_WEB_CONSOLE_PORT:-8161})"
 echo "    Postgres  : ${IPV4}:${POSTGRES_PORT:-5432}"
 echo "    Barracuda : ${IPV4}:5000"
-echo "    Tools     : vol3, dissect, bulk_extractor (+ piranha, barracuda, hayabusa)"
+echo "    WHIFF     : $( [[ "$WHIFF_ENABLE_EFF" = "1" ]] && echo "http://${WHIFF_BIND_EFF}:${WHIFF_PORT_EFF}" || echo "disabled" )"
+echo "    Tools     : vol3, dissect, bulk_extractor (+ piranha, barracuda, hayabusa, whiff)"
 echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
 echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
 UF_PRESENT="no"
