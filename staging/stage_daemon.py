@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-WADE Staging Daemon – v2.2 (content-dedupe + ETL host fix)
+WADE Staging Daemon – v2.3 (stability + dedupe race + env precedence)
 
-New in v2.2:
-- Content-aware dedupe: quick sha256(head+tail)+size fingerprint to suppress
-  byte-identical duplicates (no more "__1" for same bytes). Stored as content_sig,
-  unique-indexed in SQLite, and checked before move + on name collisions.
-- ETL hostname colocation: when classifying windows_etl, try to infer hostname
-  from existing DataSources/Hosts/* so ETL logs land under the right host.
+v2.3 (this build)
+- Optional requests import (Whiff no longer crashes daemon if not installed)
+- Env precedence: environment variables override /etc/wade/wade.env
+- enqueue_work() stray brace removed
+- Content-dedupe race: catch UNIQUE(content_sig) IntegrityError post-move and treat as dup
+- Defrag temp dir: try /var/wade/tmp, fall back to system tmp
+- Unknowns quarantined to DataSources/Unknown to avoid infinite reprocessing
+- quick_content_sig() accepts size_hint to reduce extra stats
+- ETL hostname colocation retained from v2.2
+- Pre-move stat retained to avoid FileNotFoundError on moved src
 
-Kept from v2.1:
-- Classifier registry, net-config detectors
+Kept (v2.2/v2.1):
+- Classifier registry and network-config detectors
 - VM disk & package detection (qcow2, vhdx, vmdk, vdi, vhd; ova/ovf)
 - Mountless OS hints (Linux/Windows/macOS)
 - E01 magic (EVF...) + ewfinfo acquisition date + target-info hostname
@@ -35,7 +39,6 @@ import sys
 import time
 import uuid
 import plistlib
-import requests
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -52,19 +55,25 @@ except Exception:
     INOTIFY_AVAILABLE = False
 
 # -----------------------------
-# Quick Whiff
+# Optional Whiff (requests is optional)
 # -----------------------------
+try:
+    import requests  # type: ignore
+except Exception:     # ImportError or any minimal image condition
+    requests = None  # type: ignore
 
-WHIFF_ENABLE = os.getenv("WHIFF_ENABLE", "1") in ("1","true","yes")
+WHIFF_ENABLE = os.getenv("WHIFF_ENABLE", "1").lower() in ("1", "true", "yes")
 WHIFF_URL = os.getenv("WHIFF_URL", "http://127.0.0.1:8088/annotate")
 
 def whiff_annotate(ev: dict) -> dict:
-    if not WHIFF_ENABLE: return {}
+    if not WHIFF_ENABLE or requests is None:
+        return {}
     try:
         r = requests.post(WHIFF_URL, json={"event": ev}, timeout=3)
-        return r.json().get("help", {})
+        j = r.json() if r is not None else {}
+        return (j or {}).get("help", {}) or {}
     except Exception:
-        return {"summary":"Whiff unavailable","next_steps":[],"mitre":[],"refs":[],"confidence":0.0}
+        return {"summary": "Whiff unavailable", "next_steps": [], "mitre": [], "refs": [], "confidence": 0.0}
 
 # -----------------------------
 # Configuration
@@ -142,7 +151,8 @@ def ymd_from_mtime(p: Path) -> str:
     return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d")
 
 def load_env() -> Dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k.startswith("WADE_")}
+    """Load /etc/wade/wade.env as defaults, then apply environment overrides (ENV wins)."""
+    file_env: Dict[str, str] = {}
     if WADE_ENV.is_file():
         try:
             for line in WADE_ENV.read_text().splitlines():
@@ -150,10 +160,12 @@ def load_env() -> Dict[str, str]:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"\'')
+                file_env[k.strip()] = v.strip().strip('"\'')
         except Exception:
             pass
-    return env
+    env_overrides = {k: v for k, v in os.environ.items() if k.startswith("WADE_")}
+    merged = {**file_env, **env_overrides}
+    return merged
 
 def which(cmd: str) -> Optional[str]:
     # Try PATH
@@ -203,9 +215,9 @@ def fast_signature(p: Path) -> str:
     st = p.stat()
     return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{int(st.st_mtime_ns)}"
 
-def quick_content_sig(p: Path, sample_bytes: int = SIG_SAMPLE_BYTES) -> str:
+def quick_content_sig(p: Path, sample_bytes: int = SIG_SAMPLE_BYTES, size_hint: Optional[int] = None) -> str:
     """Fast content fingerprint: sha256(head+tail)+size."""
-    size = p.stat().st_size
+    size = size_hint if size_hint is not None else p.stat().st_size
     if size == 0:
         return "0:0"
     if size <= 2 * sample_bytes:
@@ -279,7 +291,7 @@ def init_db() -> sqlite3.Connection:
             content_sig TEXT
         );
     """)
-    # Migrate old DBs that lack content_sig
+    # Migrate to add content_sig if missing
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(processed)").fetchall()}
         if "content_sig" not in cols:
@@ -488,6 +500,7 @@ def e01_fragmentation(p: Path) -> Dict[str, Any]:
     return {"fragmented": bool(parts), "parts": parts}
 
 def _parse_ewfinfo_acq_date(txt: str) -> Optional[str]:
+    # Acquisition date: Thu May 15 07:28:46 2025
     m = re.search(r"Acquisition date\s*:\s*([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})", txt)
     if not m:
         return None
@@ -742,7 +755,7 @@ def classify_disk_raw(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
 WADE_STAGE_ACCEPT_DOCS = os.getenv("WADE_STAGE_ACCEPT_DOCS", "0") == "1"
 
 @register_classifier
-def classify_net_docs(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+def classify_net_docs(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:  # optional doc classifier
     if not WADE_STAGE_ACCEPT_DOCS:
         return "", {}
     if p.suffix.lower() not in (".md", ".rst", ".adoc", ".txt"):
@@ -807,7 +820,7 @@ def classify_network_cfg(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
                           "preview_lines": preview, **stats})
         return "network_config", best_info
     return "", {}
-    
+
 # -----------------------------
 # Misc fallback (+ ETL host colocation)
 # -----------------------------
@@ -826,6 +839,7 @@ def classify_misc(p: Path, datasources: Path) -> Tuple[str, Dict[str, Any]]:
     host = match_host_from_filename(datasources, p)
     if host:
         return "misc", {"hostname": host, "date_collected": ymd_from_mtime(p)}
+    # ETL explicit classification (so it has a home) with best-effort host colocation
     if is_etl(p):
         details = {"date_collected": ymd_from_mtime(p)}
         guessed = match_host_from_filename(datasources, p)
@@ -943,8 +957,14 @@ def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[
     all_parts.sort(key=seg_num)
 
     import tempfile
-    ensure_dirs(Path("/var/wade/tmp"))
-    with tempfile.TemporaryDirectory(dir="/var/wade/tmp") as tmpdir:
+    tmp_parent = Path("/var/wade/tmp")
+    try:
+        ensure_dirs(tmp_parent)
+        base_tmpdir = str(tmp_parent)
+    except Exception:
+        base_tmpdir = None  # fall back to system tmp
+
+    with tempfile.TemporaryDirectory(dir=base_tmpdir) as tmpdir:
         tmp = Path(tmpdir)
         merged_base = tmp / f"{src.stem}_merged"
         cmd = [EWFEXPORT_PATH, "-t", str(merged_base), "-f", "ewf"] + [str(x) for x in all_parts]
@@ -982,10 +1002,8 @@ def enqueue_work(root: Path, work: Dict[str, Any]) -> Path:
     qdir = root / cls / prof
     qdir.mkdir(parents=True, exist_ok=True)
     wid = work.get("id") or str(uuid.uuid4())
-    tmp = qdir / f"{wid}.json.tmp}"
-    final = qdir / f"{wid}.json"
-    # guard against stray brace typo
     tmp = qdir / f"{wid}.json.tmp"
+    final = qdir / f"{wid}.json"
     tmp.write_text(json.dumps(work, indent=2) + "\n")
     os.replace(str(tmp), str(final))
     return final
@@ -1063,7 +1081,7 @@ def process_one(
             # --- PRE-MOVE SNAPSHOT ---
             pre_st = st0  # reuse the stat we already did
             pre_sig = f"{pre_st.st_dev}:{pre_st.st_ino}:{pre_st.st_size}:{int(pre_st.st_mtime_ns)}"
-            pre_content_sig = quick_content_sig(src)
+            pre_content_sig = quick_content_sig(src, size_hint=pre_st.st_size)
 
             # Positive-path breadcrumbs
             json_log("waited_for_stable",
@@ -1101,8 +1119,14 @@ def process_one(
             classification, details = classify_file(src, datasources)
             if classification == "unknown":
                 triage = debug_probe_file(src)
-                json_log("skipped_unknown", original_name=src.name, src_path=str(src), profile=profile,
-                         sig=pre_sig, **triage)
+                # Move unknown into quarantine to avoid repeated churn
+                unk_dir = datasources / "Unknown"
+                ensure_dirs(unk_dir)
+                unk_dest = unk_dir / src.name
+                move_atomic(src, unk_dest)
+                safe_chown(unk_dest, owner, owner)
+                json_log("quarantined_unknown", original_name=src.name, dest_path=str(unk_dest),
+                         profile=profile, sig=pre_sig, **triage)
                 return
 
             hostname = details.get("hostname") or src.stem
@@ -1159,9 +1183,11 @@ def process_one(
             safe_chown(final_path, owner, owner)
             safe_chown(final_path.parent, owner, owner)
 
-            # Work order & DB
-            final_sig = fast_signature(final_path)
-            final_content_sig = quick_content_sig(final_path)
+            # Work order & DB (use size hints to reduce extra stats)
+            final_st = final_path.stat()
+            final_content_sig = quick_content_sig(final_path, size_hint=final_st.st_size)
+            final_sig = f"{final_st.st_dev}:{final_st.st_ino}:{final_st.st_size}:{int(final_st.st_mtime_ns)}"
+
             work = {
                 "schema": "wade.queue.workorder",
                 "version": 1,
@@ -1172,7 +1198,7 @@ def process_one(
                 "original_name": src.name,
                 "source_host": os.uname().nodename,
                 "dest_path": str(final_path),
-                "size_bytes": final_path.stat().st_size,
+                "size_bytes": final_st.st_size,
                 "sig": final_sig,
                 "content_sig": final_content_sig,
             }
@@ -1197,7 +1223,7 @@ def process_one(
                 "dest_path": str(final_path),
                 "sig": final_sig,
                 "content_sig": final_content_sig,
-                "size_bytes": final_path.stat().st_size,
+                "size_bytes": final_st.st_size,
                 "started_utc": utc_from_ts(start_ts),
                 "finished_utc": utc_now_iso(),
                 "duration_seconds": round(time.time() - start_ts, 3),
@@ -1232,13 +1258,30 @@ def process_one(
                     md["package"] = details.get("package")
                 log_payload["metadata"] = {k: v for k, v in md.items() if v is not None}
 
+            # Optional Whiff assist (non-blocking)
+            assist = whiff_annotate(log_payload)
+            if assist:
+                log_payload["assist"] = assist
+
             json_log(**log_payload)
 
             # Record pre-move snapshot (no stat on src after move)
-            record_processed_snapshot(
-                conn, pre_sig, str(src), pre_st.st_size, int(pre_st.st_mtime_ns),
-                final_path, classification, profile, content_sig=final_content_sig
-            )
+            try:
+                record_processed_snapshot(
+                    conn, pre_sig, str(src), pre_st.st_size, int(pre_st.st_mtime_ns),
+                    final_path, classification, profile, content_sig=final_content_sig
+                )
+            except sqlite3.IntegrityError:
+                # Another record with same content_sig already exists -> treat as dup
+                row = conn.execute("SELECT dest_path FROM processed WHERE content_sig = ?", (final_content_sig,)).fetchone()
+                existing = row[0] if row else None
+                ignored = STAGING_ROOT / "ignored"
+                ensure_dirs(ignored)
+                dup_dest = ignored / final_path.name
+                move_atomic(final_path, dup_dest)
+                json_log("postmove_duplicate_by_content", existing=existing, moved_to=str(dup_dest),
+                         original_name=src.name, profile=profile, content_sig=final_content_sig)
+                return
 
     except Exception as exc:
         failed = src.with_suffix(".failed")
@@ -1275,7 +1318,7 @@ def build_paths() -> Tuple[str, Path, Path, Path, Path]:
     FRAGMENT_LOG = datasources / "images_to_be_defragmented.log"
 
     ensure_dirs(full, light, datasources / "Hosts", datasources / "Network",
-                staging_root / "ignored", queue_root, STATE_DIR, LOG_ROOT)
+                staging_root / "ignored", queue_root, STATE_DIR, LOG_ROOT, datasources / "Unknown")
 
     # Queue hygiene: delete >7 day old files
     now = time.time()
