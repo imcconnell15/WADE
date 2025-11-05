@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WADE Staging Daemon – v2.3 (stability + dedupe race + env precedence)
+WADE Staging Daemon – v2.3 (stability + dedupe race + env precedence + ops logging)
 
 v2.3 (this build)
 - Optional requests import (Whiff no longer crashes daemon if not installed)
@@ -12,6 +12,7 @@ v2.3 (this build)
 - quick_content_sig() accepts size_hint to reduce extra stats
 - ETL hostname colocation retained from v2.2
 - Pre-move stat retained to avoid FileNotFoundError on moved src
+- NEW: Human-readable text logging to journald/stdout (toggle via WADE_TEXT_LOGS / WADE_TEXT_LOG_LEVEL)
 
 Kept (v2.2/v2.1):
 - Classifier registry and network-config detectors
@@ -39,6 +40,7 @@ import sys
 import time
 import uuid
 import plistlib
+import logging
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -59,7 +61,7 @@ except Exception:
 # -----------------------------
 try:
     import requests  # type: ignore
-except Exception:     # ImportError or any minimal image condition
+except Exception:
     requests = None  # type: ignore
 
 WHIFF_ENABLE = os.getenv("WHIFF_ENABLE", "1").lower() in ("1", "true", "yes")
@@ -101,6 +103,10 @@ SMALL_FILE_STABLE = int(os.getenv("WADE_STAGE_SMALL_FILE_STABLE", "5"))
 
 SIG_SAMPLE_BYTES = int(os.getenv("WADE_SIG_SAMPLE_BYTES", str(4 * 1024 * 1024)))  # 4MiB head+tail
 
+# Text logging toggles
+WADE_TEXT_LOGS = os.getenv("WADE_TEXT_LOGS", "1").lower() in ("1", "true", "yes")
+WADE_TEXT_LOG_LEVEL = os.getenv("WADE_TEXT_LOG_LEVEL", "INFO").upper()
+
 # -----------------------------
 # Globals
 # -----------------------------
@@ -109,6 +115,9 @@ LOG_ROOT: Path
 SQLITE_DB: Path
 STAGING_ROOT: Optional[Path] = None
 FRAGMENT_LOG: Optional[Path] = None
+
+# Module logger (configured in setup_logging() called from main())
+log = logging.getLogger("wade.stage")
 
 # -----------------------------
 # Magic DB
@@ -332,7 +341,7 @@ def record_processed_snapshot(conn: sqlite3.Connection, sig: str, src_path: str,
     conn.commit()
 
 # -----------------------------
-# Logging
+# JSON Logging (machine)
 # -----------------------------
 def calculate_entropy(data: bytes) -> float:
     if not data:
@@ -374,6 +383,47 @@ def debug_probe_file(p: Path) -> Dict[str, Any]:
     except Exception:
         pass
     return info
+
+# -----------------------------
+# Ops logging setup (human)
+# -----------------------------
+def setup_logging(source_host: str) -> logging.Logger:
+    """
+    Text logs -> journald (stdout). Keep JSON in /var/wade/logs/stage via json_log().
+    UTC timestamps with trailing 'Z'. Toggle with WADE_TEXT_LOGS / WADE_TEXT_LOG_LEVEL.
+    """
+    logger = logging.getLogger("wade.stage")
+    if logger.handlers:
+        return logger
+
+    if not WADE_TEXT_LOGS:
+        # Attach a NullHandler so library importers don't see "No handler" warnings
+        logger.addHandler(logging.NullHandler())
+        return logger
+
+    # Level
+    level = getattr(logging, WADE_TEXT_LOG_LEVEL, logging.INFO)
+    logger.setLevel(level)
+
+    # Host filter to stamp host once
+    class HostFilter(logging.Filter):
+        def __init__(self, host: str): self.host = host
+        def filter(self, record: logging.LogRecord) -> bool:
+            record.host = self.host
+            return True
+
+    # UTC formatter
+    import time as _time
+    logging.Formatter.converter = _time.gmtime
+    fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(host)s %(message)s",
+                            "%Y-%m-%dT%H:%M:%S")
+
+    sh = logging.StreamHandler()  # journald picks this up from stdout
+    sh.setFormatter(fmt)
+
+    logger.addFilter(HostFilter(source_host))
+    logger.addHandler(sh)
+    return logger
 
 # -----------------------------
 # Classifier registry
@@ -755,7 +805,8 @@ def classify_disk_raw(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
 WADE_STAGE_ACCEPT_DOCS = os.getenv("WADE_STAGE_ACCEPT_DOCS", "0") == "1"
 
 @register_classifier
-def classify_net_docs(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:  # optional doc classifier
+def classify_net_docs(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    # optional doc classifier
     if not WADE_STAGE_ACCEPT_DOCS:
         return "", {}
     if p.suffix.lower() not in (".md", ".rst", ".adoc", ".txt"):
@@ -938,6 +989,7 @@ def append_fragment_note(details: Dict[str, Any], dest: Path) -> None:
 def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[Path]:
     if not EWFEXPORT_PATH or not EWFINFO_PATH:
         json_log("defrag_skip", reason="ewfexport/ewfinfo missing", src=str(src))
+        log.info("defrag skip (tools missing): %s", src)
         return None
     frag_info = e01_fragmentation(src)
     if not frag_info.get("fragmented"):
@@ -947,6 +999,7 @@ def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[
     all_parts = [src] + parts
     if not all(p.exists() for p in all_parts):
         json_log("defrag_skip", reason="missing_parts", src=str(src))
+        log.warning("defrag skip (missing parts): %s", src)
         return None
 
     def seg_num(p: Path) -> int:
@@ -973,10 +1026,12 @@ def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[
         merged_e01 = merged_base.with_suffix(".E01")
         if rc != 0 or not merged_e01.exists():
             json_log("defrag_failed", src=str(src), rc=rc, error=err, duration=round(time.time()-start, 2))
+            log.error("defrag failed rc=%s src=%s err=%s", rc, src, err.strip() if err else "")
             return None
         rc2, _, _ = run_cmd([EWFINFO_PATH, str(merged_e01)], timeout=30)
         if rc2 != 0:
             json_log("defrag_verify_failed", src=str(src))
+            log.error("defrag verify failed: %s", src)
             return None
 
         final_dest = dest_dir / f"{src.stem}_defragmented.E01"
@@ -986,11 +1041,13 @@ def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[
             safe_chown(final_dest.parent, owner, owner)
         except Exception as e:
             json_log("defrag_move_failed", src=str(src), error=str(e))
+            log.error("defrag move failed: %s -> %s (%s)", merged_e01, final_dest, e)
             return None
 
         json_log("defrag_success", src=str(src), dest=str(final_dest),
                  parts=len(all_parts), size_bytes=final_dest.stat().st_size,
                  duration_seconds=round(time.time()-start, 2))
+        log.info("defrag success: %s -> %s", src, final_dest)
         return final_dest
 
 # -----------------------------
@@ -1073,9 +1130,11 @@ def process_one(
             stable_secs = SMALL_FILE_STABLE if st0.st_size <= SMALL_FILE_BYTES else STABLE_SECONDS
             if not wait_stable(src, stable_secs):
                 json_log("not_stable", src_path=str(src), waited_seconds=stable_secs)
+                log.debug("not stable yet (waited=%ss): %s", stable_secs, src)
                 return
             if not no_open_writers(src):
                 json_log("writers_present", src_path=str(src))
+                log.debug("writers present: %s", src)
                 return
 
             # --- PRE-MOVE SNAPSHOT ---
@@ -1103,6 +1162,7 @@ def process_one(
                 json_log("duplicate_ignored_content",
                          original_name=src.name, dest_path=str(dest_ignored),
                          profile=profile, content_sig=pre_content_sig)
+                log.warning("duplicate by content -> ignored: %s -> %s", src.name, dest_ignored)
                 return
 
             if already_processed(conn, pre_sig):
@@ -1113,6 +1173,7 @@ def process_one(
                 json_log("duplicate_ignored",
                          original_name=src.name, dest_path=str(dest_ignored),
                          profile=profile, sig=pre_sig)
+                log.warning("duplicate by sig -> ignored: %s -> %s", src.name, dest_ignored)
                 return
 
             # Classification
@@ -1127,6 +1188,7 @@ def process_one(
                 safe_chown(unk_dest, owner, owner)
                 json_log("quarantined_unknown", original_name=src.name, dest_path=str(unk_dest),
                          profile=profile, sig=pre_sig, **triage)
+                log.warning("quarantined unknown -> %s", unk_dest)
                 return
 
             hostname = details.get("hostname") or src.stem
@@ -1144,6 +1206,7 @@ def process_one(
                                  original_name=src.name, existing=str(dest),
                                  dest_path=str(dest_ignored), profile=profile,
                                  content_sig=pre_content_sig)
+                        log.warning("duplicate existing (same content) -> ignored: %s -> %s", src.name, dest_ignored)
                         return
                 except Exception:
                     pass
@@ -1264,6 +1327,8 @@ def process_one(
                 log_payload["assist"] = assist
 
             json_log(**log_payload)
+            log.info("staged %s -> %s (%s/%s) bytes=%d",
+                     src.name, final_path, classification, profile, final_st.st_size)
 
             # Record pre-move snapshot (no stat on src after move)
             try:
@@ -1281,6 +1346,8 @@ def process_one(
                 move_atomic(final_path, dup_dest)
                 json_log("postmove_duplicate_by_content", existing=existing, moved_to=str(dup_dest),
                          original_name=src.name, profile=profile, content_sig=final_content_sig)
+                log.warning("post-move duplicate by content: %s (existing=%s) -> %s",
+                            final_path, existing, dup_dest)
                 return
 
     except Exception as exc:
@@ -1291,6 +1358,7 @@ def process_one(
             pass
         json_log("processing_failed", original_name=src.name, src_path=str(src),
                  error=str(exc), profile=profile)
+        log.error("processing failed for %s: %s", src, exc)
         raise
 
 # -----------------------------
@@ -1355,7 +1423,7 @@ def iter_files(dir_: Path) -> Iterable[Path]:
                 yield p
 
 def polling_loop(conn, full, light, datasources, queue_root, owner):
-    print(f"[+] Polling mode – scanning every {SCAN_INTERVAL_SEC}s")
+    log.info("polling mode – scanning every %ss", SCAN_INTERVAL_SEC)
     while True:
         for directory, prof in ((full, "full"), (light, "light")):
             for p in iter_files(directory):
@@ -1385,7 +1453,7 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
     add_tree(full)
     add_tree(light)
 
-    print("[+] inotify mode – waiting for events (recursive=%s)" % ("on" if WADE_STAGE_RECURSIVE else "off"))
+    log.info("inotify mode – recursive=%s", "on" if WADE_STAGE_RECURSIVE else "off")
 
     while True:
         for ev in inotify.read(timeout=1000):
@@ -1421,12 +1489,14 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
 
 def main() -> None:
     owner, stage_full, stage_light, datasources, queue_root = build_paths()
+    # Init ops logging (text)
+    setup_logging(os.uname().nodename)
     conn = init_db()
     def _sig(*_): sys.exit(0)
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
-    print("[*] WADE staging daemon starting…")
+    log.info("WADE staging daemon starting…")
     try:
         if INOTIFY_AVAILABLE:
             inotify_loop(conn, stage_full, stage_light, datasources, queue_root, owner)
