@@ -10,12 +10,10 @@ except Exception:
 
 RUNNING = True
 def _stop(*_):
-    # Graceful exit on SIGINT/SIGTERM
     global RUNNING
     RUNNING = False
 
 def _queue_root(env: dict) -> Path:
-    # Resolve queue root exactly like staging does
     owner   = env.get("WADE_OWNER_USER","autopsy")
     datadir = env.get("WADE_DATADIR","DataSources")
     qdir    = env.get("WADE_QUEUE_DIR","_queue")
@@ -24,14 +22,12 @@ def _queue_root(env: dict) -> Path:
     return q if q.is_absolute() else (base/q)
 
 def _tickets(qroot: Path):
-    # Expect _queue/<classification>/<profile>/*.json (not .work/.done/.dead)
     for p in qroot.glob("*/*/*.json"):
         if any(s in p.suffixes for s in (".work",".done",".dead",".tmp")):
             continue
         yield p
 
 def _lock(p: Path) -> Path | None:
-    # Single-host atomic lock by rename -> *.work-<pid>.json
     locked = p.with_name(p.stem + f".work-{os.getpid()}" + "".join(p.suffixes))
     try:
         p.rename(locked)
@@ -47,7 +43,7 @@ def main():
     qroot = _queue_root(env)
     cli = Path(__file__).resolve().parents[1] / "wade_workers" / "cli.py"
 
-    print(f"[*] WADE queue runner watching {qroot}")
+    print(f"[*] WADE queue runner watching {qroot}", flush=True)
     qroot.mkdir(parents=True, exist_ok=True)
 
     while RUNNING:
@@ -57,18 +53,25 @@ def main():
             if not l:
                 continue
             worked += 1
+            # >>> VERBOSE: show the lock and dispatch
+            print(f"[*] lock {l.name} -> dispatching {cli.name}", flush=True)
             try:
-                # Call the worker CLI ON the ticket
                 rc = subprocess.call([sys.executable, str(cli), str(l)])
-                base = l.with_suffix("")                 # drop one suffix
-                dst  = base.with_suffix(".done.json") if rc == 0 else base.with_suffix(".dead.json")
-                dst.write_bytes(l.read_bytes())          # keep a record
+                base = l.with_suffix("")
+                if rc == 0:
+                    dst = base.with_suffix(".done.json")
+                    print(f"[+] {t.name} -> DONE", flush=True)
+                else:
+                    dst = base.with_suffix(".dead.json")
+                    print(f"[!] {t.name} -> DEAD (rc={rc})", flush=True)
+                dst.write_bytes(l.read_bytes())
                 l.unlink(missing_ok=True)
-            except Exception:
-                # Catastrophic handling → dead-letter
+            except Exception as e:
+                # catastrophic → dead-letter
                 try:
                     base = l.with_suffix("")
                     base.with_suffix(".dead.json").write_bytes(l.read_bytes())
+                    print(f"[!] {t.name} -> DEAD (exception: {e})", flush=True)
                     l.unlink(missing_ok=True)
                 except Exception:
                     pass
@@ -78,3 +81,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY
