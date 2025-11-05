@@ -641,24 +641,46 @@ fi
 #####################################
 # Postgres bootstrap (DB, user, extension)
 #####################################
-DB_DSN="postgresql://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/$DB_NAME"
+# ---- Build DSN and normalize names (lowercase avoids quoted identifiers)
+DB_NAME_LC="${DB_NAME,,}"
+DB_USER_LC="${DB_USER,,}"
+DB_DSN="postgresql://${DB_USER_LC}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME_LC}"
+
 echo "[*] Bootstrapping database schema…"
+
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
-  sudo -u postgres psql >/dev/null <<SQL || true
-DO \$\$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '$DB_NAME') THEN
-    PERFORM dblink_exec('dbname=' || current_database(), 'CREATE DATABASE $DB_NAME');
-  END IF;
-END\$\$;
-SQL
-  sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null || true
-  sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname = '$DB_USER'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';" >/dev/null
-  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" >/dev/null || true
+  # Local Postgres: use the OS postgres superuser
+  sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME_LC}'" | grep -q 1 \
+    || sudo -u postgres createdb "${DB_NAME_LC}"
+
+  sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER_LC}'" | grep -q 1 \
+    || sudo -u postgres psql -c "CREATE USER ${DB_USER_LC} WITH PASSWORD '${DB_PASS}'"
+
+  sudo -u postgres psql -d "${DB_NAME_LC}" -c "CREATE EXTENSION IF NOT EXISTS vector"
+  sudo -u postgres psql -d "${DB_NAME_LC}" -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME_LC} TO ${DB_USER_LC}"
+else
+  # Remote Postgres (optional): provide a superuser DSN via BOOTSTRAP_DSN, e.g. postgresql://pgsuper:Pass@db:5432/postgres
+  if [[ -n "${BOOTSTRAP_DSN:-}" ]]; then
+    psql "$BOOTSTRAP_DSN" -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME_LC}'" | grep -q 1 \
+      || psql "$BOOTSTRAP_DSN" -c "CREATE DATABASE ${DB_NAME_LC}"
+
+    psql "$BOOTSTRAP_DSN" -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER_LC}'" | grep -q 1 \
+      || psql "$BOOTSTRAP_DSN" -c "CREATE USER ${DB_USER_LC} WITH PASSWORD '${DB_PASS}'"
+
+    # Switch target DB for extension/grants
+    BOOTSTRAP_DB_DSN="${BOOTSTRAP_DSN%/postgres}/${DB_NAME_LC}"
+    psql "$BOOTSTRAP_DB_DSN" -c "CREATE EXTENSION IF NOT EXISTS vector"
+    psql "$BOOTSTRAP_DB_DSN" -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME_LC} TO ${DB_USER_LC}"
+  else
+    echo "[!] Skipping remote DB bootstrap (no BOOTSTRAP_DSN). Ensure DB/user/extension exist on the server."
+  fi
 fi
 
-# Run schema file using provided DSN (works for local or remote, if perms allow)
+# Run schema as the app user so objects are owned by 'whiff'
+psql "$DB_DSN" -f /opt/whiff/sql/00_bootstrap.sql || \
+  echo "[!] Schema bootstrap failed (check credentials/privs)."
+
+  # Run schema file using provided DSN (works for local or remote, if perms allow)
 WHIFF_DB_DSN="$DB_DSN" psql "$DB_DSN" -f /opt/whiff/sql/00_bootstrap.sql >/dev/null || \
   echo "[!] Schema bootstrap skipped (insufficient privs?). Ensure 'vector' ext + tables exist."
 
