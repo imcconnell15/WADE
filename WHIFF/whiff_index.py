@@ -5,6 +5,12 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from whiff_models import embed_texts
 from whiff_utils import simple_chunks
+from pgvector.psycopg2 import register_vector
+def db():
+    conn = psycopg2.connect(DB_DSN)
+    register_vector(conn)
+    return conn
+
 
 DB_DSN = os.environ.get("WHIFF_DB_DSN","postgresql://whiff:whiff@127.0.0.1:5432/whiff")
 
