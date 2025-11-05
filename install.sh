@@ -1150,8 +1150,12 @@ run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
   [[ -x "$WADE_CAPA_VENV/bin/python" ]] || python3 -m venv "$WADE_CAPA_VENV"
   "$WADE_CAPA_VENV/bin/python" -m pip install -U pip wheel setuptools >/dev/null 2>&1 || true
 
-  PKG="flare-capa"; [[ -n "${CAPA_VERSION:-}" ]] && PKG="flare-capa==${CAPA_VERSION}"
-  '"pip_cached_install \"$WADE_CAPA_VENV/bin\" \"$PKG\""'
+  # Build the package string inside the subshell so it exists where it is used
+  PKG="flare-capa"
+  [[ -n "${CAPA_VERSION:-}" ]] && PKG="flare-capa==${CAPA_VERSION}"
+
+  # Use the shared wheelhouse helper entirely inside the step
+  pip_cached_install "$WADE_CAPA_VENV/bin" "$PKG"
 
   install -d /usr/local/bin
   ln -sf "$WADE_CAPA_VENV/bin/capa" /usr/local/bin/capa
