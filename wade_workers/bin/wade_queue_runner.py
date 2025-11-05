@@ -53,7 +53,6 @@ def main():
             if not l:
                 continue
             worked += 1
-            # >>> VERBOSE: show the lock and dispatch
             print(f"[*] lock {l.name} -> dispatching {cli.name}", flush=True)
             try:
                 rc = subprocess.call([sys.executable, str(cli), str(l)])
@@ -67,7 +66,6 @@ def main():
                 dst.write_bytes(l.read_bytes())
                 l.unlink(missing_ok=True)
             except Exception as e:
-                # catastrophic → dead-letter
                 try:
                     base = l.with_suffix("")
                     base.with_suffix(".dead.json").write_bytes(l.read_bytes())
@@ -81,4 +79,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
