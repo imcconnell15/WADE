@@ -1,2105 +1,1396 @@
-#!/usr/bin/env bash
-# WADE - Wide-Area Data Extraction :: Idempotent Installer (soft-fail + interactive STIG)
-# Author: Ian McConnell
-
-# NOTE: keep LF endings (use `dos2unix install.sh` if needed)
-
-### ---------- Prompt helpers ----------
-prompt_with_default() {
-  local q="$1"; local d="$2"; local ans
-  read -r -p "$q [$d]: " ans
-  ans="${ans:-$d}"
-  printf "%s" "$ans"
-}
-yesno_with_default() {
-  local q="$1"; local d="${2:-Y}"; local ans
-  read -r -p "$q [${d}/$( [[ "$d" =~ ^[Yy]$ ]] && echo n || echo y )]: " ans
-  ans="${ans:-$d}"
-  [[ "$ans" =~ ^[Yy]$ ]]
-}
-
-set -Euo pipefail   # no -e (we soft-fail via step runner); still strict on unset + pipefail
-
-#####################################
-# Banner
-#####################################
-cat <<'WADE_BANNER'
-[__      __  _____  ________  ___________                                                          
-/  \    /  \/  _  \ \______ \ \_   _____/                                                          
-\   \/\/   /  /_\  \ |    |  \ |    __)_                                                           
- \        /    |    \|    `   \|        \                                                          
-  \__/\  /\____|__  /_______  /_______  /                                                          
-       \/         \/        \/        \/                                                           
- __      __.__    .___                  _____                                                      
-/  \    /  \__| __| _/____             /  _  \_______   ____ _____                                 
-\   \/\/   /  |/ __ |/ __ \   ______  /  /_\  \_  __ \_/ __ \\__  \                                 
- \        /|  / /_/ \  ___/  /_____/ /    |    \  | \/\  ___/ / __ \_                              
-  \__/\  / |__\____ |\___  >         \____|__  /__|    \___  >____  /                              
-       \/          \/    \/                  \/            \/     \/                               
-________          __           ___________         __                        __  .__                
-\______ \ _____ _/  |______    \_   _____/__  ____/  |_____________    _____/  |_|__| ____   ____  
- |    |  \\__  \\   __\__  \    |    __)_\  \/  /\   __\_  __ \__  \ _/ ___\   __\  |/  _ \ /    \ 
- |    `   \/ __ \|  |  / __ \_  |        \>    <  |  |  |  | \// __ \\  \___|  | |  (  <_> )   |  \
-/_______  (____  /__| (____  / /_______  /__/\_ \ |__|  |__|  (____  /\___  >__| |__|\____/|___|  /
-        \/     \/          \/          \/      \/                  \/     \/                    \/ ]
-WADE_BANNER
-
-#####################################
-# Script location & STIG source dir
-#####################################
-SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)"
-STIG_SRC_DIR="${SCRIPT_DIR}/stigs"
-SPLUNK_SRC_DIR="${SCRIPT_DIR}"
-LOAD_PATCH_DIR="${SCRIPT_DIR}"
-
-#####################################
-# CLI flags & basic env
-#####################################
-NONINTERACTIVE=0
-CHECK_ONLY=0
-FORCE_ALL=0
-ONLY_LIST=""
-
-for arg in "${@:-}"; do
-  case "$arg" in
-    -y|--yes|--noninteractive) NONINTERACTIVE=1 ;;
-    --check) CHECK_ONLY=1 ;;
-    --force) FORCE_ALL=1 ;;
-    --only=*) ONLY_LIST="${arg#--only=}" ;;
-  esac
-done
-
-NONINTERACTIVE=${WADE_NONINTERACTIVE:-$NONINTERACTIVE}
-OFFLINE="${OFFLINE:-0}"
-
-#####################################
-# Logging
-#####################################
-LOG_DIR="/var/log/wade"; mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/install_$(date +%Y%m%d_%H%M%S).log"
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-#####################################
-# Helpers
-#####################################
-require_root() { if [[ ${EUID:-$(id -u)} -ne 0 ]]; then echo "[-] Run as root (sudo)."; exit 1; fi; }
-confirm() { [[ "$NONINTERACTIVE" -eq 1 ]] && return 0; read -r -p "${1:-Proceed?} [y/N]: " a; [[ "$a" =~ ^[Yy]$ ]]; }
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-validate_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[1-2][0-9]|3[0-2]))?$ ]]; }
-die(){ echo "[-] $*"; exit 1; }
-sha256_of(){ sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
-
-# Soft-fail aggregation
-FAILS=()
-WARNS=()
-fail_note(){ local mod="$1"; shift; local msg="${*:-failed}"; echo "[-] [$mod] $msg"; FAILS+=("$mod — $msg"); }
-warn_note(){ local mod="$1"; shift; local msg="${*:-warning}"; echo "[!] [$mod] $msg"; WARNS+=("$mod — $msg"); }
-finish_summary(){
-  echo
-  echo "================ WADE INSTALL SUMMARY ================"
-  if ((${#FAILS[@]})); then echo "Failed components:"; printf ' - %s\n' "${FAILS[@]}"; else echo "No component failures recorded."; fi
-  if ((${#WARNS[@]})); then echo; echo "Warnings:"; printf ' - %s\n' "${WARNS[@]}"; fi
-  echo "======================================================"
-  ((${#FAILS[@]}==0)) || exit 2
-}
-
-find_offline_src(){
-  for d in /media/*/wade-offline /run/media/*/wade-offline /mnt/wade-offline /wade-offline; do
-    [[ -d "$d" ]] && { echo "$d"; return 0; }
-  done
-  local dev; dev=$(lsblk -o NAME,LABEL,MOUNTPOINT -nr | awk '/wade-offline/ {print "/dev/"$1; exit}')
-  if [[ -n "$dev" ]]; then local mnt="/mnt/wade-repo"; mkdir -p "$mnt"; mount "$dev" "$mnt" && { echo "$mnt"; return 0; }; fi
-  return 1
-}
-
-# --- APT lock helper (Ubuntu/Debian) ---
-apt_wait() {
-  [[ "$PM" != "apt" ]] && return 0
-  local tries=60
-  local locks=(/var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
-  echo "[apt] checking for package manager locks…"
-  while fuser "${locks[@]}" >/dev/null 2>&1; do
-    ((tries--)) || { echo "[apt] lock held too long; bailing"; return 1; }
-    echo "[apt] lock held by another process; retrying in 5s… ($((60-tries))/60)"
-    sleep 5
-  done
-  # clean up any half-configured state
-  dpkg --configure -a >/dev/null 2>&1 || true
-}
-
-#####################################
-# Idempotency framework (step registry)
-#####################################
-WADE_VAR_DEFAULT="/var/wade"
-STEPS_DIR="${WADE_VAR_DEFAULT}/state/steps"; mkdir -p "$STEPS_DIR"
-
-_inlist(){ local item="$1" list_csv="$2"; [[ -z "$list_csv" ]] && return 0; IFS=',' read -ra arr <<< "$list_csv"; for x in "${arr[@]}"; do [[ "$item" == "$x" ]] && return 0; done; return 1; }
-mark_done(){ local step="$1" ver="$2"; shift 2 || true; printf '%s\n' "$ver" > "${STEPS_DIR}/${step}.ver"; [[ $# -gt 0 ]] && printf '%s\n' "$*" > "${STEPS_DIR}/${step}.note"; }
-get_mark_ver(){ local step="$1" [[ -f "${STEPS_DIR}/${step}.ver" ]] && cat "${STEPS_DIR}/${step}.ver" || echo ""; }
-report_step(){ printf " - %-16s want=%-12s have=%-14s [%s]\n" "$1" "${2:-n/a}" "${3:-n/a}" "$4"; }
-
-# Caches/symbols for vol3 & friends
-CACHEDIR="${CACHEDIR:-/var/wade/cache}"
-mkdir -p "${CACHEDIR}"
-
-run_step(){
-  local name="$1" want="$2" get_have="$3" do_install="$4"
-  _inlist "$name" "$ONLY_LIST" || { report_step "$name" "$want" "$($get_have 2>/dev/null || true)" "SKIP(--only)"; return 0; }
-  local have; have="$($get_have 2>/dev/null || true)"
-  if (( CHECK_ONLY )); then
-    if [[ -z "$have" ]]; then report_step "$name" "$want" "<none>" "NEED"
-    elif [[ -n "$want" && "$want" != "$have" ]]; then report_step "$name" "$want" "$have" "NEED"
-    else report_step "$name" "$want" "$have" "OK"; fi
-    return 0
-  fi
-  if (( ! FORCE_ALL )) && [[ -n "$have" && ( -z "$want" || "$want" == "$have" ) ]]; then
-    report_step "$name" "$want" "$have" "OK"; return 0
-  fi
-  echo "[*] Installing/updating ${name} (want=${want:-n/a}, have=${have:-none})…"
-  if ( set -e; eval "$do_install" ); then
-    have="$($get_have 2>/dev/null || true)"
-    mark_done "$name" "${have:-unknown}"
-    report_step "$name" "$want" "$have" "OK"
-    return 0
-  else
-    report_step "$name" "$want" "$have" "FAIL"
-    return 1
-  fi
-}
-
-#####################################
-# Version detectors (best-effort)
-#####################################
-get_ver_be(){ /usr/local/bin/bulk_extractor -V 2>&1 | grep -Eo '[0-9]+(\.[0-9]+)*' | head -1 || true; }
-get_ver_hayabusa(){
-  local bin="${HAYABUSA_DEST:-/usr/local/bin/hayabusa}"
-  [[ -x "$bin" ]] || { echo ""; return; }
-  if v="$("$bin" --version 2>/dev/null | sed -nE 's/.*v?([0-9]+(\.[0-9]+)+).*/\1/p' | head -1)"; then
-    [[ -n "$v" ]] && { echo "$v"; return; }
-  fi
-  echo installed
-}
-get_ver_solr(){ /opt/solr/bin/solr -version 2>/dev/null | awk '{print $2}' || true; }
-get_ver_zk(){ [[ -x /opt/zookeeper/bin/zkServer.sh ]] && ls /opt/zookeeper/lib/* 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo ""; }
-get_ver_amq(){ /opt/activemq/bin/activemq --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9.]+' | head -1 || true; }
-get_ver_pg(){ psql -V 2>/dev/null | awk '{print $3}' || true; }
-get_ver_pipx_vol3(){ pipx list 2>/dev/null | awk '/package volatility3 /{print $3}' | tr -d '()' || true; }
-get_ver_pipx_dissect(){ pipx list 2>/dev/null | awk '/package dissect /{print $3}' | tr -d '()' || true; }
-get_ver_stig(){ [[ -f "${STIG_UBU_EXTRACT_DIR:-/var/wade/stigs/ubuntu2404}/ds.xml" ]] && sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" || echo ""; }
-get_ver_qtgl(){ dpkg -s libegl1 >/dev/null 2>&1 && echo present || echo ""; }  # apt branch only
-get_ver_splunkuf(){
-  [[ -x /opt/splunkforwarder/bin/splunk ]] || { echo ""; return; }
-  local outconf="/opt/splunkforwarder/etc/system/local/outputs.conf"
-  if [[ -f "$outconf" ]] && grep -q '^\s*server\s*=' "$outconf"; then
-    echo installed
-  else
-    echo ""
-  fi
-}
-get_ver_uf(){
-  [[ -x /opt/splunkforwarder/bin/splunk ]] || { echo ""; return; }
-  /opt/splunkforwarder/bin/splunk version 2>/dev/null \
-    | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) {print $i; exit}}'
-}
-get_ver_capa(){ /usr/local/bin/capa --version 2>/dev/null | sed -nE "s/.* ([0-9]+(\.[0-9]+)+).*/\1/p" | head -1 || echo ""; }
-get_ver_capa_rules(){
-  local dir="${WADE_CAPA_RULES_DIR:-/opt/capa-rules}"
-  if [[ -d "$dir/.git" ]]; then
-    git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo ""
-  elif [[ -d "$dir" ]]; then
-    local n; n=$(find "$dir" -type f -name '*.yml' 2>/dev/null | wc -l | tr -d ' ')
-    [[ "$n" =~ ^[0-9]+$ ]] && echo "files-${n}" || echo ""
-  else
-    echo ""
-  fi
-}
-
-# == WADE Staging Daemon (detector)
-get_ver_wade_stage(){
-  # Return script hash if staged+enabled, else blank so run_step knows to install
-  local svc="/etc/systemd/system/wade-staging.service"
-  local bin="/opt/wade/stage_daemon.py"
-  systemctl is-enabled --quiet wade-staging.service >/dev/null 2>&1 || { echo ""; return; }
-  [[ -f "$bin" ]] || { echo ""; return; }
-  sha256sum "$bin" 2>/dev/null | awk '{print $1}'
-}
-
-get_ver_wade_mwex(){
-  local bin="/opt/wade/wade_mw_extract.py"
-  [[ -f "$bin" ]] || { echo ""; return; }
-  sha256sum "$bin" 2>/dev/null | awk '{print $1}'
-}
-
-# === Staging & Malware Extractor source (from repo) ===
-STAGE_SRC="${SCRIPT_DIR}/scripts/staging/stage_daemon.py"
-STAGE_EXPECT_SHA="$(sha256_of "$STAGE_SRC" 2>/dev/null || true)"
-
-MWEX_SRC="${SCRIPT_DIR}/scripts/malware/wade_mw_extract.py"
-MWEX_EXPECT_SHA="$(sha256_of "$MWEX_SRC" 2>/dev/null || true)"
-
-#####################################
-# WADE Doctor (services, shares, Splunk UF)
-#####################################
-wade_doctor() {
-  echo "=== WADE Doctor ==="
-  if systemctl is-active --quiet smbd || systemctl is-active --quiet smb; then
-    echo "[*] Samba: active"
-  else
-    echo "[!] Samba: inactive"
-  fi
-  SMB_CONF="/etc/samba/smb.conf"
-  for SHARE in DataSources Cases Staging; do
-    if testparm -s 2>/dev/null | grep -q "^\[$SHARE\]"; then
-      PATH_LINE="$(awk '/^\['"$SHARE"'\]/{f=1;next} /^\[/{f=0} f && /path[[:space:]]*=/{print; exit}' "$SMB_CONF" 2>/dev/null | sed -E 's/^[[:space:]]*path[[:space:]]*=\s*//')"
-      if [[ -n "$PATH_LINE" && -d "$PATH_LINE" ]]; then
-        echo "[+] Share [$SHARE] mapped to $PATH_LINE"
-      else
-        echo "[!] Share [$SHARE] defined, but path missing or not a directory"
-      fi
-    else
-      echo "[!] Share [$SHARE] not found in smb.conf (testparm)"
-    fi
-  done
-  if [[ -x /opt/splunkforwarder/bin/splunk ]]; then
-    echo "[*] Splunk UF present: version $(/opt/splunkforwarder/bin/splunk version 2>/dev/null | awk '{print $NF}')"
-    OUTCONF="/opt/splunkforwarder/etc/system/local/outputs.conf"
-    if [[ -f "$OUTCONF" ]]; then
-      SERVER_LINE="$(awk -F= '/^\s*server\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$OUTCONF" 2>/dev/null)"
-      if [[ -n "$SERVER_LINE" ]]; then
-        echo "[+] UF forwarding to: $SERVER_LINE"
-      else
-        echo "[!] UF outputs.conf found but no 'server=' set"
-      fi
-    else
-      echo "[!] UF outputs.conf missing at $OUTCONF"
-    fi
-    /opt/splunkforwarder/bin/splunk status 2>/dev/null | sed -n '1,8p' || true
-  else
-    echo "[!] Splunk UF not installed"
-  fi
-  echo "[*] Listening ports (smbd 139/445, solr 8983, postgres 5432):"
-  ss -plnt | awk 'NR==1 || /:139 |:445 |:8983 |:5432 /'
-  echo "===================="
-}
-
-#####################################
-# Preflight specs
-#####################################
-require_root
-CPU_MIN=4; RAM_MIN_GB=16; DISK_MIN_GB=200
-CPU_CORES=$(nproc || echo 1)
-MEM_GB=$(( ( $(awk '/MemTotal/{print $2}' /proc/meminfo) + 1048575 ) / 1048576 ))
-ROOT_AVAIL_GB=$(( ( $(df --output=avail / | tail -1) + 1048575 ) / 1048576 ))
-echo "[*] Cores:${CPU_CORES} RAM:${MEM_GB}GB Free/:${ROOT_AVAIL_GB}GB"
-WARN=false
-(( CPU_CORES < CPU_MIN )) && echo "  WARN: < ${CPU_MIN} cores" && WARN=true
-(( MEM_GB   < RAM_MIN_GB )) && echo "  WARN: < ${RAM_MIN_GB} GB RAM" && WARN=true
-(( ROOT_AVAIL_GB < DISK_MIN_GB )) && echo "  WARN: < ${DISK_MIN_GB} GB free" && WARN=true
-$WARN && ! confirm "Under recommended specs. Continue anyway?" && exit 1
-
-#####################################
-# OS detection
-#####################################
-. /etc/os-release
-OS_ID="${ID:-}"; OS_LIKE="${ID_LIKE:-}"; OS_VER_ID="${VERSION_ID:-}"
-PRETTY="${PRETTY_NAME:-$OS_ID $OS_VER_ID}"
-echo "[*] Detected OS: ${PRETTY}"
-
-PKG_INSTALL=""; PKG_UPDATE=""; PKG_REFRESH=""; FIREWALL=""; PM=""
-
-#####################################
-# WADE scaffolding & default config
-#####################################
-WADE_ETC="/etc/wade"
-WADE_VAR="/var/wade"
-mkdir -p "${WADE_ETC}/"{conf.d,modules,json_injection.d} \
-         "${WADE_VAR}/"{logs,state,tmp,pkg,tools.d,pipelines.d}
-
-# Seed default wade.conf if missing
-if [[ ! -f "${WADE_ETC}/wade.conf" ]]; then
-  cat >"${WADE_ETC}/wade.conf"<<'CONF'
-### /etc/wade/wade.conf (defaults) ##############################
-WADE_HOSTNAME=""
-WADE_OWNER_USER="autopsy"
-WADE_SMB_USERS="autopsy,KAPE"
-WADE_ALLOW_NETS=""                       # "10.0.0.0/24,10.0.1.0/24"
-
-WADE_BASE_VAR="/var/wade"
-WADE_BASE_ETC="/etc/wade"
-WADE_LOG_DIR="${WADE_BASE_VAR}/logs"
-WADE_PKG_DIR="${WADE_BASE_VAR}/pkg"
-WADE_TOOLS_DIR="${WADE_BASE_VAR}/tools.d"
-WADE_PIPELINES_DIR="${WADE_BASE_VAR}/pipelines.d"
-
-WADE_DATADIR="DataSources"
-WADE_CASESDIR="Cases"
-WADE_STAGINGDIR="Staging"
-
-WADE_OFFLINE="${OFFLINE:-0}"
-WADE_STRICT_FIREWALL="0"
-
-# Pinned versions
-ZOOKEEPER_VER="3.5.7"
-SOLR_VER="8.6.3"
-ACTIVEMQ_VER="5.14.0"
-
-# Java (headless recommended)
-JAVA_PACKAGE_APT="default-jre-headless"
-JAVA_PACKAGE_RPM="java-11-openjdk-headless"
-SOLR_HEAP=""
-# Leave SOLR_HEAP blank so Solr uses SOLR_JAVA_MEM below (Xms 24G, Xmx 48G).
-SOLR_JAVA_MEM='-Xms24G -Xmx48G'
-SOLR_ZK_HOST="127.0.0.1"
-
-# PostgreSQL lab settings (unsafe for prod)
-PG_LISTEN_ADDR="0.0.0.0"
-PG_PERF_FSYNC="off"
-PG_PERF_SYNCCOMMIT="off"
-PG_PERF_FULLPAGE="off"
-PG_CREATE_AUTOPSY_USER="1"
-
-# ===== Splunk (UF + ports) =====
-# Default index new WADE tools should use (kept for backwards-compat)
-SPLUNK_DEFAULT_INDEX="wade_custom"
-
-# Universal Forwarder defaults (used by the installer prompts & env)
-# One or more indexers, comma-separated, each as host:port
-SPLUNK_UF_RCVR_HOSTS="splunk.example.org:9997"
-SPLUNK_UF_DEFAULT_INDEX="wade_custom"
-SPLUNK_UF_COMPRESSED="true"     # tcpout: compressed = true|false
-SPLUNK_UF_USE_ACK="true"        # tcpout: useACK = true|false
-SPLUNK_UF_SSL_VERIFY="false"    # tcpout: sslVerifyServerCert = true|false
-SPLUNK_UF_SSL_COMMON_NAME="*"   # tcpout: sslCommonNameToCheck (only if verify true)
-SPLUNK_UF_DEPLOYMENT_SERVER=""  # e.g. "ds.example.org:8089" or blank to skip
-
-# Ports (for summary/UI hints; *not* proof of local Splunk Enterprise)
-SPLUNK_WEB_PORT="8000"
-SPLUNK_MGMT_PORT="8089"
-SPLUNK_HEC_PORT="8088"
-SPLUNK_FORWARD_PORT="9997"
-
-# Module toggles
-MOD_VOL_SYMBOLS_ENABLED="1"
-MOD_BULK_EXTRACTOR_ENABLED="1"
-MOD_PIRANHA_ENABLED="1"
-MOD_BARRACUDA_ENABLED="1"
-MOD_HAYABUSA_ENABLED="1"
-
-# Volatility3 runtime dirs (writable by primary owner)
-VOL3_BASE_DIR="/var/wade/vol3"
-VOL3_SYMBOLS_DIR="${VOL3_BASE_DIR}/symbols"
-VOL3_CACHE_DIR="${VOL3_BASE_DIR}/cache"
-VOL3_PLUGIN_DIR="${VOL3_BASE_DIR}/plugins"   # optional, for custom plugins later
-
-# Sigma disabled in this build
-SIGMA_ENABLED="0"
-SIGMA_AUTOUPDATE="0"
-
-# Hayabusa locations
-HAYABUSA_ARCH_AUTO="1"
-HAYABUSA_ARCH_OVERRIDE=""
-HAYABUSA_DEST="/usr/local/bin/hayabusa"
-HAYABUSA_RULES_DIR="/etc/wade/hayabusa/rules"
-SIGMA_RULES_DIR="/etc/wade/sigma"
-
-# ---- Mandiant capa (engine + rules) ----
-CAPA_VERSION=""                         # blank = latest from PyPI
-WADE_CAPA_VENV="/opt/wade/venvs/capa"   # dedicated venv for capa
-WADE_CAPA_RULES_DIR="/opt/capa-rules"   # where rules live
-WADE_CAPA_RULES_COMMIT=""               # optionally pin: commit SHA or tag
-
-# ---- STIG (assessment only; interactive at end) ----
-MOD_STIG_EVAL_ENABLED="1"         # keep prereqs enabled; eval runs interactively at end
-MOD_STIG_REMEDIATE_ENABLED="0"    # do NOT apply fixes
-
-# Reports
-STIG_REPORT_DIR="/var/wade/logs/stig"
-
-# Storage for a stable copy of the DS/XML we evaluated (for idempotent checks)
-STIG_STORE_DIR="/var/wade/stigs"
-STIG_UBU_EXTRACT_DIR="${STIG_STORE_DIR}/ubuntu2404"
-
-# Default profile (can override; menu will still be shown)
-STIG_PROFILE_ID="xccdf_mil.disa.stig_profile_MAC-1_Classified"
-
-# Optional: comma-separated rule IDs to skip
-STIG_SKIP_RULES=""
-CONF
-  chmod 0644 "${WADE_ETC}/wade.conf"
-fi
-
-# Seed universal jq injector
-if [[ ! -f "${WADE_ETC}/json_injection.d/00-universal.jq" ]]; then
-  cat >"${WADE_ETC}/json_injection.d/00-universal.jq"<<'JQ'
-# Add WADE metadata to each JSON object
-. as $o
-| $o
-| .wade |= ( .wade // {} )
-| .wade.hostname = (env.WADE_HOSTNAME // env.HOSTNAME)
-| .wade.module = (env.MODULE // null)
-| .wade.pipeline = (env.PIPELINE // null)
-| .wade.image_path = (env.IMAGE_PATH // null)
-| .wade.case_id = (env.CASE_ID // null)
-| .wade.location = (env.LOCATION // null)
-JQ
-  chmod 0644 "${WADE_ETC}/json_injection.d/00-universal.jq"
-fi
-
-# Load config stack
-source "${WADE_ETC}/wade.conf"
-for f in "${WADE_ETC}/conf.d/"*.conf; do [[ -f "$f" ]] && source "$f"; done
-for f in "${WADE_ETC}/modules/"*.conf; do [[ -f "$f" ]] && source "$f"; done
-OFFLINE="${OFFLINE:-${WADE_OFFLINE:-0}}"
-
-# ---- Guard against set -u for expected vars (defaults if config missing) ----
-: "${VOL3_BASE_DIR:=/var/wade/vol3}"
-: "${VOL3_SYMBOLS_DIR:=${VOL3_BASE_DIR}/symbols}"
-: "${VOL3_CACHE_DIR:=${VOL3_BASE_DIR}/cache}"
-: "${VOL3_PLUGIN_DIR:=${VOL3_BASE_DIR}/plugins}"
-: "${LWADEUSER:=${WADE_OWNER_USER:-autopsy}}"
-
-#####################################
-# OFFLINE repo setup & pkg managers
-#####################################
-OFFLINE_SRC=""
-if [[ "$OFFLINE" == "1" ]]; then
-  echo "[*] OFFLINE mode enabled…"
-  OFFLINE_SRC="$(find_offline_src)" || die "Could not find 'wade-offline' media."
-  echo "[+] Offline repo root: $OFFLINE_SRC"
-fi
-
-if [[ "$OFFLINE" == "1" ]]; then
-  case "$OS_ID:$OS_LIKE" in
-    ubuntu:*|*:"debian"*)
-      echo "deb [trusted=yes] file:${OFFLINE_SRC}/ubuntu noble main" > /etc/apt/sources.list.d/wade-offline.list
-      APT_FLAGS='-o Dir::Etc::sourcelist="sources.list.d/wade-offline.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"'
-      PKG_UPDATE="apt-get update ${APT_FLAGS}"
-      PKG_INSTALL="apt-get install -y --no-install-recommends ${APT_FLAGS}"
-      PKG_REFRESH="$PKG_INSTALL"; FIREWALL="ufw"; PM="apt"
-      ;;
-    ol:*|*:"rhel"*|*:"fedora"*)
-      cat >/etc/yum.repos.d/wade-offline.repo <<EOF
-[WadeOffline]
-name=Wade Offline
-baseurl=file://${OFFLINE_SRC}/oracle10
-enabled=1
-gpgcheck=0
-EOF
-      if have_cmd dnf; then
-        PKG_UPDATE="dnf -y --disablerepo='*' --enablerepo='WadeOffline' makecache"
-        PKG_INSTALL="dnf -y --disablerepo='*' --enablerepo='WadeOffline' install"
-        PKG_REFRESH="$PKG_INSTALL"; PM="dnf"
-      else
-        PKG_UPDATE="yum -y --disablerepo='*' --enablerepo='WadeOffline' makecache"
-        PKG_INSTALL="yum -y --disablerepo='*' --enablerepo='WadeOffline' install"
-        PKG_REFRESH="$PKG_INSTALL"; PM="yum"
-      fi
-      FIREWALL="firewalld"
-      ;;
-    *) die "Offline: unsupported distro ${OS_ID}/${OS_LIKE}." ;;
-  esac
-else
-  case "$OS_ID:$OS_LIKE" in
-    ubuntu:*|*:"debian"*)
-      PKG_UPDATE="apt-get update -y"
-      PKG_INSTALL="apt-get install -y --no-install-recommends"
-      PKG_REFRESH="$PKG_INSTALL"; FIREWALL="ufw"; PM="apt"
-      ;;
-    ol:*|*:"rhel"*|*:"fedora"*)
-      if have_cmd dnf; then
-        PKG_UPDATE="dnf -y makecache"
-        PKG_INSTALL="dnf -y install"
-        PKG_REFRESH="$PKG_INSTALL"; PM="dnf"
-      else
-        PKG_UPDATE="yum -y makecache"
-        PKG_INSTALL="yum -y install"
-        PKG_REFRESH="$PKG_INSTALL"; PM="yum"
-      fi
-      FIREWALL="firewalld"
-      ;;
-    *) die "Unsupported distro (ID=${OS_ID}, LIKE=${OS_LIKE})." ;;
-  esac
-fi
-
-#####################################
-# Fresh-install bootstrap
-#####################################
-bootstrap_fresh_install(){
-  echo "[*] Fresh-install bootstrap…"
-  if [[ "$PM" == "apt" ]]; then
-    export DEBIAN_FRONTEND=noninteractive
-    bash -lc "$PKG_UPDATE"
-    bash -lc "$PKG_INSTALL ca-certificates curl gnupg lsb-release git python3-venv unzip"
-    bash -lc "$PKG_INSTALL ufw" || true
-  else
-    bash -lc "$PKG_UPDATE"
-    bash -lc "$PKG_INSTALL firewalld curl tar git python3 python3-virtualenv unzip" || true
-    systemctl enable firewalld --now || true
-    if [[ "$OFFLINE" != "1" ]]; then
-      bash -lc "$PKG_INSTALL oracle-epel-release-el10" || bash -lc "$PKG_INSTALL oracle-epel-release-el9" || bash -lc "$PKG_INSTALL epel-release" || true
-      bash -lc "$PKG_UPDATE" || true
-    fi
-  fi
-}
-bootstrap_fresh_install
-
-#####################################
-# Prompts (noninteractive honors defaults)
-#####################################
-DEFAULT_HOSTNAME="${WADE_HOSTNAME:-$(hostname)}"
-DEFAULT_OWNER="${WADE_OWNER_USER:-autopsy}"
-DEFAULT_SMB_USERS="${WADE_SMB_USERS:-${DEFAULT_OWNER},KAPE}"
-DEFAULT_ALLOW_NETS="${WADE_ALLOW_NETS:-}"
-
-if [[ "$NONINTERACTIVE" -eq 1 ]]; then
-  LWADE="$DEFAULT_HOSTNAME"; LWADEUSER="$DEFAULT_OWNER"
-  SMB_USERS_CSV="$DEFAULT_SMB_USERS"; ALLOW_NETS_CSV="$DEFAULT_ALLOW_NETS"
-  echo "[*] Noninteractive: using wade.conf defaults."
-else
-  read -r -p "Hostname for this WADE server [${DEFAULT_HOSTNAME}]: " LWADE; LWADE="${LWADE:-$DEFAULT_HOSTNAME}"
-  read -r -p "Primary Linux user to own shares [${DEFAULT_OWNER}]: " LWADEUSER; LWADEUSER="${LWADEUSER:-$DEFAULT_OWNER}"
-  read -r -p "Samba users (comma-separated) [${DEFAULT_SMB_USERS}]: " SMB_USERS_CSV; SMB_USERS_CSV="${SMB_USERS_CSV:-$DEFAULT_SMB_USERS}"
-  read -r -p "Allowed networks CSV (ex. 10.0.0.0/24,10.0.1.0/24) [${DEFAULT_ALLOW_NETS}]: " ALLOW_NETS_CSV; ALLOW_NETS_CSV="${ALLOW_NETS_CSV:-$DEFAULT_ALLOW_NETS}"
-fi
-hostnamectl set-hostname "$LWADE" || true
-
-IFS=',' read -ra ALLOW_NETS_ARR <<< "${ALLOW_NETS_CSV// /}"
-for net in "${ALLOW_NETS_ARR[@]:-}"; do [[ -n "$net" ]] && ! validate_cidr "$net" && warn_note "precheck" "Invalid CIDR ignored: $net"; done
-IFS=',' read -ra SMBUSERS <<< "${SMB_USERS_CSV}"
-
-if ! id -u "$LWADEUSER" >/dev/null 2>&1; then
-  echo "[*] Creating user ${LWADEUSER}…"
-  useradd -m -s /bin/bash "$LWADEUSER" || warn_note "useradd" "could not create ${LWADEUSER}"
-  if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-    while :; do read -s -p "Password for ${LWADEUSER}: " p1; echo; read -s -p "Confirm: " p2; echo; [[ "$p1" == "$p2" && -n "$p1" ]] && break; echo "Mismatch/empty. Try again."; done
-    echo "${LWADEUSER}:${p1}" | chpasswd || warn_note "useradd" "could not set password for ${LWADEUSER}"
-  fi
-  usermod -aG sudo "$LWADEUSER" || true
-fi
-for u in "${SMBUSERS[@]}"; do u=$(echo "$u" | xargs); id -u "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u" || warn_note "useradd" "failed creating $u"; done
-
-#####################################
-# Unified Prompt Stack (run once, early)
-#####################################
-
-# --- Optional: set one Samba password for all users now (skip to leave unchanged) ---
-SMB_SET_PW_ALL="N"
-if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-  read -r -p "Set one Samba password for ALL SMB users now? [y/N]: " SMB_SET_PW_ALL
-  SMB_SET_PW_ALL="${SMB_SET_PW_ALL:-N}"
-fi
-SMB_ALL_PW=""
-if [[ "$SMB_SET_PW_ALL" =~ ^[Yy]$ && "$NONINTERACTIVE" -eq 0 ]]; then
-  while :; do
-    read -s -p "Samba password (will apply to: ${SMB_USERS_CSV}): " p1; echo
-    read -s -p "Confirm: " p2; echo
-    [[ "$p1" == "$p2" && -n "$p1" ]] && SMB_ALL_PW="$p1" && break
-    echo "Mismatch/empty. Try again."
-  done
-fi
-
-# --- Splunk UF prompts (pre-set for later step; no more mid-run questions) ---
-# Defaults from wade.conf
-DEFAULT_HOSTS="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
-DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
-COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
-USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
-SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
-SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
-DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
-
-PRESET_SPLUNK_SERVER_LINE=""
-PRESET_SPLUNK_INDEX="$DEFAULT_INDEX"
-PRESET_SPLUNK_COMPRESSED="$COMPRESSED"
-PRESET_SPLUNK_USEACK="$USE_ACK"
-PRESET_SPLUNK_SSL_VERIFY="$SSL_VERIFY"
-PRESET_SPLUNK_SSL_CN="$SSL_CN"
-PRESET_SPLUNK_DS="$DS_TARGET"
-
-if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-  echo
-  echo ">> Splunk UF configuration (captured once, used later)"
-  read -r -p "Indexer(s) host[:port], comma-separated [${DEFAULT_HOSTS}]: " IDXERS
-  IDXERS="${IDXERS:-$DEFAULT_HOSTS}"
-  DEFAULT_PORT="$(echo "${DEFAULT_HOSTS##*:}" | awk '{print $1}')"
-  NORMALIZED=""
-  IFS=',' read -r -a ARR <<< "$IDXERS"
-  for h in "${ARR[@]}"; do
-    h="$(echo "$h" | xargs)"; [[ -z "$h" ]] && continue
-    if [[ "$h" == *:* ]]; then NORMALIZED+="${h},"; else NORMALIZED+="${h}:${DEFAULT_PORT},"; fi
-  done
-  PRESET_SPLUNK_SERVER_LINE="${NORMALIZED%,}"
-
-  read -r -p "Default index for WADE logs [${DEFAULT_INDEX}]: " tmp; tmp="${tmp:-$DEFAULT_INDEX}"; PRESET_SPLUNK_INDEX="$tmp"
-
-  read -r -p "Enable compression? (true/false) [${COMPRESSED}]: " tmp; PRESET_SPLUNK_COMPRESSED="${tmp:-$COMPRESSED}"
-  read -r -p "Enable indexer ACKs? (true/false) [${USE_ACK}]: " tmp; PRESET_SPLUNK_USEACK="${tmp:-$USE_ACK}"
-
-  read -r -p "Verify indexer SSL certs? (true/false) [${SSL_VERIFY}]: " tmp; PRESET_SPLUNK_SSL_VERIFY="${tmp:-$SSL_VERIFY}"
-  if [[ "${PRESET_SPLUNK_SSL_VERIFY}" == "true" ]]; then
-    read -r -p "sslCommonNameToCheck [${SSL_CN}]: " tmp; PRESET_SPLUNK_SSL_CN="${tmp:-$SSL_CN}"
-  fi
-
-  read -r -p "Deployment server host:port (blank to skip) [${DS_TARGET}]: " tmp; PRESET_SPLUNK_DS="${tmp:-$DS_TARGET}"
-fi
-
-# Let later steps know everything is pre-captured
-export PRESET_SPLUNK=1
-export PRESET_SPLUNK_SERVER_LINE PRESET_SPLUNK_INDEX PRESET_SPLUNK_COMPRESSED PRESET_SPLUNK_USEACK PRESET_SPLUNK_SSL_VERIFY PRESET_SPLUNK_SSL_CN PRESET_SPLUNK_DS
-export SMB_ALL_PW
-
-# --- STIG run choice (only the choice now; profile is picked later when DS is found) ---
-RUN_STIG_NOW="N"
-if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-  read -r -p "Run DISA STIG assessment at the end? [y/N]: " RUN_STIG_NOW; RUN_STIG_NOW="${RUN_STIG_NOW:-N}"
-fi
-export RUN_STIG_NOW
-
-if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-  echo; echo "===== Summary ====="
-  echo " Hostname     : $LWADE"
-  echo " Linux Owner  : $LWADEUSER"
-  echo " SMB users    : ${SMB_USERS_CSV}"
-  echo " Allow nets   : ${ALLOW_NETS_CSV:-<none>}"
-  echo " Offline mode : ${OFFLINE}"
-  confirm "Proceed with installation?" || exit 0
-fi
-
-#####################################
-# Core packages (+ headless Java & truststore)
-#####################################
-( set -e
-  WANTED_PKGS_COMMON=(samba cifs-utils jq inotify-tools plocate libewf2 ewf-tools pipx zip unzip p7zip-full)
-  if [[ "$PM" == "apt" ]]; then
-    JAVA_PKG="${JAVA_PACKAGE_APT:-default-jre-headless}"
-    bash -lc "$PKG_UPDATE"
-    bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} ufw ${JAVA_PKG} samba-common-bin"
-    if command -v keytool >/dev/null 2>&1; then
-      /var/lib/dpkg/info/ca-certificates-java.postinst configure || true
-      bash -lc "$PKG_INSTALL --reinstall ca-certificates-java" || true
-    fi
-  else
-    JAVA_PKG="${JAVA_PACKAGE_RPM:-java-11-openjdk-headless}"
-    bash -lc "$PKG_UPDATE"
-    EXTRA_RPM=(policycoreutils policycoreutils-python-utils setools-console "$JAVA_PKG")
-    bash -lc "$PKG_INSTALL ${WANTED_PKGS_COMMON[*]} firewalld ${EXTRA_RPM[*]}" || true
-    systemctl enable firewalld --now || true
-  fi
-) || fail_note "core_packages" "base packages failed"
-
-
-#####################################
-# Samba shares (DataSources, Cases, Staging)
-#####################################
-get_ver_samba(){
-  local SMB_CONF="/etc/samba/smb.conf"
-  grep -q '^\[WADE-BEGIN\]' "$SMB_CONF" 2>/dev/null || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_DATADIR}" ]]    || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_CASESDIR}" ]]   || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_STAGINGDIR}" ]] || { echo ""; return; }
-  echo configured
-}
-
-run_step "samba" "configured" get_ver_samba '
-  set -e
-
-  # Ensure Samba packages (correct packages per family; no stray commands)
-  if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL samba samba-common-bin cifs-utils" >/dev/null 2>&1 || true
-  else
-    # RHEL/OL family uses samba-common-tools instead of -bin
-    bash -lc "$PKG_INSTALL samba samba-common-tools cifs-utils" >/dev/null 2>&1 || true
-  fi
-
-  SMB_CONF="/etc/samba/smb.conf"
-  install -d /etc/samba
-
-  # Seed minimal config if missing
-  if [[ ! -f "$SMB_CONF" ]]; then
-    cat >"$SMB_CONF"<<EOF
-[global]
-   workgroup = WORKGROUP
-   server string = WADE
-   security = user
-   map to guest = Bad User
-   dns proxy = no
-EOF
-  fi
-
-  [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
-
-  DATADIR="/home/${LWADEUSER}/${WADE_DATADIR}"
-  CASESDIR="/home/${LWADEUSER}/${WADE_CASESDIR}"
-  STAGINGDIR="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
-  mkdir -p "$DATADIR" "$CASESDIR" "$STAGINGDIR"
-  chown -R "${LWADEUSER}:${LWADEUSER}" "/home/${LWADEUSER}"
-  chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
-
-  HOSTS_DENY_LINE="   hosts deny = 0.0.0.0/0"
-  HOSTS_ALLOW_BLOCK=""
-  if [[ "${#ALLOW_NETS_ARR[@]}" -gt 0 ]]; then
-    HOSTS_ALLOW_BLOCK="   hosts allow ="
-    for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_ALLOW_BLOCK+=" ${n}"; done
-  fi
-  VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed "s/[[:space:]]//g")"
-
-  # Strip our managed block if present, then append new one
-  awk '"'"'BEGIN{skip=0} /^\[WADE-BEGIN\]/{skip=1;next} /^\[WADE-END\]/{skip=0;next} skip==0{print}'"'"' "$SMB_CONF" > "${SMB_CONF}.tmp" && mv "${SMB_CONF}.tmp" "$SMB_CONF"
-
-  cat >>"$SMB_CONF"<<EOF
-[WADE-BEGIN]
-[DataSources]
-   path = ${DATADIR}
-   read only = no
-   browsable = yes
-   public = no
-   guest ok = no
-   writable = yes
-   valid users = ${VALID_USERS}
-${HOSTS_ALLOW_BLOCK}
-${HOSTS_DENY_LINE}
-
-[Cases]
-   path = ${CASESDIR}
-   read only = no
-   browsable = yes
-   public = no
-   guest ok = no
-   writable = yes
-   valid users = ${VALID_USERS}
-${HOSTS_ALLOW_BLOCK}
-${HOSTS_DENY_LINE}
-
-[Staging]
-   path = ${STAGINGDIR}
-   read only = no
-   browsable = yes
-   public = no
-   guest ok = no
-   writable = yes
-   valid users = ${VALID_USERS}
-${HOSTS_ALLOW_BLOCK}
-${HOSTS_DENY_LINE}
-[WADE-END]
-EOF
-
-  if ! testparm -s >/dev/null 2>&1; then
-    echo "[!] testparm failed; restoring ${SMB_CONF}.bak"
-    cp -f "${SMB_CONF}.bak" "$SMB_CONF"
-    exit 1
-  fi
-
-  # Set Samba passwords
-  if [[ "$NONINTERACTIVE" -eq 0 ]]; then
-    if [[ -n "${SMB_ALL_PW:-}" ]]; then
-      # One password for everyone (from early prompt stack)
-      for u in "${SMBUSERS[@]}"; do
-        u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
-        ( printf "%s\n%s\n" "$SMB_ALL_PW" "$SMB_ALL_PW" ) | smbpasswd -s -a "$u" >/dev/null || true
-      done
-    else
-      # Prompt per user only if interactive and not already present in tdbsam
-      for u in "${SMBUSERS[@]}"; do
-        u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
-        if ! pdbedit -L | cut -d: -f1 | grep -qx "$u"; then
-          echo "[*] Set Samba password for $u"
-          while :; do
-            read -s -p "Password for $u: " sp1; echo
-            read -s -p "Confirm: " sp2; echo
-            [[ "$sp1" == "$sp2" && -n "$sp1" ]] && break
-            echo "Mismatch/empty. Try again."
-          done
-          ( printf "%s\n%s\n" "$sp1" "$sp1" ) | smbpasswd -s -a "$u" >/dev/null
-        fi
-      done
-    fi
-  fi
-
-  # Enable services
-  if systemctl list-unit-files | grep -q "^smbd\.service"; then
-    systemctl enable smbd --now
-    systemctl list-unit-files | grep -q "^nmbd\.service" && systemctl enable nmbd --now || true
-  elif systemctl list-unit-files | grep -q "^smb\.service"; then
-    systemctl enable smb --now
-    systemctl list-unit-files | grep -q "^nmb\.service" && systemctl enable nmb --now || true
-  fi
-
-  # Firewall
-  if [[ "$FIREWALL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
-    ufw allow Samba || true
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    systemctl enable firewalld --now || true
-    if [[ "${WADE_STRICT_FIREWALL:-0}" -eq 1 ]]; then
-      firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true
-      for n in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='"'"'ipv4'"'"' source address='"'"'${n}'"'"' service name='"'"'samba'"'"' accept" || true
-      done
-    else
-      firewall-cmd --permanent --add-service=samba || true
-      for n in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='"'"'ipv4'"'"' source address='"'"'${n}'"'"' service name='"'"'samba'"'"' accept" || true
-      done
-    fi
-    firewall-cmd --reload || true
-  fi
-' || fail_note "samba" "share setup failed"
-
-#####################################
-# Staging Service Install (venv-managed)
-#####################################
-
-VENV_DIR="/home/${LWADEUSER}/.venvs/wade"
-
-run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
-  set -e
-
-  # Load config if present (non-fatal)
-  . "'"${WADE_ETC}/wade.conf"'" 2>/dev/null || true
-  . "'"${WADE_ETC}/wade.env"'" 2>/dev/null || true
-
-  # 1) Install the daemon script
-  install -d -m 0755 /opt/wade
-  install -m 0755 "'"$STAGE_SRC"'" /opt/wade/stage_daemon.py
-
-  # 2) Create the WADE venv for the service (owned by the runtime user)
-  install -d -m 0755 "/home/'"${LWADEUSER}"'/.venvs"
-  python3 -m venv "'"$VENV_DIR"'"
-  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "'"$VENV_DIR"'"
-
-  # 3) Install deps into the venv (no system Python writes → PEP 668-safe)
-  "'"$VENV_DIR"'/bin/python" -m pip install -U pip setuptools wheel
-  "'"$VENV_DIR"'/bin/pip" install inotify-simple
-
-  # 4) Smoke test: verify all imports you listed resolve from the venv
-  "'"$VENV_DIR"'/bin/python" - <<'"'"'PY'"'"'
-import json, os, re, shutil, signal, sqlite3, subprocess, sys, time, string, uuid
+#!/usr/bin/env python3
+"""
+WADE Staging Daemon – v2.2 (content-dedupe + ETL host fix)
+
+New in v2.2:
+- Content-aware dedupe: quick sha256(head+tail)+size fingerprint to suppress
+  byte-identical duplicates (no more "__1" for same bytes). Stored as content_sig,
+  unique-indexed in SQLite, and checked before move + on name collisions.
+- ETL hostname colocation: when classifying windows_etl, try to infer hostname
+  from existing DataSources/Hosts/* so ETL logs land under the right host.
+
+Kept from v2.1:
+- Classifier registry, net-config detectors
+- VM disk & package detection (qcow2, vhdx, vmdk, vdi, vhd; ova/ovf)
+- Mountless OS hints (Linux/Windows/macOS)
+- E01 magic (EVF...) + ewfinfo acquisition date + target-info hostname
+- ETL guard so .etl is never considered memory
+- Inotify CLOSE_WRITE gating + size-stable + optional lsof writer check
+- Optional auto-defrag of fragmented E01 via ewfexport
+- Troubleshooting-friendly logs (file(1) one-liner + hex head)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import string
+import subprocess
+import sys
+import time
+import uuid
+import plistlib
+import requests
+from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
-from inotify_simple import INotify, flags
-import difflib
-print("WADE staging imports OK from", sys.executable)
-PY
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Any
 
-  # 5) Ensure logs/state + staging/share structure exists
-  install -d -m 0755 /var/wade/logs/stage /var/wade/state
-  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /var/wade
+# -----------------------------
+# Optional inotify
+# -----------------------------
+try:
+    from inotify_simple import INotify, flags
+    INOTIFY_AVAILABLE = True
+except Exception:
+    INOTIFY_AVAILABLE = False
 
-  STAGING_ROOT="/home/'"${LWADEUSER}"'/'"${WADE_STAGINGDIR}"'"
-  DATAS_ROOT="/home/'"${LWADEUSER}"'/'"${WADE_DATADIR}"'"
-  QUEUE_DIR="${WADE_QUEUE_DIR:-_queue}"
+# -----------------------------
+# Quick Whiff
+# -----------------------------
 
-  install -d -o "'"${LWADEUSER}"'" -g "'"${LWADEUSER}"'" -m 0755 \
-      "${STAGING_ROOT}/full" "${STAGING_ROOT}/light" \
-      "${DATAS_ROOT}/Hosts" "${DATAS_ROOT}/Network" "${DATAS_ROOT}/${QUEUE_DIR}"
+WHIFF_ENABLE = os.getenv("WHIFF_ENABLE", "1") in ("1","true","yes")
+WHIFF_URL = os.getenv("WHIFF_URL", "http://127.0.0.1:8088/annotate")
 
-  # 6) Systemd unit — explicitly run with the venv’s interpreter
-  cat >/etc/systemd/system/wade-staging.service <<EOF
-[Unit]
-Description=WADE Staging Daemon (full vs light)
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=/opt/wade/stage_daemon.py
+def whiff_annotate(ev: dict) -> dict:
+    if not WHIFF_ENABLE: return {}
+    try:
+        r = requests.post(WHIFF_URL, json={"event": ev}, timeout=3)
+        return r.json().get("help", {})
+    except Exception:
+        return {"summary":"Whiff unavailable","next_steps":[],"mitre":[],"refs":[],"confidence":0.0}
 
-[Service]
-Type=simple
-User=${LWADEUSER}
-Group=${LWADEUSER}
-# If your Splunk UF runs as another user and needs to read outputs, consider:
-# SupplementaryGroups=splunk
-EnvironmentFile=-/etc/wade/wade.env
-Environment=PYTHONUNBUFFERED=1
-WorkingDirectory=/opt/wade
-ExecStart=${VENV_DIR}/bin/python /opt/wade/stage_daemon.py
-Restart=on-failure
-RestartSec=3
-UMask=002
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=false
-ReadWritePaths=/home/${LWADEUSER} /var/wade
+# -----------------------------
+# Configuration
+# -----------------------------
+WADE_ENV = Path("/etc/wade/wade.env")
+DEFAULT_OWNER = "autopsy"
+DEFAULT_DATADIR = "DataSources"
+DEFAULT_STAGINGDIR = "Staging"
 
-[Install]
-WantedBy=multi-user.target
-EOF
+SCAN_INTERVAL_SEC = int(os.getenv("WADE_STAGE_SCAN_INTERVAL", "30"))
+STABLE_SECONDS = int(os.getenv("WADE_STAGE_STABLE_SECONDS", "60"))  # safer default
+REQUIRE_CLOSE_WRITE = os.getenv("WADE_STAGE_REQUIRE_CLOSE_WRITE", "1") == "1"
+VERIFY_NO_WRITERS = os.getenv("WADE_STAGE_VERIFY_NO_WRITERS", "1") == "1"
 
-  # 7) Enable & start
-  systemctl daemon-reload
-  systemctl enable --now wade-staging.service
+HEAD_SCAN_BYTES = int(os.getenv("WADE_STAGE_HEAD_SCAN_BYTES", str(1024 * 1024)))
+TEXT_SNIFF_BYTES = int(os.getenv("WADE_STAGE_TEXT_SNIFF_BYTES", str(128 * 1024)))
+TEXT_MIN_PRINTABLE_RATIO = float(os.getenv("WADE_STAGE_TEXT_MIN_PRINTABLE_RATIO", "0.92"))
 
-  # 8) Version marker (lets your idempotency skip next run)
-  sha256sum /opt/wade/stage_daemon.py | awk '"'"'{print $1}'"'"' > "'"${STEPS_DIR}/wade-stage.ver"'"
+HEX_PREVIEW_BYTES = int(os.getenv("WADE_STAGE_HEX_PREVIEW_BYTES", "32"))
 
-  # Optional: freeze for reproducibility alongside your repo
-  install -d -m 0755 /home/'"${LWADEUSER}"'/WADE 2>/dev/null || true
-  "'"$VENV_DIR"'/bin/pip" freeze > /home/'"${LWADEUSER}"'/WADE/requirements.lock || true
-' || fail_note "wade-stage" "service install/start failed"
+WADE_STAGE_RECURSIVE = os.getenv("WADE_STAGE_RECURSIVE", "0") == "1"
 
-#####################################
-# pipx tools: volatility3 + dissect
-#####################################
-run_step "pipx-vol3" "installed" get_ver_pipx_vol3 '
-  set -e
-  export PIPX_HOME=/opt/pipx
-  export PIPX_BIN_DIR=/usr/local/bin
-  mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
+SMALL_FILE_BYTES = int(os.getenv("WADE_STAGE_SMALL_FILE_BYTES", str(2 * 1024 * 1024)))  # 2MiB
+SMALL_FILE_STABLE = int(os.getenv("WADE_STAGE_SMALL_FILE_STABLE", "5"))
 
-  if ! command -v pipx >/dev/null 2>&1; then
-    if [[ "$PM" == "apt" ]]; then
-      bash -lc "$PKG_UPDATE"
-      bash -lc "$PKG_INSTALL pipx"
-    else
-      python3 -m pip install --upgrade pip || true
-      python3 -m pip install pipx || true
-    fi
-  fi
+SIG_SAMPLE_BYTES = int(os.getenv("WADE_SIG_SAMPLE_BYTES", str(4 * 1024 * 1024)))  # 4MiB head+tail
 
-  python3 -m pipx ensurepath || true
-  pipx install volatility3 || pipx upgrade volatility3
-' || fail_note "pipx-vol3" "install failed"
+# -----------------------------
+# Globals
+# -----------------------------
+STATE_DIR: Path
+LOG_ROOT: Path
+SQLITE_DB: Path
+STAGING_ROOT: Optional[Path] = None
+FRAGMENT_LOG: Optional[Path] = None
 
-run_step "pipx-dissect" "installed" get_ver_pipx_dissect '
-  set -e
-  export PIPX_HOME=/opt/pipx
-  export PIPX_BIN_DIR=/usr/local/bin
-  mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
+# -----------------------------
+# Magic DB
+# -----------------------------
+def _sig(offset: int, blob: bytes) -> Tuple[int, bytes]:
+    return (offset, blob)
 
-  if ! command -v pipx >/dev/null 2>&1; then
-    if [[ "$PM" == "apt" ]]; then
-      bash -lc "$PKG_UPDATE"
-      bash -lc "$PKG_INSTALL pipx"
-    else
-      python3 -m pip install --upgrade pip || true
-      python3 -m pip install pipx || true
-    fi
-  fi
-
-  python3 -m pipx ensurepath || true
-  pipx install "dissect[cli]" --include-deps || pipx upgrade "dissect[cli]"
-' || fail_note "pipx-dissect" "install failed"
-
-run_step "vol3-runtime" "ready" 'get_mark_ver vol3-runtime' '
-  set -e
-
-  # Safe defaults inside the subshell too (defend against set -u and --only runs)
-  : "${VOL3_BASE_DIR:=/var/wade/vol3}"
-  : "${VOL3_SYMBOLS_DIR:=${VOL3_BASE_DIR}/symbols}"
-  : "${VOL3_CACHE_DIR:=${VOL3_BASE_DIR}/cache}"
-  : "${VOL3_PLUGIN_DIR:=${VOL3_BASE_DIR}/plugins}"
-  : "${LWADEUSER:=autopsy}"
-
-  install -d -m 2775 "$VOL3_SYMBOLS_DIR" "$VOL3_CACHE_DIR" "$VOL3_PLUGIN_DIR"
-  chown -R "$LWADEUSER:$LWADEUSER" "$VOL3_BASE_DIR" || true
-
-  # Locate vol (ensure pipx step ran, or fail clearly)
-  VOL_BIN="$(command -v vol || true)"
-  [[ -x "$VOL_BIN" ]] || { echo "vol not found; run with --only=pipx-vol3,vol3-runtime or full install"; exit 1; }
-
-  # Wrapper that forces writable symbols/cache/plugin dirs
-  cat >/usr/local/bin/vol3 <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-SYMDIR="${VOL3_SYMBOLS_DIR:-/var/wade/vol3/symbols}"
-CACHEDIR="${VOL3_CACHE_DIR:-/var/wade/vol3/cache}"
-PLUGDIR="${VOL3_PLUGIN_DIR:-/var/wade/vol3/plugins}"
-exec vol \
-  --cache-path "$CACHEDIR" \
-  --plugin-dirs "$PLUGDIR" \
-  -s "$SYMDIR" \
-  "$@"
-EOF
-  chmod 0755 /usr/local/bin/vol3
-
-  echo "$(date -Iseconds)" > "${STEPS_DIR}/vol3-runtime.ver"
-' || fail_note "vol3-runtime" "wrapper/setup failed"
-
-#####################################
-# Mandiant capa (engine)
-#####################################
-run_step "capa" "${CAPA_VERSION:-}" get_ver_capa '
-  set -e
-  : "${WADE_CAPA_VENV:=/opt/wade/venvs/capa}"
-
-  # Pre-reqs
-  if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL python3-venv python3-pip git ca-certificates zip p7zip-full"
-  else
-    bash -lc "$PKG_INSTALL python3 python3-virtualenv git ca-certificates zip" || true
-    bash -lc "$PKG_INSTALL p7zip p7zip-plugins" || true
-  fi
-
-  # venv
-  install -d "$(dirname "$WADE_CAPA_VENV")"
-  [[ -x "$WADE_CAPA_VENV/bin/python" ]] || python3 -m venv "$WADE_CAPA_VENV"
-  "$WADE_CAPA_VENV/bin/python" -m pip install -U pip wheel setuptools >/dev/null 2>&1 || true
-
-  # Correct package is flare-capa (provides "capa" CLI)
-  PKG="flare-capa"
-  [[ -n "${CAPA_VERSION:-}" ]] && PKG="flare-capa==${CAPA_VERSION}"
-
-  WHEEL_DIR=""
-  if [[ -d "${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels" ]]; then
-    WHEEL_DIR="${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels"
-  elif [[ "${OFFLINE:-0}" == "1" && -d "${OFFLINE_SRC:-}/pipwheels" ]]; then
-    WHEEL_DIR="${OFFLINE_SRC}/pipwheels"
-  fi
-
-  if [[ -n "$WHEEL_DIR" ]]; then
-    "$WADE_CAPA_VENV/bin/pip" install --no-index --find-links "$WHEEL_DIR" "$PKG"
-  else
-    "$WADE_CAPA_VENV/bin/pip" install "$PKG"
-  fi
-
-  install -d /usr/local/bin
-  ln -sf "$WADE_CAPA_VENV/bin/capa" /usr/local/bin/capa
-
-  /usr/local/bin/capa --version >/dev/null 2>&1 || { echo "capa not runnable"; exit 1; }
-' || fail_note "capa" "engine install failed"
-
-#####################################
-# Mandiant capa-rules (repo or tarball)
-#####################################
-run_step "capa-rules" "${WADE_CAPA_RULES_COMMIT:-}" get_ver_capa_rules '
-  set -e
-  : "${WADE_CAPA_RULES_DIR:=/opt/capa-rules}"
-  : "${WADE_CAPA_RULES_COMMIT:=}"
-
-  install -d /opt
-  if [[ -f "${WADE_PKG_DIR:-/var/wade/pkg}/capa-rules.tar.gz" ]]; then
-    echo "[*] Using offline rules from ${WADE_PKG_DIR}/capa-rules.tar.gz"
-    rm -rf "$WADE_CAPA_RULES_DIR.tmp" "$WADE_CAPA_RULES_DIR"
-    mkdir -p "$WADE_CAPA_RULES_DIR.tmp"
-    tar -xzf "${WADE_PKG_DIR}/capa-rules.tar.gz" -C "$WADE_CAPA_RULES_DIR.tmp" --strip-components=1
-    mv "$WADE_CAPA_RULES_DIR.tmp" "$WADE_CAPA_RULES_DIR"
-  elif [[ "${OFFLINE:-0}" == "1" && -f "${OFFLINE_SRC:-}/capa-rules.tar.gz" ]]; then
-    echo "[*] Using offline rules from ${OFFLINE_SRC}/capa-rules.tar.gz"
-    rm -rf "$WADE_CAPA_RULES_DIR.tmp" "$WADE_CAPA_RULES_DIR"
-    mkdir -p "$WADE_CAPA_RULES_DIR.tmp"
-    tar -xzf "${OFFLINE_SRC}/capa-rules.tar.gz" -C "$WADE_CAPA_RULES_DIR.tmp" --strip-components=1
-    mv "$WADE_CAPA_RULES_DIR.tmp" "$WADE_CAPA_RULES_DIR"
-  else
-    if [[ -d "$WADE_CAPA_RULES_DIR/.git" ]]; then
-      git -C "$WADE_CAPA_RULES_DIR" pull --ff-only || true
-    else
-      rm -rf "$WADE_CAPA_RULES_DIR"
-      git clone --depth=1 https://github.com/mandiant/capa-rules "$WADE_CAPA_RULES_DIR"
-    fi
-    if [[ -n "$WADE_CAPA_RULES_COMMIT" ]]; then
-      git -C "$WADE_CAPA_RULES_DIR" fetch --depth=1 origin "$WADE_CAPA_RULES_COMMIT" || true
-      git -C "$WADE_CAPA_RULES_DIR" checkout -q "$WADE_CAPA_RULES_COMMIT" || true
-    fi
-  fi
-
-  chown -R root:root "$WADE_CAPA_RULES_DIR" && chmod -R a+rX "$WADE_CAPA_RULES_DIR"
-
-  # Export for shells/tools
-  cat >/etc/profile.d/wade-capa.sh <<EOF
-export WADE_CAPA_RULES="${WADE_CAPA_RULES_DIR}"
-EOF
-  chmod 0644 /etc/profile.d/wade-capa.sh
-
-  # Handy updater (for online use)
-  cat >/usr/local/sbin/update-capa-rules <<'"'"'EOF'"'"'
-#!/usr/bin/env bash
-set -euo pipefail
-RULES_DIR="${WADE_CAPA_RULES:-/opt/capa-rules}"
-if [[ -d "$RULES_DIR/.git" ]]; then
-  git -C "$RULES_DIR" pull --ff-only
-else
-  echo "capa-rules is not a git repo (likely from tarball). Replace ${RULES_DIR} to update."
-fi
-EOF
-  chmod 0755 /usr/local/sbin/update-capa-rules
-
-  # Smoke check: have rules?
-  n=$(find "$WADE_CAPA_RULES_DIR" -type f -name "*.yml" 2>/dev/null | wc -l | tr -d " ")
-  [[ "${n:-0}" -gt 0 ]] || { echo "no rules found"; exit 1; }
-' || fail_note "capa-rules" "rules install failed"
-
-#####################################
-# WADE Malware Extractor (CLI)
-#####################################
-run_step "wade-mw-extractor" "${MWEX_EXPECT_SHA}" get_ver_wade_mwex '
-  set -e
-
-  # Install script & dirs
-  install -d -m 0755 /opt/wade /var/wade/logs/malware
-  install -m 0755 "'"$MWEX_SRC"'" /opt/wade/wade_mw_extract.py
-
-  # Lightweight wrapper in PATH (passes through args)
-  cat >/usr/local/bin/wade-mw-extract <<'"'"'EOF'"'"'
-#!/usr/bin/env bash
-set -euo pipefail
-# Default capa rules for convenience; user can override per-invocation
-export WADE_CAPA_RULES="${WADE_CAPA_RULES:-/opt/capa-rules}"
-exec /usr/bin/env python3 /opt/wade/wade_mw_extract.py "$@"
-EOF
-  chmod 0755 /usr/local/bin/wade-mw-extract
-
-  # Sanity hints (non-fatal)
-  command -v target-fs >/dev/null 2>&1     || echo "[WARN] Dissect CLI (target-fs) not found; disk mode unavailable."
-  command -v vol >/dev/null 2>&1 || command -v volatility3 >/dev/null 2>&1 \
-                                         || echo "[WARN] Volatility 3 not found; memory mode unavailable."
-  command -v capa >/dev/null 2>&1          || echo "[WARN] capa not found; capability analysis disabled."
-  command -v 7zz >/dev/null 2>&1 || command -v zip >/dev/null 2>&1 \
-                                         || echo "[WARN] Neither 7zz nor zip in PATH; passworded ZIPs unavailable."
-
-  sha256sum /opt/wade/wade_mw_extract.py | awk "{print \$1}" > "'"${STEPS_DIR}/wade-mw-extractor.ver"'"
-' || fail_note "wade-mw-extractor" "install failed"
-
-
-#####################################
-# Helpers for packages & hayabusa arch
-#####################################
-fetch_pkg(){
-  local sub="$1" file="$2"
-  local local_pkg="${WADE_PKG_DIR}/${sub}/${file}"
-  if [[ -f "$local_pkg" ]]; then cp "$local_pkg" .; return 0; fi
-  if [[ "$OFFLINE" == "1" ]]; then
-    local off="${OFFLINE_SRC}/${sub}/${file}"
-    [[ -f "$off" ]] && { cp "$off" .; return 0; }
-  fi
-  return 1
-}
-detect_hayabusa_arch(){
-  local arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) echo "lin-x64-gnu" ;;
-    aarch64|arm64) echo "lin-aarch64-gnu" ;;
-    *) echo "lin-x64-gnu" ;;
-  esac
+MAGIC_DB: Dict[str, Tuple[Tuple[int, bytes], ...]] = {
+    # EWF/E01: begins with EVF 09 0D 0A FF 00 ...
+    "ewf": (_sig(0, b"EVF"),),
+    # Disks
+    "ntfs": (_sig(3, b"NTFS    "),),
+    "fat32": (_sig(0x52, b"FAT32   "),),
+    "gpt": (_sig(512, b"EFI PART"),),
+    "mbr": (_sig(510, b"\x55\xaa"),),
+    # VM disk formats
+    "qcow": (_sig(0, b"QFI\xfb"),),
+    "vhdx": (_sig(0x200, b"vhdxfile"),),
+    "vmdk": (_sig(0, b"KDMV"),),           # streamOptimized/sparse header
+    "vdi":  (_sig(0, b"\x7fVDI"),),
+    # Tar/OVA (ustar)
+    "tar_ustar": (_sig(257, b"ustar"),),
 }
 
-#####################################
-# Volatility3 symbol packs (soft-fail)
-#####################################
-if [[ "${MOD_VOL_SYMBOLS_ENABLED:-1}" == "1" ]]; then
-run_step "vol3-symbols" "current" 'get_mark_ver vol3-symbols' '
-  set -e
-  mkdir -p "'"${VOL3_SYMBOLS_DIR}"'"
-
-  # Pull the official prebuilt packs when online, or use offline cache if present
-  for z in windows.zip mac.zip linux.zip; do
-    test -f "'"${VOL3_SYMBOLS_DIR}"'/$z" && continue
-    fetch_pkg "volatility3/symbols" "$z" || curl -L "https://downloads.volatilityfoundation.org/volatility3/symbols/${z}" -o "$z"
-    cp -f "$z" "'"${VOL3_SYMBOLS_DIR}"'/"
-  done
-
-  # Ownership so your primary operator can add symbols later
-  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "'"${VOL3_SYMBOLS_DIR}"'" || true
-
-  echo "$(date -Iseconds)" > "${STEPS_DIR}/vol3-symbols.ver"
-' || fail_note "volatility_symbols" "download/verify failed"
-fi
-
-#####################################
-# bulk_extractor (source build; soft-fail)
-#####################################
-if [[ "${MOD_BULK_EXTRACTOR_ENABLED:-1}" == "1" ]]; then
-run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_be '
-  set -e
-  echo "[*] Installing bulk_extractor from source…"
-  BE_PREFIX="${WADE_TOOLS_DIR:-/opt/wade/tools.d}/bulk_extractor"
-  mkdir -p "$BE_PREFIX" /var/tmp/wade/build
-  BUILD_DIR="$(mktemp -d /var/tmp/wade/build/be.XXXXXX)"
-
-  if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL --no-install-recommends \
-      git ca-certificates build-essential autoconf automake libtool pkg-config \
-      flex bison libewf-dev libssl-dev zlib1g-dev libxml2-dev libexiv2-dev \
-      libtre-dev libsqlite3-dev libpcap-dev libre2-dev libpcre3-dev libexpat1-dev" || true
-  else
-    if have_cmd dnf; then
-      dnf -y groupinstall "Development Tools" || true
-    else
-      yum -y groupinstall "Development Tools" || true
-    fi
-    bash -lc "$PKG_INSTALL \
-      git ca-certificates libewf-devel openssl-devel zlib-devel libxml2-devel \
-      exiv2-devel tre-devel sqlite-devel libpcap-devel re2-devel pcre-devel \
-      expat-devel flex bison" || true
-  fi
-
-  OFFLINE_TGZ="${WADE_PKG_DIR:-/var/wade/pkg}/bulk_extractor/bulk_extractor-src.tar.gz"
-  BE_GIT_REF="${BE_GIT_REF:-master}"
-
-  pushd "$BUILD_DIR" >/dev/null
-  if [[ "$OFFLINE" == "1" && -f "$OFFLINE_TGZ" ]]; then
-    echo "[*] Using offline bulk_extractor source tarball: $OFFLINE_TGZ"
-    tar -xzf "$OFFLINE_TGZ"
-    [[ -d bulk_extractor ]] || { echo "bulk_extractor folder not found in tarball"; exit 1; }
-    cd bulk_extractor
-  else
-    echo "[*] Cloning bulk_extractor (with submodules)…"
-    git clone --recurse-submodules https://github.com/simsong/bulk_extractor.git
-    cd bulk_extractor
-    [[ "$BE_GIT_REF" != "master" ]] && git checkout "$BE_GIT_REF" || true
-    git submodule update --init --recursive
-  fi
-
-  ./bootstrap.sh || true
-  ./configure --prefix="$BE_PREFIX"
-  make -j"$(nproc)"
-  make install
-
-  install -d /usr/local/bin
-  ln -sf "$BE_PREFIX/bin/bulk_extractor" /usr/local/bin/bulk_extractor
-  /usr/local/bin/bulk_extractor -V >/dev/null 2>&1 || { echo "version check failed"; exit 1; }
-
-  popd >/dev/null
-  rm -rf "$BUILD_DIR"
-' || fail_note "bulk_extractor" "build/install failed (see ${LOG_FILE})"
-fi
-
-#####################################
-# Qt/GL runtime libs (for Piranha/Barracuda UIs; apt branch)
-#####################################
-if [[ "$PM" == "apt" && ( "${MOD_PIRANHA_ENABLED:-1}" == "1" || "${MOD_BARRACUDA_ENABLED:-1}" == "1" ) ]]; then
-run_step "qtgl-runtime" "present" get_ver_qtgl '
-  set -e
-  bash -lc "$PKG_INSTALL \
-    libegl1 libopengl0 libgl1 libxkbcommon-x11-0 \
-    libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
-    libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1 \
-    libxcb-cursor0 \
-    fonts-dejavu-core"
-' || fail_note "qtgl-runtime" "Qt/GL libs missing"
-
-#####################################
-# SSH X11 forwarding (server-side GUI over ssh -X)
-#####################################
-get_ver_x11fwd(){
-  if [[ "$PM" == "apt" ]]; then
-    dpkg -s xauth >/dev/null 2>&1 || { echo ""; return; }
-  else
-    rpm -q xorg-x11-xauth >/dev/null 2>&1 || rpm -q xauth >/dev/null 2>&1 || { echo ""; return; }
-  fi
-  grep -qiE '^\s*X11Forwarding\s+yes' /etc/ssh/sshd_config && echo configured || echo ""
-}
-
-run_step "x11-forwarding" "configured" get_ver_x11fwd '
-  set -e
-  if [[ "$PM" == "apt" ]]; then
-    bash -lc "$PKG_INSTALL xauth x11-apps"
-  else
-    bash -lc "$PKG_INSTALL xorg-x11-xauth || $PKG_INSTALL xauth || true"
-  fi
-
-  sed -ri "s/^\s*#?\s*X11Forwarding.*/X11Forwarding yes/" /etc/ssh/sshd_config
-  if grep -qiE "^\s*X11UseLocalhost" /etc/ssh/sshd_config; then
-    sed -ri "s/^\s*#?\s*X11UseLocalhost.*/X11UseLocalhost yes/" /etc/ssh/sshd_config
-  else
-    echo "X11UseLocalhost yes" >> /etc/ssh/sshd_config
-  fi
-  if ! grep -qiE "^\s*X11DisplayOffset" /etc/ssh/sshd_config; then
-    echo "X11DisplayOffset 10" >> /etc/ssh/sshd_config
-  fi
-
-  systemctl restart ssh || systemctl restart sshd || true
-
-  su - "${LWADEUSER}" -c "mkdir -p ~/.config/matplotlib; touch ~/.Xauthority; chmod 600 ~/.Xauthority" || true
-' || fail_note "x11-forwarding" "setup failed"
-
-fi
-
-#####################################
-# Piranha (install only; GUI via ssh -X, no systemd)
-#####################################
-get_ver_piranha(){ [[ -x /usr/local/bin/piranha && -d /opt/piranha/.venv && -f /opt/piranha/piranha.py ]] && echo installed || echo ""; }
-
-if [[ "${MOD_PIRANHA_ENABLED:-1}" == "1" ]]; then
-run_step "piranha" "installed" get_ver_piranha '
-  set -e
-  install -d /opt/piranha /var/log/wade/piranha
-  chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha /var/log/wade/piranha
-
-  install -d /opt/piranha/Documents/PiranhaLogs
-  chown -R "${LWADEUSER}:${LWADEUSER}" /opt/piranha/Documents
-  ln -sf /var/log/wade/piranha/APT_Report.log /opt/piranha/Documents/PiranhaLogs/APT_Report.log || true
-
-  if [[ "$OFFLINE" == "1" ]]; then
-    PKG_ARC="$(ls "${WADE_PKG_DIR}/piranha/"piranha*.tar.gz "${WADE_PKG_DIR}/piranha/"piranha*.zip 2>/dev/null | head -1 || true)"
-    [[ -n "$PKG_ARC" ]] || { echo "offline Piranha archive missing"; exit 1; }
-    cp "$PKG_ARC" /opt/piranha/
-    pushd /opt/piranha >/dev/null
-    [[ "$PKG_ARC" == *.zip ]] && unzip -o "$(basename "$PKG_ARC")" || tar -xzf "$(basename "$PKG_ARC")"
-    popd >/dev/null
-  else
-    if [[ ! -d /opt/piranha/.git ]]; then
-      rm -rf /opt/piranha/*
-      git clone https://github.com/williamjsmail/piranha /opt/piranha
-    fi
-  fi
-
-  [[ -f /opt/piranha/piranha.py ]] || { echo "Piranha sources missing under /opt/piranha"; exit 1; }
-
-  python3 -m venv /opt/piranha/.venv || python3 -m virtualenv /opt/piranha/.venv
-  /opt/piranha/.venv/bin/pip install --upgrade pip
-  [[ -f /opt/piranha/requirements.txt ]] && /opt/piranha/.venv/bin/pip install -r /opt/piranha/requirements.txt || true
-
-  FEIX="$(ls "$LOAD_PATCH_DIR"/*patch.py 2>/dev/null | sort -V | tail -1)"
-  if [[ -n "$FEIX" ]]; then
-    rm -f /opt/piranha/backend/loader.py
-    cp "$FEIX" /opt/piranha/backend/loader.py || true
-  fi
-
-  echo 'exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"' > /usr/local/bin/piranha
-  chmod 0755 /usr/local/bin/piranha
-  chown "${LWADEUSER}:${LWADEUSER}" /usr/local/bin/piranha || true
-' || fail_note "piranha" "setup failed"
-fi
-
-#####################################
-# Barracuda (soft-fail; fetch MITRE JSON; cd wrapper; absolute JSON path)
-#####################################
-get_ver_barracuda(){
-  [[ -x /usr/local/bin/barracuda && -d /opt/barracuda/.venv ]] || { echo ""; return; }
-  [[ -f /opt/barracuda/enterprise-attack.json ]] && echo installed || echo ""
-}
-if [[ "${MOD_BARRACUDA_ENABLED:-1}" == "1" ]]; then
-run_step "barracuda" "installed" get_ver_barracuda '
-  set -e
-  install -d /opt/barracuda
-  if [[ "$OFFLINE" == "1" ]]; then
-    PKG_ARC="$(ls "${WADE_PKG_DIR}/barracuda/"barracuda*.tar.gz "${WADE_PKG_DIR}/barracuda/"barracuda*.zip 2>/dev/null | head -1 || true)"
-    [[ -n "$PKG_ARC" ]] || { echo "offline Barracuda archive missing"; exit 1; }
-    cp "$PKG_ARC" /opt/barracuda/
-    pushd /opt/barracuda >/dev/null
-    [[ "$PKG_ARC" == *.zip ]] && unzip -o "$(basename "$PKG_ARC")" || tar -xzf "$(basename "$PKG_ARC")"
-    popd >/dev/null
-  else
-    [[ -d /opt/barracuda/.git ]] || git clone https://github.com/williamjsmail/Barracuda /opt/barracuda || true
-  fi
-
-  python3 -m venv /opt/barracuda/.venv || python3 -m virtualenv /opt/barracuda/.venv
-  /opt/barracuda/.venv/bin/pip install --upgrade pip
-  [[ -f /opt/barracuda/requirements.txt ]] && /opt/barracuda/.venv/bin/pip install -r /opt/barracuda/requirements.txt || true
-
-  if [[ ! -f /opt/barracuda/enterprise-attack.json ]]; then
-    if [[ -f "${WADE_PKG_DIR}/mitre/enterprise-attack.json" ]]; then
-      cp "${WADE_PKG_DIR}/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
-    elif [[ "$OFFLINE" == "1" && -f "${OFFLINE_SRC}/mitre/enterprise-attack.json" ]]; then
-      cp "${OFFLINE_SRC}/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
-    else
-      curl -fsSL https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json \
-        -o /opt/barracuda/enterprise-attack.json
-    fi
-  fi
-
-  sed -i -E \
-    '\''s|load_techniques_enriched\("enterprise-attack\.json"\)|load_techniques_enriched("/opt/barracuda/enterprise-attack.json")|'\'' \
-    /opt/barracuda/app.py || true
-
-  install -d -o autopsy -g autopsy -m 0750 /opt/barracuda/uploads
-
-  cat >/usr/local/bin/barracuda <<'\''EOF'\''
-#!/usr/bin/env bash
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
-cd /opt/barracuda
-exec /opt/barracuda/.venv/bin/python /opt/barracuda/app.py "$@"
-EOF
-  chmod 0755 /usr/local/bin/barracuda
-
-  cat >/etc/systemd/system/barracuda.service <<EOF
-[Unit]
-Description=WADE Barracuda (DFIR helper)
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=/opt/barracuda/.venv/bin/python
-ConditionPathExists=/opt/barracuda/app.py
-
-[Service]
-Type=simple
-User=${LWADEUSER}
-Group=${LWADEUSER}
-WorkingDirectory=/opt/barracuda
-EnvironmentFile=-/etc/wade/wade.env
-Environment=PYTHONUNBUFFERED=1
-Environment=QT_QPA_PLATFORM=offscreen
-ExecStart=/opt/barracuda/.venv/bin/python /opt/barracuda/app.py
-Restart=on-failure
-RestartSec=5s
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now barracuda.service || true
-' || fail_note "barracuda" "setup failed"
-fi
-
-#####################################
-# Hayabusa (robust extract; soft-fail)
-#####################################
-if [[ "${MOD_HAYABUSA_ENABLED:-1}" == "1" ]]; then
-run_step "hayabusa" "" get_ver_hayabusa '
-  set -e
-  echo "[*] Installing Hayabusa…"
-  install -d "$(dirname "${HAYABUSA_DEST}")"
-
-  HAY_ARCH="${HAY_ARCH:-$(detect_hayabusa_arch)}"
-  HAY_ZIP=""
-  HAY_ZIP_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa/"hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
-
-  if [[ -n "$HAY_ZIP_LOCAL" ]]; then
-    cp "$HAY_ZIP_LOCAL" .
-    HAY_ZIP="$(basename "$HAY_ZIP_LOCAL")"
-  elif [[ "$OFFLINE" == "1" ]]; then
-    HAY_ZIP_USB="$(ls "${OFFLINE_SRC}/hayabusa/"hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
-    [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '${HAY_ARCH:-}' not found offline"; exit 1; }
-    cp "$HAY_ZIP_USB" .
-    HAY_ZIP="$(basename "$HAY_ZIP_USB")"
-  else
-    if have_cmd curl && have_cmd jq; then
-      echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
-      DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
-        | jq -r --arg pat "${HAY_ARCH:-}" ".assets[] | select(.name | test(\$pat)) | .browser_download_url" | head -1)"
-      [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH:-}"; exit 1; }
-      HAY_ZIP="$(basename "$DL_URL")"
-      curl -L "$DL_URL" -o "$HAY_ZIP"
-    else
-      echo "curl/jq required to auto-fetch Hayabusa online"; exit 1
-    fi
-  fi
-
-  TMPDIR="$(mktemp -d)"; cleanup(){ rm -rf "$TMPDIR"; }; trap cleanup EXIT
-  unzip -qo "$HAY_ZIP" -d "$TMPDIR"
-
-  HAY_BIN_PATH="$(find "$TMPDIR" -type f \( -name "hayabusa" -o -name "hayabusa-*" \) ! -path "*/rules/*" ! -path "*/config/*" | head -1 || true)"
-  if [[ -z "$HAY_BIN_PATH" ]]; then
-    echo "Hayabusa binary not found in ${HAY_ZIP}. Contents:"; find "$TMPDIR" -maxdepth 3 -type f -printf "  %P\n"; exit 1
-  fi
-
-  install -m 0755 "$HAY_BIN_PATH" "${HAYABUSA_DEST}"
-  echo "[+] Installed Hayabusa to ${HAYABUSA_DEST}"
-
-  install -d -m 0755 "${HAYABUSA_RULES_DIR}"
-  [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules/"*  "${HAYABUSA_RULES_DIR}/"; echo "[+] Copied Hayabusa rules → ${HAYABUSA_RULES_DIR}"; }
-  [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config"    /etc/wade/hayabusa/;     echo "[+] Copied Hayabusa config → /etc/wade/hayabusa/"; }
-
-  [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules"  /usr/local/bin/; echo "[+] Copied Hayabusa rules/ to /usr/local/bin/rules"; }
-  [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config" /usr/local/bin/; echo "[+] Copied Hayabusa config/ to /usr/local/bin/config"; }
-
-  "${HAYABUSA_DEST}" --help >/dev/null 2>&1 || { echo "Hayabusa post-install test failed"; exit 1; }
-' || fail_note "hayabusa" "binary/rules copy failed"
-fi
-
-#####################################
-# ZooKeeper (pinned; soft-fail)
-#####################################
-run_step "zookeeper" "${ZOOKEEPER_VER}" get_ver_zk '
-  set -e
-  ZOOKEEPER_TGZ="apache-zookeeper-${ZOOKEEPER_VER}-bin.tar.gz"
-  fetch_pkg zookeeper "$ZOOKEEPER_TGZ" || curl -L "https://archive.apache.org/dist/zookeeper/zookeeper-${ZOOKEEPER_VER}/${ZOOKEEPER_TGZ}" -o "$ZOOKEEPER_TGZ"
-  [[ -f "$ZOOKEEPER_TGZ" ]] || { echo "ZooKeeper tarball missing"; exit 1; }
-  id zookeeper >/dev/null 2>&1 || useradd --system -s /usr/sbin/nologin zookeeper
-  mkdir -p /opt/zookeeper /var/lib/zookeeper
-  tar -xzf "$ZOOKEEPER_TGZ" -C /opt/zookeeper --strip-components 1
-  cat >/opt/zookeeper/conf/zoo.cfg <<'"'"'EOF'"'"'
-tickTime=2000
-dataDir=/var/lib/zookeeper
-clientPort=2181
-maxClientCnxns=60
-4lw.commands.whitelist=mntr,conf,ruok
-EOF
-  chown -R zookeeper:zookeeper /opt/zookeeper /var/lib/zookeeper
-  cat >/etc/systemd/system/zookeeper.service <<'"'"'EOF'"'"'
-[Unit]
-Description=Zookeeper Daemon
-After=network.target
-[Service]
-Type=forking
-WorkingDirectory=/opt/zookeeper
-User=zookeeper
-Group=zookeeper
-ExecStart=/opt/zookeeper/bin/zkServer.sh start /opt/zookeeper/conf/zoo.cfg
-ExecStop=/opt/zookeeper/bin/zkServer.sh stop /opt/zookeeper/conf/zoo.cfg
-ExecReload=/opt/zookeeper/bin/zkServer.sh restart /opt/zookeeper/conf/zoo.cfg
-TimeoutSec=30
-Restart=on-failure
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload; systemctl enable zookeeper --now
-' || fail_note "zookeeper" "install/config failed"
-
-#####################################
-# Solr (pinned; soft-fail)
-#####################################
-run_step "solr" "${SOLR_VER}" get_ver_solr '
-  set -e
-  SOLR_TGZ="solr-${SOLR_VER}.tgz"
-  fetch_pkg solr "$SOLR_TGZ" || curl -L "https://archive.apache.org/dist/lucene/solr/${SOLR_VER}/${SOLR_TGZ}" -o "$SOLR_TGZ"
-  [[ -f "$SOLR_TGZ" ]] || { echo "Solr tgz missing"; exit 1; }
-  tar -xvzf "$SOLR_TGZ" "solr-${SOLR_VER}/bin/install_solr_service.sh" --strip-components=2
-  bash ./install_solr_service.sh "$SOLR_TGZ"
-  IPV4=$(hostname -I 2>/dev/null | awk '"'"'{print $1}'"'"')
-  sed -i "s/^#\?SOLR_HEAP=.*/SOLR_HEAP=\"${SOLR_HEAP}\"/" /etc/default/solr.in.sh
-  sed -i "s|^#\?SOLR_JAVA_MEM=.*|SOLR_JAVA_MEM=\"${SOLR_JAVA_MEM}\"|" /etc/default/solr.in.sh
-  if grep -q "^#\?ZK_HOST=" /etc/default/solr.in.sh; then
-    sed -i "s|^#\?ZK_HOST=.*|ZK_HOST=\"${SOLR_ZK_HOST}\"|" /etc/default/solr.in.sh
-  else
-    echo "ZK_HOST=\"${SOLR_ZK_HOST}\"" >> /etc/default/solr.in.sh
-  fi
-  sed -i "s|^#\?SOLR_JETTY_HOST=.*|SOLR_JETTY_HOST=\"${IPV4}\"|" /etc/default/solr.in.sh
-  systemctl restart solr
-
-  AUTOPSY_ZIP="SOLR_8.6.3_AutopsyService.zip"
-  fetch_pkg autopsy "$AUTOPSY_ZIP" || curl -L "https://sourceforge.net/projects/autopsy/files/CollaborativeServices/Solr/${AUTOPSY_ZIP}/download" -o "$AUTOPSY_ZIP"
-  [[ -f "$AUTOPSY_ZIP" ]] || { echo "Autopsy Solr config zip missing"; exit 1; }
-  mkdir -p /opt/autopsy-solr; unzip -o "$AUTOPSY_ZIP" -d /opt/autopsy-solr >/dev/null
-  CONF_DIR=$(find /opt/autopsy-solr -type d -path "*/AutopsyConfig/conf" | head -1 || true)
-  chown -R solr:solr /opt/autopsy-solr
-  [[ -n "$CONF_DIR" ]] && sudo -u solr /opt/solr/bin/solr create_collection -c AutopsyConfig -d "$CONF_DIR" || true
-' || fail_note "solr" "install/config failed"
-
-#####################################
-# ActiveMQ (pinned; soft-fail)
-#####################################
-run_step "activemq" "${ACTIVEMQ_VER}" get_ver_amq '
-  set -e
-  ACTIVEMQ_TGZ="apache-activemq-${ACTIVEMQ_VER}-bin.tar.gz"
-  fetch_pkg activemq "$ACTIVEMQ_TGZ" || curl -L "https://archive.apache.org/dist/activemq/${ACTIVEMQ_VER}/${ACTIVEMQ_TGZ}" -o "$ACTIVEMQ_TGZ"
-  [[ -f "$ACTIVEMQ_TGZ" ]] || { echo "ActiveMQ tarball missing"; exit 1; }
-  id activemq >/dev/null 2>&1 || useradd --system -s /usr/sbin/nologin activemq
-  mkdir -p /opt/activemq; tar -xzf "$ACTIVEMQ_TGZ" -C /opt/activemq --strip-components 1
-  chown -R activemq:activemq /opt/activemq
-  cat >/etc/systemd/system/activemq.service <<'"'"'EOF'"'"'
-[Unit]
-Description=Apache ActiveMQ
-After=network.target
-[Service]
-Type=forking
-User=activemq
-Group=activemq
-ExecStart=/opt/activemq/bin/activemq start
-ExecStop=/opt/activemq/bin/activemq stop
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload; systemctl enable activemq --now
-' || fail_note "activemq" "install/config failed"
-
-#####################################
-# PostgreSQL (Ubuntu path; soft-fail)
-#####################################
-run_step "postgresql" "configured" get_ver_pg '
-  set -e
-  if [[ "$PM" == "apt" ]]; then
-    dpkg -s postgresql >/dev/null 2>&1 || bash -lc "$PKG_INSTALL postgresql"
-    systemctl enable postgresql || true
-    PG_VER=$(psql -V | awk "{print \$3}" | cut -d. -f1)
-    PG_DIR="/etc/postgresql/${PG_VER}/main"
-    sed -ri "s/^#?fsync\s*=.*/fsync = ${PG_PERF_FSYNC}/" "${PG_DIR}/postgresql.conf"
-    sed -ri "s/^#?synchronous_commit\s*=.*/synchronous_commit = ${PG_PERF_SYNCCOMMIT}/" "${PG_DIR}/postgresql.conf"
-    sed -ri "s/^#?full_page_writes\s*=.*/full_page_writes = ${PG_PERF_FULLPAGE}/" "${PG_DIR}/postgresql.conf"
-    grep -q "listen_addresses" "${PG_DIR}/postgresql.conf" && \
-      sed -ri "s/^#?listen_addresses\s*=.*/listen_addresses = '"'"'${PG_LISTEN_ADDR}'"'"'/" "${PG_DIR}/postgresql.conf" \
-      || echo "listen_addresses = '"'"'${PG_LISTEN_ADDR}'"'"'" >> "${PG_DIR}/postgresql.conf"
-    for n in ${ALLOW_NETS_CSV//,/ }; do
-      grep -qE "^\s*host\s+all\s+all\s+${n}\s+md5" "${PG_DIR}/pg_hba.conf" || echo "host all all ${n} md5" >> "${PG_DIR}/pg_hba.conf"
-    done
-    systemctl restart postgresql || true
-  fi
-' || fail_note "postgresql" "install/config failed"
-
-#####################################
-# STIG prerequisites (OpenSCAP + SSG)
-#####################################
-# Robust package detector: only returns "installed" when all required bits exist.
-get_ver_stig_pkgs() {
-  if [[ "$PM" == "apt" ]]; then
-    dpkg -s openscap-scanner ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications >/dev/null 2>&1 \
-      && echo "installed" || echo ""
-  else
-    # RHEL/OL/Fedora family: openscap-scanner + scap-security-guide
-    rpm -q openscap-scanner scap-security-guide >/dev/null 2>&1 && echo "installed" || echo ""
-  fi
-}
-
-if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" ]]; then
-run_step "stig-prereqs" "installed" get_ver_stig_pkgs '
-  set -e
-  if [[ "$PM" == "apt" ]]; then
-    apt_wait
-    bash -lc "$PKG_UPDATE"
-    # exactly what you installed manually, plus unzip (needed for zip STIG bundles)
-    bash -lc "$PKG_INSTALL unzip openscap-scanner"
-    bash -lc "$PKG_INSTALL ssg-base ssg-debderived ssg-debian ssg-nondebian ssg-applications"
-    # scap-security-guide is split on Ubuntu; attempt if present in this release
-    bash -lc "apt-cache show scap-security-guide >/dev/null 2>&1 && $PKG_INSTALL scap-security-guide || true"
-  else
-    bash -lc "$PKG_UPDATE"
-    bash -lc "$PKG_INSTALL openscap-scanner unzip"
-    bash -lc "$PKG_INSTALL scap-security-guide"
-  fi
-' || fail_note "stig" "could not install prerequisites"
-fi
-
-
-#####################################
-# Splunk Universal Forwarder (UF-only)
-#####################################
-run_step "splunk-uf" "installed" get_ver_splunkuf '
-  set -e
-
-  # Basic deps
-  if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || true
-    apt-get install -y --no-install-recommends procps curl
-  fi
-
-  # System user for UF
-  id splunkfwd >/dev/null 2>&1 || useradd --system --home-dir /opt/splunkforwarder --shell /usr/sbin/nologin splunkfwd || true
-
-  # ---- locate UF package (env URL, /var/wade/pkg, or script dir) ----
-  PKG=""
-  if [[ -n "${SPLUNK_UF_DEB_URL:-}" ]]; then
-    PKG="/tmp/$(basename "${SPLUNK_UF_DEB_URL}")"
-    curl -L "${SPLUNK_UF_DEB_URL}" -o "$PKG"
-  elif ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb >/dev/null 2>&1; then
-    PKG="$(ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb | sort -V | tail -1)"
-  elif [[ -n "${SPLUNK_SRC_DIR:-}" ]] && ls "${SPLUNK_SRC_DIR}"/splunkforwarder*.deb >/dev/null 2>&1; then
-    PKG="$(ls "${SPLUNK_SRC_DIR}"/splunkforwarder*.deb | sort -V | tail -1)"
-  fi
-
-  # Soft-skip if you didn't provide a UF package
-  if [[ -z "$PKG" || ! -f "$PKG" ]]; then
-    echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/"
-    exit 0
-  fi
-
-  dpkg -i "$PKG" || apt-get -f install -y
-
-  # Accept license + enable at boot under splunkfwd
-  /opt/splunkforwarder/bin/splunk enable boot-start -systemd-managed 1 -user splunkfwd --accept-license --answer-yes || true
-
-  # ---- defaults from wade.conf (with sane fallbacks) ----
-  SERVER_LINE="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
-  DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
-  COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
-  USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
-  SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
-  SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
-  DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
-
-  # If early prompts pre-set values, prefer them
-  if [[ "${PRESET_SPLUNK:-0}" -eq 1 ]]; then
-    SERVER_LINE="${PRESET_SPLUNK_SERVER_LINE:-$SERVER_LINE}"
-    DEFAULT_INDEX="${PRESET_SPLUNK_INDEX:-$DEFAULT_INDEX}"
-    COMPRESSED="${PRESET_SPLUNK_COMPRESSED:-$COMPRESSED}"
-    USE_ACK="${PRESET_SPLUNK_USEACK:-$USE_ACK}"
-    SSL_VERIFY="${PRESET_SPLUNK_SSL_VERIFY:-$SSL_VERIFY}"
-    SSL_CN="${PRESET_SPLUNK_SSL_CN:-$SSL_CN}"
-    DS_TARGET="${PRESET_SPLUNK_DS:-$DS_TARGET}"
-  fi
-
-  mkdir -p /opt/splunkforwarder/etc/system/local
-
-  cat >/opt/splunkforwarder/etc/system/local/outputs.conf <<EOF
-[tcpout]
-defaultGroup = default-autolb-group
-
-[tcpout:default-autolb-group]
-server = ${SERVER_LINE}
-compressed = ${COMPRESSED}
-useACK = ${USE_ACK}
-EOF
-
-  # Optional SSL common name pinning
-  if [[ "$SSL_VERIFY" == "true" ]]; then
-    cat >>/opt/splunkforwarder/etc/system/local/outputs.conf <<EOF
-sslVerifyServerCert = true
-sslCommonNameToCheck = ${SSL_CN}
-EOF
-  fi
-
-  # Optional Deployment Server
-  if [[ -n "$DS_TARGET" ]]; then
-    cat >/opt/splunkforwarder/etc/system/local/deploymentclient.conf <<EOF
-[deployment-client]
-clientName = wade-uf
-
-[target-broker:deploymentServer]
-targetUri = ${DS_TARGET}
-EOF
-  fi
-
-  systemctl enable --now SplunkForwarder.service 2>/dev/null || systemctl enable --now splunkforwarder.service || true
-' || fail_note "splunk-uf" "install/config failed"
-
-#####################################
-# WADE: logrotate setup (multi-service)
-#####################################
-
-# Ensure logrotate is installed (best-effort for offline)
-_wade_ensure_logrotate() {
-  if command -v logrotate >/dev/null 2>&1; then return 0; fi
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y logrotate >/dev/null 2>&1 || true
-  fi
-}
-
-# Derive default logdir from service name: wade-XYZ -> /var/wade/logs/XYZ
-_wade_default_logdir_for_service() {
-  local svc="$1"
-  local base="${svc#wade-}"
-  printf "/var/wade/logs/%s" "${base}"
-}
-
-# Configure logrotate + systemd override for a single service
-# Args:
-#   1: service name (e.g., wade-stage)  [required]
-#   2: logdir (default: auto from svc)  [optional]
-#   3: user  (default: autopsy)         [optional]
-#   4: group (default: same as user)    [optional]
-#   5: rotate count (default: 14)       [optional]
-#   6: period: daily|weekly|monthly (default: daily) [optional]
-#   7: method: signal:USR1|signal:HUP|copytruncate (default: signal:USR1) [optional]
-install_wade_logrotate() {
-  local svc="${1:?service name required}"
-  local logdir="${2:-$(_wade_default_logdir_for_service "$svc")}"
-  local user="${3:-autopsy}"
-  local group="${4:-$user}"
-  local rotate_count="${5:-14}"
-  local period="${6:-daily}"
-  local method="${7:-signal:USR1}"
-
-  echo "[wade] configuring logrotate for ${svc} → ${logdir}"
-
-  _wade_ensure_logrotate
-
-  # Ensure log dir and ownership
-  mkdir -p "${logdir}"
-  if id -u "${user}" >/dev/null 2>&1 && getent group "${group}" >/dev/null 2>&1; then
-    chown -R "${user}:${group}" "${logdir}" || true
-  else
-    echo "[wade] note: user/group ${user}:${group} not present; defaulting to root:root for ${logdir}"
-    user="root"; group="root"
-    chown -R root:root "${logdir}" || true
-  fi
-  chmod 0750 "${logdir}" || true
-
-  # Per-service systemd override (only when signaling)
-  if [[ "${method}" == signal:* ]]; then
-    local sig="${method#signal:}"
-    mkdir -p "/etc/systemd/system/${svc}.service.d"
-    cat > "/etc/systemd/system/${svc}.service.d/logrotate-reload.conf" <<EOF
-[Service]
-ExecReload=
-ExecReload=/bin/kill -s ${sig} \$MAINPID
-EOF
-    systemctl daemon-reload 2>/dev/null || true
-  fi
-
-  # Build postrotate script based on method
-  local postrotate_cmd
-  if [[ "${method}" == copytruncate ]]; then
-    # No signal; rely on copytruncate directive
-    postrotate_cmd=": # no signal; using copytruncate"
-  else
-    # Default or explicit signal:<SIG>
-    local sig="${method#signal:}"
-    postrotate_cmd="systemctl kill -s ${sig} ${svc}.service 2>/dev/null || true"
-  fi
-
-  # Per-service logrotate policy file
-  local policy="/etc/logrotate.d/${svc}"
-  cat > "${policy}" <<EOF
-${logdir%/}/*.log {
-  ${period}
-  rotate ${rotate_count}
-  compress
-  missingok
-  notifempty
-  su ${user} ${group}
-  create 0640 ${user} ${group}
-  sharedscripts
-$( [[ "${method}" == copytruncate ]] && echo "  copytruncate" )
-  postrotate
-    ${postrotate_cmd}
-  endscript
-}
-EOF
-
-  chmod 0644 "${policy}"
-  chown root:root "${policy}"
-
-  echo "[wade] logrotate policy: ${policy}"
-}
-
-# Bulk helper:
-# Accepts any number of tokens in the form:
-#   "service[:logdir[:user[:group[:rotate[:period[:method]]]]]]"
-# Example token: "wade-stage:/var/wade/logs/stage:autopsy:autopsy:14:daily:signal:USR1"
-install_wade_logrotate_bulk() {
-  local token svc logdir user group rotate period method
-  for token in "$@"; do
-    IFS=':' read -r svc logdir user group rotate period method <<<"${token}"
-    install_wade_logrotate "${svc:?}" "${logdir:-}" "${user:-}" "${group:-}" "${rotate:-}" "${period:-}" "${method:-}"
-  done
-}
-
-# Rotate JSONL under /var/wade/logs/malware weekly, keep 14 copies
-install_wade_logrotate "wade-mw-extractor" "/var/wade/logs/malware" "${LWADEUSER:-autopsy}" "${LWADEUSER:-autopsy}" 14 "weekly" "copytruncate"
-
-#####################################
-# Persist facts & endpoints
-#####################################
-ENV_FILE="${WADE_ETC}/wade.env"
-IPV4="$(hostname -I 2>/dev/null | awk '{print $1}')"
-
-# — Derive Splunk UF settings if present (fall back to conf defaults) —
-OUTCONF="/opt/splunkforwarder/etc/system/local/outputs.conf"
-INCONF="/opt/splunkforwarder/etc/system/local/inputs.conf"
-DCONF="/opt/splunkforwarder/etc/system/local/deploymentclient.conf"
-
-UF_RCVR="$(awk -F= '/^\s*server\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$OUTCONF" 2>/dev/null)"
-UF_COMP="$(awk -F= '/^\s*compressed\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
-UF_ACKS="$(awk -F= '/^\s*useACK\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
-UF_SSLV="$(awk -F= '/^\s*sslVerifyServerCert\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
-UF_SSLN="$(awk -F= '/^\s*sslCommonNameToCheck\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$OUTCONF" 2>/dev/null)"
-UF_DS="$(awk -F= '/^\s*targetUri\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$DCONF" 2>/dev/null)"
-UF_IDX="$(awk -F= '/^\s*index\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$INCONF" 2>/dev/null)"
-
-# fallbacks to defaults from wade.conf
-UF_RCVR="${UF_RCVR:-${SPLUNK_UF_RCVR_HOSTS:-${SPLUNK_UF_RCVR_HOST:-}}}"
-UF_COMP="${UF_COMP:-${SPLUNK_UF_COMPRESSED:-true}}"
-UF_ACKS="${UF_ACKS:-${SPLUNK_UF_USE_ACK:-true}}"
-UF_SSLV="${UF_SSLV:-${SPLUNK_UF_SSL_VERIFY:-false}}"
-UF_SSLN="${UF_SSLN:-${SPLUNK_UF_SSL_COMMON_NAME:-*}}"
-UF_DS="${UF_DS:-${SPLUNK_UF_DEPLOYMENT_SERVER:-}}"
-UF_IDX="${UF_IDX:-${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}}"
-
-cat > "$ENV_FILE" <<ENV
-# ===== WADE runtime facts =====
-WADE_HOSTNAME="${LWADE}"
-WADE_HOST_IPV4="${IPV4}"
-WADE_OWNER_USER="${LWADEUSER}"
-WADE_SMB_USERS="${SMB_USERS_CSV}"
-WADE_ALLOW_NETS="${ALLOW_NETS_CSV}"
-
-# Directories
-WADE_DATADIR="${WADE_DATADIR}"
-WADE_CASESDIR="${WADE_CASESDIR}"
-WADE_STAGINGDIR="${WADE_STAGINGDIR}"
-WADE_LOG_DIR="${WADE_LOG_DIR}"
-WADE_PKG_DIR="${WADE_PKG_DIR}"
-WADE_TOOLS_DIR="${WADE_TOOLS_DIR}"
-WADE_PIPELINES_DIR="${WADE_PIPELINES_DIR}"
-
-# Splunk settings (UF actuals if present, else defaults)
-SPLUNK_DEFAULT_INDEX="${SPLUNK_DEFAULT_INDEX:-wade_custom}"
-SPLUNK_UF_RCVR_HOSTS="${UF_RCVR}"
-SPLUNK_UF_DEFAULT_INDEX="${UF_IDX}"
-SPLUNK_UF_COMPRESSED="${UF_COMP}"
-SPLUNK_UF_USE_ACK="${UF_ACKS}"
-SPLUNK_UF_SSL_VERIFY="${UF_SSLV}"
-SPLUNK_UF_SSL_COMMON_NAME="${UF_SSLN}"
-SPLUNK_UF_DEPLOYMENT_SERVER="${UF_DS}"
-
-# Hayabusa locations
-HAYABUSA_DEST="${HAYABUSA_DEST}"
-HAYABUSA_RULES_DIR="${HAYABUSA_RULES_DIR}"
-SIGMA_RULES_DIR="${SIGMA_RULES_DIR}"
-
-# Staging safety & performance
-WADE_STAGE_STABLE_SECONDS=180
-WADE_STAGE_REQUIRE_CLOSE_WRITE=1
-WADE_STAGE_VERIFY_NO_WRITERS=1
-WADE_STAGE_RECURSIVE=1
-WADE_STAGE_ACCEPT_DOCS=1
-WADE_STAGE_SMALL_FILE_BYTES=2097152
-WADE_STAGE_SMALL_FILE_STABLE=5
-
-# Offline flag
-OFFLINE="${OFFLINE}"
-
-# Queue 
-WADE_QUEUE_DIR=_queue
-
-# WHIFF
-WHIFF_ENABLE=1
-WHIFF_URL=http://127.0.0.1:8088/annotate
-
-# ===== Network ports in use =====
-SSH_PORT="22"
-SMB_TCP_139="139"
-SMB_TCP_445="445"
-SMB_UDP_137="137"
-SMB_UDP_138="138"
-ZK_CLIENT_PORT="2181"
-ZK_QUORUM_PORT="2888"
-ZK_ELECTION_PORT="3888"
-SOLR_PORT="8983"
-ACTIVEMQ_OPENWIRE_PORT="61616"
-ACTIVEMQ_WEB_CONSOLE_PORT="8161"
-ACTIVEMQ_AMQP_PORT="5672"
-ACTIVEMQ_STOMP_PORT="61613"
-ACTIVEMQ_MQTT_PORT="1883"
-ACTIVEMQ_WS_PORT="61614"
-POSTGRES_PORT="5432"
-PIRANHA_PORT="5001"
-BARRACUDA_PORT="5000"
-SPLUNK_WEB_PORT="\${SPLUNK_WEB_PORT}"
-SPLUNK_MGMT_PORT="\${SPLUNK_MGMT_PORT}"
-SPLUNK_HEC_PORT="\${SPLUNK_HEC_PORT}"
-SPLUNK_FORWARD_PORT="\${SPLUNK_FORWARD_PORT}"
-
-WADE_SERVICE_PORTS_CSV="\${SSH_PORT},\${SMB_TCP_139},\${SMB_TCP_445},\${SMB_UDP_137},\${SMB_UDP_138},\${ZK_CLIENT_PORT},\${ZK_QUORUM_PORT},\${ZK_ELECTION_PORT},\${SOLR_PORT},\${ACTIVEMQ_OPENWIRE_PORT},\${ACTIVEMQ_WEB_CONSOLE_PORT},\${ACTIVEMQ_AMQP_PORT},\${ACTIVEMQ_STOMP_PORT},\${ACTIVEMQ_MQTT_PORT},\${ACTIVEMQ_WS_PORT},\${POSTGRES_PORT},\${PIRANHA_PORT},\${BARRACUDA_PORT},\${SPLUNK_WEB_PORT},\${SPLUNK_MGMT_PORT},\${SPLUNK_HEC_PORT},\${SPLUNK_FORWARD_PORT}"
-ENV
-
- chown root:autopsy "$ENV_FILE"
- chmod 0640 "$ENV_FILE"
-
-
-echo
-echo "[+] WADE install attempted."
-echo "    Shares: //${IPV4}/${WADE_DATADIR} //${IPV4}/${WADE_CASESDIR} //${IPV4}/${WADE_STAGINGDIR}"
-echo "    Zookeeper : 127.0.0.1:${ZK_CLIENT_PORT:-2181}"
-echo "    Solr (UI) : http://${IPV4}:${SOLR_PORT:-8983}/solr/#/~cloud"
-echo "    ActiveMQ  : ${IPV4}:${ACTIVEMQ_OPENWIRE_PORT:-61616} (web console :${ACTIVEMQ_WEB_CONSOLE_PORT:-8161})"
-echo "    Postgres  : ${IPV4}:${POSTGRES_PORT:-5432}"
-echo "    Barracuda  : ${IPV4}:5000"
-echo "    Tools     : vol3, dissect, bulk_extractor (+ piranha, barracuda, hayabusa)"
-echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
-echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
-UF_PRESENT="no"
-UF_OUT_TARGETS=""
-UF_DS_TARGET=""
-if [[ -x /opt/splunkforwarder/bin/splunk ]]; then
-  UF_PRESENT="yes"
-  UF_OUT_TARGETS="$(awk -F= '/^\s*server\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' /opt/splunkforwarder/etc/system/local/outputs.conf 2>/dev/null)"
-  UF_DS_TARGET="$(awk -F= '/^\s*targetUri\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' /opt/splunkforwarder/etc/system/local/deploymentclient.conf 2>/dev/null)"
-fi
-
-if [[ "$UF_PRESENT" == "yes" ]]; then
-  echo "    Splunk UF : forwarding to ${UF_OUT_TARGETS:-<not configured>} (DS: ${UF_DS_TARGET:-none})"
-  echo "                compressed=${SPLUNK_UF_COMPRESSED:-${UF_COMP:-true}}, useACK=${SPLUNK_UF_USE_ACK:-${UF_ACKS:-true}}, sslVerify=${SPLUNK_UF_SSL_VERIFY:-${UF_SSLV:-false}}"
-else
-  echo "    Splunk UF : not installed"
-fi
-echo "    Log       : ${LOG_FILE}"
-echo
-echo "NOTE: New tools default to SPLUNK index: '${SPLUNK_DEFAULT_INDEX:-wade_custom}'."
-
-#####################################
-# Interactive STIG assessment (end; reads from ./stigs)
-#####################################
-stig_list_profiles() {
-  local info
-  info="$(oscap info "$1" 2>/dev/null || true)"
-
-  {
-    printf '%s\n' "$info" | awk '
-      BEGIN{inside=0}
-      /^[[:space:]]*Profiles:/ {inside=1; next}
-      inside && /^[[:space:]]*Id:[[:space:]]*/ {
-        sub(/^[[:space:]]*Id:[[:space:]]*/,"")
-        print $1
-      }
-    '
-    printf '%s\n' "$info" | sed -nE 's/^[[:space:]]*Profile[[:space:]]*:[[:space:]]*([[:alnum:]_.:-]+).*/\1/p'
-    printf '%s\n' "$info" | sed -nE 's/^[[:space:]]*Profile.*\(([[:alnum:]_.:-]+)\).*/\1/p'
-  } | awk 'NF' | sort -u
-}
-
-stig_pick_profile_interactive() {
-  local ds="$1"
-  mapfile -t PROFILES < <(stig_list_profiles "$ds")
-
-  if [[ ${#PROFILES[@]} -eq 0 ]]; then
-    >&2 echo "[!] No profiles parsed from 'oscap info'."
-    >&2 echo "    Type a profile ID manually, or press Enter to use default:"
-    >&2 echo "    Default: ${STIG_PROFILE_ID:-<none set>}"
-    read -r -p "Profile ID: " manual
-    [[ -n "$manual" ]] && { printf '%s\n' "$manual"; return 0; }
-    [[ -n "${STIG_PROFILE_ID:-}" ]] && { printf '%s\n' "${STIG_PROFILE_ID}"; return 0; }
-    return 1
-  fi
-
-  >&2 echo "Available profiles:"
-  local i=1
-  for p in "${PROFILES[@]}"; do >&2 printf "  %2d) %s\n" "$i" "$p"; ((i++)); done
-  local def=1
-  read -r -p "Choose profile [${def}]: " idx
-  idx="${idx:-$def}"
-  if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#PROFILES[@]} )); then
-    >&2 echo "[!] Invalid selection."
-    return 1
-  fi
-  printf '%s\n' "${PROFILES[$((idx-1))]}"
-}
-
-stig_skip_args() {
-  local s="${STIG_SKIP_RULES:-}"; [[ -z "$s" ]] && return 0
-  IFS=',' read -ra arr <<< "$s"
-  for r in "${arr[@]}"; do echo -n " --skip-rule ${r}"; done
-}
-
-if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
-  echo
-  echo "==> Optional: Run DISA STIG assessment now"
-  echo "    Looking for STIG zips/XML under: ${STIG_SRC_DIR}"
-  if [[ "$NONINTERACTIVE" -eq 1 ]]; then
-    echo "    (NONINTERACTIVE mode: skipping STIG assessment prompt.)"
-  else
-    read -r -p "Run STIG assessment now? [y/N]: " __ans
-    if [[ "$__ans" =~ ^[Yy]$ ]]; then
-      install -d "${STIG_REPORT_DIR}" "${STIG_UBU_EXTRACT_DIR}"
-      CAND_ZIP="$(ls -1 "${STIG_SRC_DIR}"/*.zip 2>/dev/null | sort -V | tail -1 || true)"
-      CAND_XML="$(ls -1 "${STIG_SRC_DIR}"/*.xml "${STIG_SRC_DIR}"/*.XML 2>/dev/null | sort -V | tail -1 || true)"
-      DS_FILE=""; TMP_EXTRACT=""
-
-      if [[ -n "$CAND_ZIP" ]]; then
-        echo "[*] Using ZIP: $(basename "$CAND_ZIP")"
-        TMP_EXTRACT="$(mktemp -d)"
-        unzip -oq "$CAND_ZIP" -d "$TMP_EXTRACT"
-        for pat in '*-ds.xml' '*-datastream.xml' '*-xccdf.xml' '*Benchmark*.xml'; do
-          DS_FILE="$(find "$TMP_EXTRACT" -type f -iname "$pat" | head -1 || true)"
-          [[ -n "$DS_FILE" ]] && break
-        done
-      elif [[ -n "$CAND_XML" ]]; then
-        echo "[*] Using XML: $(basename "$CAND_XML")"
-        DS_FILE="$CAND_XML"
-      fi
-
-      if [[ -z "$DS_FILE" || ! -f "$DS_FILE" ]]; then
-        echo "[!] No usable DISA STIG DS/XML found under ${STIG_SRC_DIR}."
-        echo "    Put the official zip/XML there and re-run: ./install.sh --only=stig-prereqs"
-        fail_note "stig-eval" "no DS/XML found"
-      else
-        CHOSEN_PROFILE="$(stig_pick_profile_interactive "$DS_FILE")" || { fail_note "stig-eval" "no profile chosen"; CHOSEN_PROFILE=""; }
-        if [[ -n "$CHOSEN_PROFILE" ]]; then
-          echo "[*] Running oscap with profile: ${CHOSEN_PROFILE}"
-          SKIP_ARGS="$(stig_skip_args)"
-          TS="$(date +%Y%m%d_%H%M%S)"
-          REP_HTML="${STIG_REPORT_DIR}/stig-ubuntu-${OS_VER_ID}-${TS}.html"
-          REP_ARF="${STIG_REPORT_DIR}/stig-ubuntu-${OS_VER_ID}-${TS}.arf.xml"
-          if oscap xccdf eval --skip-valid ${SKIP_ARGS} \
-               --profile "${CHOSEN_PROFILE}" \
-               --results-arf "${REP_ARF}" \
-               --report "${REP_HTML}" \
-               "${DS_FILE}"; then
-            echo "[+] STIG report: ${REP_HTML}"
-            echo "[+] STIG ARF   : ${REP_ARF}"
-            cp -f "${DS_FILE}" "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || true
-            mark_done "stig-eval" "$(sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || echo run-${TS})"
-          else
-            fail_note "stig-eval" "oscap eval failed"
-          fi
-        fi
-      fi
-      [[ -n "$TMP_EXTRACT" ]] && rm -rf "$TMP_EXTRACT"
-    fi
-  fi
-fi
-
-finish_summary
+# -----------------------------
+# Compiled regexes
+# -----------------------------
+_RE_HOSTNAME = re.compile(r"(?im)^hostname\s+([A-Za-z0-9._-]+)")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def utc_from_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def ymd_from_mtime(p: Path) -> str:
+    return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d")
+
+def load_env() -> Dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k.startswith("WADE_")}
+    if WADE_ENV.is_file():
+        try:
+            for line in WADE_ENV.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"\'')
+        except Exception:
+            pass
+    return env
+
+def which(cmd: str) -> Optional[str]:
+    # Try PATH
+    for p in os.getenv("PATH", "").split(os.pathsep):
+        cand = Path(p) / cmd
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    # Common absolute fallbacks
+    extras = (
+        "/usr/local/bin/vol", "/usr/bin/vol", "/opt/pipx/venvs/volatility3/bin/vol",
+        "/usr/local/bin/target-info", "/usr/bin/target-info",
+        "/usr/local/bin/ewfinfo", "/usr/bin/ewfinfo",
+        "/usr/local/bin/ewfexport", "/usr/bin/ewfexport",
+        "/usr/bin/file", "/usr/local/bin/file",
+        "/usr/bin/lsof", "/usr/sbin/lsof", "/bin/lsof",
+    )
+    name = Path(cmd).name
+    for e in extras:
+        if Path(e).name == name and Path(e).is_file() and os.access(e, os.X_OK):
+            return e
+    return None
+
+VOL_PATH = os.getenv("WADE_VOL_PATH") or which("vol")
+TARGET_INFO_PATH = which("target-info")
+EWFINFO_PATH = which("ewfinfo")
+EWFEXPORT_PATH = which("ewfexport")
+FILE_CMD = which("file")
+LSOF_CMD = which("lsof")
+
+def run_cmd(cmd: List[str], timeout: int = 20) -> Tuple[int, str, str]:
+    try:
+        cp = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, text=True, check=False
+        )
+        return cp.returncode, cp.stdout, cp.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:
+        return 1, "", str(e)
+
+def ensure_dirs(*paths: Path) -> None:
+    for p in paths:
+        p.mkdir(parents=True, exist_ok=True)
+
+def fast_signature(p: Path) -> str:
+    st = p.stat()
+    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{int(st.st_mtime_ns)}"
+
+def quick_content_sig(p: Path, sample_bytes: int = SIG_SAMPLE_BYTES) -> str:
+    """Fast content fingerprint: sha256(head+tail)+size."""
+    size = p.stat().st_size
+    if size == 0:
+        return "0:0"
+    if size <= 2 * sample_bytes:
+        blob = p.read_bytes()
+    else:
+        with p.open("rb") as f:
+            head = f.read(sample_bytes)
+            f.seek(max(0, size - sample_bytes))
+            tail = f.read(sample_bytes)
+        blob = head + tail
+    h = hashlib.sha256(blob).hexdigest()
+    return f"{size}:{h}"
+
+def safe_chown(path: Path, user: str, group: str) -> None:
+    try:
+        shutil.chown(path, user=user, group=group)
+    except Exception:
+        pass
+
+def extract_text_snippet(p: Path, max_bytes: int = 512*1024) -> str:
+    try:
+        data = p.read_bytes()[:max_bytes]
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+# -----------------------------
+# I/O
+# -----------------------------
+def read_head_once(p: Path, max_bytes: int = HEAD_SCAN_BYTES) -> bytes:
+    size = p.stat().st_size
+    if size <= max_bytes:
+        return p.read_bytes()
+    chunk = 512 * 1024
+    with p.open("rb") as f:
+        head = f.read(min(chunk, max_bytes // 2))
+        f.seek(max(0, size - chunk))
+        tail = f.read(min(chunk, max_bytes // 2))
+    return head + tail
+
+def is_probably_text(p: Path) -> Tuple[bool, str]:
+    try:
+        data = p.read_bytes()[:TEXT_SNIFF_BYTES]
+        printable = set(string.printable.encode("ascii"))
+        ratio = sum(b in printable for b in data) / max(1, len(data))
+        if ratio >= TEXT_MIN_PRINTABLE_RATIO:
+            return True, data.decode("utf-8", errors="ignore")
+        return False, ""
+    except Exception:
+        return False, ""
+
+# -----------------------------
+# SQLite
+# -----------------------------
+def init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(SQLITE_DB), timeout=30.0, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS processed (
+            sig TEXT PRIMARY KEY,
+            src_path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            dest_path TEXT NOT NULL,
+            classification TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            content_sig TEXT
+        );
+    """)
+    # Migrate old DBs that lack content_sig
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(processed)").fetchall()}
+        if "content_sig" not in cols:
+            conn.execute("ALTER TABLE processed ADD COLUMN content_sig TEXT;")
+    except sqlite3.OperationalError:
+        pass
+    # Unique by content (allows many NULLs)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_content_sig ON processed(content_sig);")
+    conn.commit()
+    return conn
+
+def already_processed(conn: sqlite3.Connection, sig: str) -> bool:
+    return conn.execute("SELECT 1 FROM processed WHERE sig = ?", (sig,)).fetchone() is not None
+
+def already_processed_by_content(conn: sqlite3.Connection, content_sig: Optional[str]) -> bool:
+    if not content_sig:
+        return False
+    return conn.execute("SELECT 1 FROM processed WHERE content_sig = ?", (content_sig,)).fetchone() is not None
+
+def record_processed_snapshot(conn: sqlite3.Connection, sig: str, src_path: str,
+                              size: int, mtime_ns: int, dest: Path,
+                              classification: str, profile: str,
+                              content_sig: Optional[str] = None) -> None:
+    now = utc_now_iso()
+    conn.execute("""
+        INSERT INTO processed (sig, src_path, size, mtime_ns, first_seen, last_seen, dest_path, classification, profile, content_sig)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sig) DO UPDATE SET
+            src_path = excluded.src_path,
+            size = excluded.size,
+            mtime_ns = excluded.mtime_ns,
+            last_seen = excluded.last_seen,
+            dest_path = excluded.dest_path,
+            classification = excluded.classification,
+            profile = excluded.profile,
+            content_sig = COALESCE(excluded.content_sig, processed.content_sig);
+    """, (sig, src_path, size, mtime_ns, now, now, str(dest), classification, profile, content_sig))
+    conn.commit()
+
+# -----------------------------
+# Logging
+# -----------------------------
+def calculate_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    freq = defaultdict(int)
+    for b in data:
+        freq[b] += 1
+    import math
+    entropy = 0.0
+    length = len(data)
+    for count in freq.values():
+        p = count / length
+        entropy -= p * math.log2(p)
+    return round(entropy, 3)
+
+def _daily_log_path() -> Path:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return LOG_ROOT / f"stage_{today}.log"
+
+def json_log(event: str, **fields: Any) -> None:
+    payload = {"timestamp_utc": utc_now_iso(), "event": event, **fields}
+    line = json.dumps(payload, ensure_ascii=False)
+    path = _daily_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+def debug_probe_file(p: Path) -> Dict[str, Any]:
+    """Return 1-line file(1) string and hex head to help triage unknowns."""
+    info = {}
+    if FILE_CMD:
+        rc, out, _ = run_cmd([FILE_CMD, "-b", str(p)], timeout=5)
+        if rc == 0:
+            info["file_one_liner"] = out.strip()
+    try:
+        with p.open("rb") as f:
+            head = f.read(HEX_PREVIEW_BYTES)
+        info["hex_head"] = " ".join(f"{b:02x}" for b in head)
+    except Exception:
+        pass
+    return info
+
+# -----------------------------
+# Classifier registry
+# -----------------------------
+Classifier = Callable[[Path, Path], Tuple[str, Dict[str, Any]]]
+CLASSIFIERS: List[Classifier] = []
+
+def register_classifier(fn: Classifier) -> Classifier:
+    CLASSIFIERS.append(fn)
+    return fn
+
+# -----------------------------
+# Network Config Detectors
+# -----------------------------
+def _cisco_ios(text: str) -> Optional[Dict[str, Any]]:
+    anchors = 0
+    if re.search(r"(?im)^Building configuration\.\.\.", text): anchors += 1
+    if re.search(r"(?im)^Current configuration\s*:", text): anchors += 1
+    if re.search(r"(?im)^service (timestamps|password-encryption|call-home)", text): anchors += 1
+    if re.search(r"(?im)^line vty\s+\d+", text): anchors += 1
+    if anchors < 2: return None
+    m_host = _RE_HOSTNAME.search(text)
+    m_ver = re.search(r"(?im)^(?:Cisco IOS.*Version|version)\s+([0-9A-Za-z.\(\)_-]+)", text)
+    return {"vendor": "cisco_ios", "hostname": m_host.group(1) if m_host else None,
+            "os_version": m_ver.group(1) if m_ver else None, "platform": "IOS"}
+
+def _cisco_asa(text: str) -> Optional[Dict[str, Any]]:
+    if "ASA Version" not in text and "Cisco Adaptive Security Appliance" not in text:
+        return None
+    m_ver = re.search(r"ASA Version\s+([0-9.]+)", text)
+    m_host = _RE_HOSTNAME.search(text)
+    m_serial = re.search(r"Hardware:\s+.*,\s+([A-Z0-9]{11})", text)
+    return {"vendor": "cisco_asa", "hostname": m_host.group(1) if m_host else None,
+            "os_version": m_ver.group(1) if m_ver else None, "platform": "ASA",
+            "serial": m_serial.group(1) if m_serial else None}
+
+def _fortigate(text: str) -> Optional[Dict[str, Any]]:
+    tl = text.lower()
+    if not (re.search(r'(?im)^\s*#?\s*config[-_ ]version\s*[:=]\s*', text) or "fortigate" in tl):
+        return None
+    m_ver = re.search(r'(?im)config[-_ ]version\s*[:=]\s*([0-9A-Za-z.\-_]+)', text)
+    m_host = re.search(r'(?im)^\s*set\s+hostname\s+"?([A-Za-z0-9._-]+)"?', text)
+    return {
+        "vendor": "fortinet_fortigate",
+        "hostname": m_host.group(1) if m_host else None,
+        "os_version": m_ver.group(1) if m_ver else None,
+        "platform": "FortiGate",
+    }
+
+def _paloalto(text: str) -> Optional[Dict[str, Any]]:
+    if "set deviceconfig system hostname" not in text and "<panos>" not in text:
+        return None
+    m_host = re.search(r"set deviceconfig system hostname\s+([A-Za-z0-9._-]+)", text)
+    m_ver = re.search(r"sw-version\s+([0-9.]+)", text)
+    return {"vendor": "paloalto_panos", "hostname": m_host.group(1) if m_host else None,
+            "os_version": m_ver.group(1) if m_ver else None, "platform": "PAN-OS"}
+
+def _juniper_screenos(text: str) -> Optional[Dict[str, Any]]:
+    if "ScreenOS" not in text or "set hostname" not in text:
+        return None
+    m_host = re.search(r"set hostname\s+\"?([A-Za-z0-9._-]+)\"?", text)
+    m_ver = re.search(r"ScreenOS\s+([0-9.]+)", text)
+    return {"vendor": "juniper_screenos", "hostname": m_host.group(1) if m_host else None,
+            "os_version": m_ver.group(1) if m_ver else None, "platform": "ScreenOS"}
+
+def _checkpoint_gaia(text: str) -> Optional[Dict[str, Any]]:
+    if "set hostname" not in text or "Gaia" not in text:
+        return None
+    m_host = re.search(r"set hostname\s+([A-Za-z0-9._-]+)", text)
+    m_ver = re.search(r"Gaia\s+R([0-9.]+)", text)
+    return {"vendor": "checkpoint_gaia", "hostname": m_host.group(1) if m_host else None,
+            "os_version": m_ver.group(1) if m_ver else None, "platform": "Gaia"}
+
+def _juniper_junos(text: str) -> Optional[Dict[str, Any]]:
+    if "set system host-name" not in text:
+        return None
+    m_host = re.search(r"set\s+system\s+host-name\s+(\S+)", text)
+    return {"vendor": "juniper_junos", "hostname": m_host.group(1) if m_host else None,
+            "platform": "Junos"}
+
+def _vyos_edgeos(text: str) -> Optional[Dict[str, Any]]:
+    if "set system host-name" not in text or "interfaces" not in text:
+        return None
+    m_host = re.search(r"set\s+system\s+host-name\s+(\S+)", text)
+    return {"vendor": "vyos_edgeos", "hostname": m_host.group(1) if m_host else None,
+            "platform": "VyOS/EdgeOS"}
+
+def _arista_eos(text: str) -> Optional[Dict[str, Any]]:
+    if "daemon TerminAttr" not in text and "management api http-commands" not in text:
+        return None
+    m_host = _RE_HOSTNAME.search(text)
+    return {"vendor": "arista_eos", "hostname": m_host.group(1) if m_host else None,
+            "platform": "EOS"}
+
+def _mikrotik_ros(text: str) -> Optional[Dict[str, Any]]:
+    if "/interface" not in text or "/ip " not in text:
+        return None
+    m_host = re.search(r"/system identity set name=(\S+)", text)
+    return {"vendor": "mikrotik_ros", "hostname": m_host.group(1) if m_host else None,
+            "platform": "RouterOS"}
+
+_NETWORK_DETECTORS = (
+    _cisco_asa, _fortigate, _paloalto, _juniper_screenos, _checkpoint_gaia,
+    _cisco_ios, _juniper_junos, _vyos_edgeos, _arista_eos, _mikrotik_ros,
+)
+
+# -----------------------------
+# Core Heuristics: E01
+# -----------------------------
+def _has_magic_at(buf: bytes, off: int, sig: bytes) -> bool:
+    if off < 0 or off + len(sig) > len(buf):
+        return False
+    return buf[off:off+len(sig)] == sig
+
+def is_e01(p: Path) -> bool:
+    if p.suffix.lower() == ".e01":
+        return True
+    head = read_head_once(p, 1024)
+    return any(_has_magic_at(head, off, sig) for off, sig in MAGIC_DB["ewf"])
+
+def e01_fragmentation(p: Path) -> Dict[str, Any]:
+    base = p.with_suffix("")
+    parts = sorted(f.name for f in p.parent.glob(f"{base.name}.E0[2-9]*") if f.is_file())
+    return {"fragmented": bool(parts), "parts": parts}
+
+def _parse_ewfinfo_acq_date(txt: str) -> Optional[str]:
+    m = re.search(r"Acquisition date\s*:\s*([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})", txt)
+    if not m:
+        return None
+    raw = m.group(1)
+    try:
+        dt = datetime.strptime(raw, "%a %b %d %H:%M:%S %Y")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+@register_classifier
+def classify_e01(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    if not is_e01(p):
+        return "", {}
+    hostname = p.stem
+    date_col = ymd_from_mtime(p)
+
+    # Prefer ewfinfo acquisition date
+    if EWFINFO_PATH:
+        rc, out, _ = run_cmd([EWFINFO_PATH, str(p)], timeout=30)
+        if rc == 0:
+            maybe = _parse_ewfinfo_acq_date(out)
+            if maybe:
+                date_col = maybe
+
+    # Prefer target-info hostname
+    if TARGET_INFO_PATH:
+        rc, out, _ = run_cmd([TARGET_INFO_PATH, "-j", str(p)], timeout=30)
+        if rc == 0:
+            try:
+                j = json.loads(out)
+                if j.get("hostname"):
+                    hostname = j["hostname"]
+            except Exception:
+                pass
+
+    return "e01", {
+        "hostname": hostname,
+        "date_collected": date_col,
+        "fragmentation": e01_fragmentation(p),
+    }
+
+# -----------------------------
+# Memory & ETL
+# -----------------------------
+def is_etl(p: Path) -> bool:
+    # Use file(1) when available; otherwise rely on extension
+    if FILE_CMD:
+        rc, out, _ = run_cmd([FILE_CMD, "-b", str(p)], timeout=5)
+        if rc == 0 and "Event Trace Log" in out:
+            return True
+    return p.suffix.lower() == ".etl"
+
+def name_looks_memory(p: Path) -> bool:
+    n = p.name.lower()
+    return any(k in n for k in (".mem", ".vmem", "hiberfil", "hibernat", "winpmem", "rawmem", ".lime"))
+
+def detect_memory_dump(p: Path) -> Optional[Dict[str, str]]:
+    # Never consider ETL as memory
+    if is_etl(p):
+        return None
+    head = read_head_once(p, max(HEAD_SCAN_BYTES, 4096))
+    if head[:4] in (b"HIBR", b"Hibr", b"hibr"):
+        return {"kind": "hibernation", "evidence": "HIBR magic"}
+    if head[:4] == b"LiME":
+        return {"kind": "lime", "evidence": "LiME magic"}
+    if name_looks_memory(p):
+        return {"kind": "raw", "evidence": "filename hint"}
+    return None
+
+def best_effort_mem_meta(p: Path) -> Tuple[Optional[str], Optional[str]]:
+    if not VOL_PATH:
+        return None, None
+    # Try to extract ComputerName
+    rc, out, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.registry.hivelist"], timeout=60)
+    host = None
+    if rc == 0:
+        for line in out.splitlines():
+            if "SYSTEM" in line:
+                offset = line.split()[0]
+                rc2, out2, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.registry.printkey",
+                                        "--offset", offset, "--key",
+                                        r"ControlSet001\Control\ComputerName\ComputerName"], timeout=60)
+                if rc2 == 0:
+                    m = re.search(r'ComputerName.*?"([^"]+)"', out2)
+                    if m:
+                        host = m.group(1)
+                break
+    # Date (very rough)
+    rc3, out3, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=60)
+    date = None
+    if rc3 == 0:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", out3)
+        if m:
+            date = m.group(1)
+    return host, date
+
+@register_classifier
+def classify_memory(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    sig = detect_memory_dump(p)
+    if not sig:
+        return "", {}
+
+    hostname = p.stem
+    date_col = ymd_from_mtime(p)
+    meta = {
+        "hostname": hostname,
+        "date_collected": date_col,
+        "mem_signature": sig,
+    }
+
+    if not VOL_PATH:
+        return "mem", meta
+
+    # Try Windows first
+    rc, out, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=90)
+    score = 0
+    if rc == 0:
+        m_ver = re.search(r"Image\s+version:\s+([\d.]+)", out)
+        m_build = re.search(r"Build\s+number:\s+(\d+)", out)
+        m_ed = re.search(r"Edition:\s+(.+)", out)
+        m_arch = re.search(r"Architecture:\s+(\w+)", out)
+
+        if m_ver:
+            meta["os"] = "Windows"; meta["version"] = m_ver.group(1); score += 30
+        if m_build:
+            meta["build"] = m_build.group(1); score += 25
+        if m_ed:
+            edition = m_ed.group(1).lower()
+            meta["edition"] = "Server" if "server" in edition else "Workstation"; score += 20
+        if m_arch:
+            meta["arch"] = m_arch.group(1); score += 15
+
+        h, d = best_effort_mem_meta(p)
+        if h: meta["hostname"] = h; score += 10
+        if d: meta["date_collected"] = d
+    else:
+        # Try Linux
+        rc2, out2, _ = run_cmd([VOL_PATH, "-f", str(p), "linux.uname.Uname"], timeout=60)
+        if rc2 == 0 and "Linux version" in out2:
+            meta["os"] = "Linux"; score += 30
+            m_kern = re.search(r"Linux version ([^\s]+)", out2)
+            if m_kern:
+                meta["kernel"] = m_kern.group(1); score += 25
+
+    meta["confidence"] = min(100, score)
+    return "mem", meta
+
+# -----------------------------
+# VM & Disk Detection
+# -----------------------------
+def _mountless_os_detect_from_text(text: str) -> Tuple[Dict[str, Any], int]:
+    meta: Dict[str, Any] = {}
+    score = 0
+
+    m_osrel = re.search(r"PRETTY_NAME=\"?([^\"]+)\"?", text)
+    if m_osrel:
+        pretty = m_osrel.group(1)
+        meta["os"] = "Linux"; meta["distro"] = pretty; score += 30
+        m_ver = re.search(r"VERSION_ID=\"?([^\"]+)\"?", text)
+        if m_ver:
+            meta["version"] = m_ver.group(1); score += 25
+        meta["arch"] = "x86_64" if "64" in text else "x86"; score += 15
+        return meta, min(100, score)
+
+    if re.search(r"Microsoft\\Windows NT\\CurrentVersion", text, re.I):
+        meta["os"] = "Windows"; score += 30
+        m_ver = re.search(r"CurrentVersion[\s=]+([0-9.]+)", text)
+        if m_ver:
+            meta["version"] = m_ver.group(1); score += 25
+        m_build = re.search(r"CurrentBuild[\s=]+(\d+)", text)
+        if m_build:
+            meta["build"] = m_build.group(1); score += 20
+        meta["edition"] = "Server" if "Server" in text else "Workstation"; score += 15
+        return meta, min(100, score)
+
+    if "com.apple.SystemVersion" in text:
+        # Parsing deferred to plist bytes
+        return {}, 0
+
+    return {}, 0
+
+def _mountless_os_enrich_from_plist_bytes(p: Path, meta: Dict[str, Any], score: int) -> Tuple[Dict[str, Any], int]:
+    try:
+        win = read_head_once(p, 2 * 1024 * 1024)
+        m = re.search(b"<plist.*?</plist>", win, re.DOTALL)
+        if not m and len(win) < 2 * 1024 * 1024:
+            blob = p.read_bytes()[:4 * 1024 * 1024]
+            m = re.search(b"<plist.*?</plist>", blob, re.DOTALL)
+        if m:
+            pl = plistlib.loads(m.group(0))
+            meta["os"] = "macOS"
+            meta["version"] = pl.get("ProductVersion", "")
+            meta["build"] = pl.get("ProductBuildVersion", "")
+            score += 55
+    except Exception:
+        pass
+    return meta, min(100, score)
+
+def detect_disk_image(p: Path) -> Optional[Dict[str, str]]:
+    head = read_head_once(p)
+    if any(_has_magic_at(head, off, sig) for off, sig in MAGIC_DB["gpt"]):
+        return {"kind": "gpt", "evidence": "EFI PART header"}
+    if any(_has_magic_at(head, off, sig) for off, sig in MAGIC_DB["mbr"]):
+        pt = head[446:510]
+        if any(pt):
+            return {"kind": "mbr", "evidence": "MBR 0x55AA + PT"}
+        return {"kind": "mbr", "evidence": "MBR 0x55AA"}
+    if any(_has_magic_at(head, off, sig) for off, sig in MAGIC_DB["ntfs"]):
+        return {"kind": "ntfs", "evidence": "NTFS boot"}
+    if any(_has_magic_at(head, off, sig) for off, sig in MAGIC_DB["fat32"]):
+        return {"kind": "fat32", "evidence": "FAT32 label"}
+    return None
+
+def detect_vm_image(p: Path) -> Optional[Dict[str, str]]:
+    buf = read_head_once(p, max(HEAD_SCAN_BYTES, 1024 * 1024))
+    if any(_has_magic_at(buf, off, sig) for off, sig in MAGIC_DB["qcow"]):
+        return {"format": "qcow2", "evidence": "QFI\\xfb magic at 0"}
+    if any(_has_magic_at(buf, off, sig) for off, sig in MAGIC_DB["vhdx"]):
+        return {"format": "vhdx", "evidence": "vhdxfile at 0x200"}
+    if any(_has_magic_at(buf, off, sig) for off, sig in MAGIC_DB["vmdk"]):
+        return {"format": "vmdk", "evidence": "KDMV header"}
+    if any(_has_magic_at(buf, off, sig) for off, sig in MAGIC_DB["vdi"]):
+        return {"format": "vdi", "evidence": "Oracle VDI header"}
+    tail = buf[-1024:]
+    if b"conectix" in tail:
+        return {"format": "vhd", "evidence": "conectix footer"}
+    return None
+
+def detect_vm_package(p: Path) -> Optional[Dict[str, str]]:
+    head = read_head_once(p, 512 * 1024)
+    if any(_has_magic_at(head, off, sig) for off, sig in MAGIC_DB["tar_ustar"]):
+        return {"pkg": "ova", "evidence": "ustar tar header"}
+    ok, txt = is_probably_text(p)
+    if ok and "<Envelope" in txt and "schemas.dmtf.org/ovf/envelope/1" in txt:
+        return {"pkg": "ovf", "evidence": "OVF XML envelope"}
+    return None
+
+@register_classifier
+def classify_disk_raw(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    sig = detect_disk_image(p)
+    if not sig:
+        return "", {}
+    meta = {"disk_signature": sig, "date_collected": ymd_from_mtime(p)}
+    text = extract_text_snippet(p, 1024*1024)
+    os_meta, score = _mountless_os_detect_from_text(text)
+    if "os" not in os_meta and "com.apple.SystemVersion" in text:
+        os_meta, score = _mountless_os_enrich_from_plist_bytes(p, os_meta, score)
+    meta.update(os_meta); meta["confidence"] = score
+    return "disk_raw", meta
+
+WADE_STAGE_ACCEPT_DOCS = os.getenv("WADE_STAGE_ACCEPT_DOCS", "0") == "1"
+
+@register_classifier
+def classify_net_docs(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    if not WADE_STAGE_ACCEPT_DOCS:
+        return "", {}
+    if p.suffix.lower() not in (".md", ".rst", ".adoc", ".txt"):
+        return "", {}
+    ok, txt = is_probably_text(p)
+    if not ok:
+        return "", {}
+    if any(k in txt.lower() for k in ("site-to-site", "azure vnet", "paloalto", "fortigate", "ipsec")) \
+       and not any(k in txt for k in ("set hostname", "Building configuration")):
+        return "network_doc", {"date_collected": ymd_from_mtime(p)}
+    return "", {}
+
+@register_classifier
+def classify_vm_disk(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    sig = detect_vm_image(p)
+    if not sig:
+        return "", {}
+    meta = {"format": sig["format"], "date_collected": ymd_from_mtime(p)}
+    text = extract_text_snippet(p, 1024*1024)
+    os_meta, score = _mountless_os_detect_from_text(text)
+    if "os" not in os_meta and "com.apple.SystemVersion" in text:
+        os_meta, score = _mountless_os_enrich_from_plist_bytes(p, os_meta, score)
+    meta.update(os_meta); meta["confidence"] = score
+    return "vm_disk", meta
+
+@register_classifier
+def classify_vm_package(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    sig = detect_vm_package(p)
+    if not sig:
+        return "", {}
+    return "vm_package", {"package": sig.get("pkg"), "date_collected": ymd_from_mtime(p)}
+
+# -----------------------------
+# Network config classifier
+# -----------------------------
+@register_classifier
+def classify_network_cfg(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    ok, txt = is_probably_text(p)
+    if not ok:
+        return "", {}
+
+    preview = "\n".join(txt.splitlines()[:3])
+    stats = {"size_bytes": p.stat().st_size,
+             "line_count": txt.count("\n") + 1,
+             "entropy": calculate_entropy(p.read_bytes()[:TEXT_SNIFF_BYTES])}
+
+    best_score = 0; best_info = None
+    for det in _NETWORK_DETECTORS:
+        info = det(txt)
+        if not info:
+            continue
+        score = 0
+        if info.get("hostname"): score += 30
+        if info.get("os_version"): score += 25
+        if info.get("platform"): score += 15
+        if info.get("serial"): score += 20
+        if score > best_score:
+            best_score = score; best_info = info
+
+    if best_info:
+        best_info.update({"confidence": min(100, best_score),
+                          "preview_lines": preview, **stats})
+        return "network_config", best_info
+    return "", {}
+    
+# -----------------------------
+# Misc fallback (+ ETL host colocation)
+# -----------------------------
+def match_host_from_filename(datasources: Path, p: Path) -> Optional[str]:
+    hosts_dir = datasources / "Hosts"
+    if not hosts_dir.is_dir():
+        return None
+    stem = p.stem.lower()
+    for d in hosts_dir.iterdir():
+        if d.is_dir() and (stem == d.name.lower() or stem.startswith(d.name.lower())):
+            return d.name
+    return None
+
+@register_classifier
+def classify_misc(p: Path, datasources: Path) -> Tuple[str, Dict[str, Any]]:
+    host = match_host_from_filename(datasources, p)
+    if host:
+        return "misc", {"hostname": host, "date_collected": ymd_from_mtime(p)}
+    if is_etl(p):
+        details = {"date_collected": ymd_from_mtime(p)}
+        guessed = match_host_from_filename(datasources, p)
+        if guessed:
+            details["hostname"] = guessed
+        return "windows_etl", details
+    return "", {}
+
+# -----------------------------
+# Orchestrator
+# -----------------------------
+def classify_file(p: Path, datasources: Path) -> Tuple[str, Dict[str, Any]]:
+    for clf in CLASSIFIERS:
+        cls, details = clf(p, datasources)
+        if cls:
+            return cls, details
+    return "unknown", {}
+
+# -----------------------------
+# Destination & Move
+# -----------------------------
+def build_destination(src: Path, root: Path, classification: str, details: Dict[str, Any]) -> Path:
+    date_str = details.get("date_collected", ymd_from_mtime(src))
+    hostname = details.get("hostname") or src.stem
+
+    if classification == "network_config":
+        dir_ = root / "Network" / hostname
+        ext = src.suffix or ".cfg"
+        name = f"cfg_{hostname}_{date_str}{ext}"
+
+    elif classification == "misc":
+        dir_ = root / "Hosts" / hostname / "misc"
+        name = src.name
+
+    elif classification == "windows_etl":
+        dir_ = root / "Hosts" / hostname / "logs"
+        ext = src.suffix or ".etl"
+        name = f"{hostname}_{date_str}{ext}"
+
+    elif classification == "vm_disk":
+        fmt = details.get("format") or "disk"
+        dir_ = root / "VM" / fmt
+        ext = src.suffix or f".{fmt}"
+        name = f"{hostname}_{date_str}{ext}"
+
+    elif classification == "vm_package":
+        pkg = details.get("package") or "pkg"
+        dir_ = root / "VM" / "packages"
+        ext = src.suffix or f".{pkg}"
+        name = f"{hostname}_{date_str}{ext}"
+
+    elif classification == "network_doc":
+        dir_ = root / "Network" / "docs"
+        ext = src.suffix or ".txt"
+        name = f"{src.stem}_{date_str}{ext}"
+
+    else:
+        # e01, mem, disk_raw, etc. → Hosts/<hostname>
+        dir_ = root / "Hosts" / hostname
+        ext = ".E01" if classification == "e01" else (src.suffix or (".mem" if classification == "mem" else ""))
+        name = f"{hostname}_{date_str}{ext}"
+
+    ensure_dirs(dir_)
+    dest = dir_ / name
+    i = 1
+    while dest.exists():
+        stem, suf = os.path.splitext(name)
+        dest = dest.with_name(f"{stem}__{i}{suf}"); i += 1
+    return dest
+
+def move_atomic(src: Path, dest: Path) -> None:
+    try:
+        src.rename(dest)
+    except OSError:
+        shutil.copy2(src, dest)
+        src.unlink(missing_ok=True)
+
+# -----------------------------
+# Fragment note
+# -----------------------------
+def append_fragment_note(details: Dict[str, Any], dest: Path) -> None:
+    if not FRAGMENT_LOG or not details.get("fragmented"):
+        return
+    lines = [str(dest), "### FRAGMENTED E01 ###", "Parts:",
+             *[f"  - {p}" for p in details.get("parts", [])], "",
+             "INSTRUCTIONS:",
+             "1) Use FTK Imager → Mount → Export defragmented E01",
+             "2) Drop back into Staging", "-"*50, ""]
+    FRAGMENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with FRAGMENT_LOG.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+# -----------------------------
+# Auto-defrag (optional)
+# -----------------------------
+def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[Path]:
+    if not EWFEXPORT_PATH or not EWFINFO_PATH:
+        json_log("defrag_skip", reason="ewfexport/ewfinfo missing", src=str(src))
+        return None
+    frag_info = e01_fragmentation(src)
+    if not frag_info.get("fragmented"):
+        return None
+
+    parts = [src.parent / p for p in frag_info["parts"]]
+    all_parts = [src] + parts
+    if not all(p.exists() for p in all_parts):
+        json_log("defrag_skip", reason="missing_parts", src=str(src))
+        return None
+
+    def seg_num(p: Path) -> int:
+        try:
+            return int(p.suffix[2:])  # .E02 -> 2
+        except Exception:
+            return 999
+    all_parts.sort(key=seg_num)
+
+    import tempfile
+    ensure_dirs(Path("/var/wade/tmp"))
+    with tempfile.TemporaryDirectory(dir="/var/wade/tmp") as tmpdir:
+        tmp = Path(tmpdir)
+        merged_base = tmp / f"{src.stem}_merged"
+        cmd = [EWFEXPORT_PATH, "-t", str(merged_base), "-f", "ewf"] + [str(x) for x in all_parts]
+        start = time.time()
+        rc, out, err = run_cmd(cmd, timeout=3600)
+        merged_e01 = merged_base.with_suffix(".E01")
+        if rc != 0 or not merged_e01.exists():
+            json_log("defrag_failed", src=str(src), rc=rc, error=err, duration=round(time.time()-start, 2))
+            return None
+        rc2, _, _ = run_cmd([EWFINFO_PATH, str(merged_e01)], timeout=30)
+        if rc2 != 0:
+            json_log("defrag_verify_failed", src=str(src))
+            return None
+
+        final_dest = dest_dir / f"{src.stem}_defragmented.E01"
+        try:
+            shutil.move(str(merged_e01), str(final_dest))
+            safe_chown(final_dest, owner, owner)
+            safe_chown(final_dest.parent, owner, owner)
+        except Exception as e:
+            json_log("defrag_move_failed", src=str(src), error=str(e))
+            return None
+
+        json_log("defrag_success", src=str(src), dest=str(final_dest),
+                 parts=len(all_parts), size_bytes=final_dest.stat().st_size,
+                 duration_seconds=round(time.time()-start, 2))
+        return final_dest
+
+# -----------------------------
+# Queue
+# -----------------------------
+def enqueue_work(root: Path, work: Dict[str, Any]) -> Path:
+    cls = work.get("classification", "unknown")
+    prof = work.get("profile", "light")
+    qdir = root / cls / prof
+    qdir.mkdir(parents=True, exist_ok=True)
+    wid = work.get("id") or str(uuid.uuid4())
+    tmp = qdir / f"{wid}.json.tmp}"
+    final = qdir / f"{wid}.json"
+    # guard against stray brace typo
+    tmp = qdir / f"{wid}.json.tmp"
+    tmp.write_text(json.dumps(work, indent=2) + "\n")
+    os.replace(str(tmp), str(final))
+    return final
+
+# -----------------------------
+# Lock
+# -----------------------------
+@contextmanager
+def acquire_lock(p: Path):
+    lock = p.with_suffix(".lock")
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        try:
+            yield lock
+        finally:
+            lock.unlink(missing_ok=True)
+    except FileExistsError:
+        raise RuntimeError("already locked") from None
+
+# -----------------------------
+# Copy-safety helpers
+# -----------------------------
+def no_open_writers(p: Path) -> bool:
+    if not LSOF_CMD or not VERIFY_NO_WRITERS:
+        return True
+    rc, out, _ = run_cmd([LSOF_CMD, "-t", "--", str(p)], timeout=5)
+    # lsof returns 0 with PIDs if open; 1 if none; treat empty stdout as "no writers"
+    if rc == 0 and out.strip():
+        return False
+    return True
+
+def wait_stable(p: Path, seconds: int) -> bool:
+    if not p.exists():
+        return False
+    last = p.stat().st_size
+    remaining = seconds
+    while remaining > 0:
+        time.sleep(1)
+        if not p.exists():
+            return False
+        cur = p.stat().st_size
+        if cur == last:
+            remaining -= 1
+        else:
+            last = cur
+            remaining = seconds
+    return True
+
+# -----------------------------
+# Processing
+# -----------------------------
+def process_one(
+    conn: sqlite3.Connection,
+    src: Path,
+    datasources: Path,
+    profile: str,
+    owner: str,
+    queue_root: Path,
+) -> None:
+    try:
+        with acquire_lock(src):
+            start_ts = time.time()
+
+            # Size-aware stability wait
+            st0 = src.stat()
+            stable_secs = SMALL_FILE_STABLE if st0.st_size <= SMALL_FILE_BYTES else STABLE_SECONDS
+            if not wait_stable(src, stable_secs):
+                json_log("not_stable", src_path=str(src), waited_seconds=stable_secs)
+                return
+            if not no_open_writers(src):
+                json_log("writers_present", src_path=str(src))
+                return
+
+            # --- PRE-MOVE SNAPSHOT ---
+            pre_st = st0  # reuse the stat we already did
+            pre_sig = f"{pre_st.st_dev}:{pre_st.st_ino}:{pre_st.st_size}:{int(pre_st.st_mtime_ns)}"
+            pre_content_sig = quick_content_sig(src)
+
+            # Positive-path breadcrumbs
+            json_log("waited_for_stable",
+                     src_path=str(src),
+                     stable_seconds=stable_secs,
+                     size_bytes=pre_st.st_size)
+            if LSOF_CMD and VERIFY_NO_WRITERS:
+                rc, out, _ = run_cmd([LSOF_CMD, "-t", "--", str(src)], timeout=5)
+                json_log("writer_check",
+                         src_path=str(src),
+                         writers_found=(rc == 0 and out.strip() != ""))
+
+            # Duplicate guard (by content first, then inode sig)
+            if already_processed_by_content(conn, pre_content_sig):
+                ignored = STAGING_ROOT / "ignored"
+                ensure_dirs(ignored)
+                dest_ignored = ignored / src.name
+                move_atomic(src, dest_ignored)
+                json_log("duplicate_ignored_content",
+                         original_name=src.name, dest_path=str(dest_ignored),
+                         profile=profile, content_sig=pre_content_sig)
+                return
+
+            if already_processed(conn, pre_sig):
+                ignored = STAGING_ROOT / "ignored"
+                ensure_dirs(ignored)
+                dest_ignored = ignored / src.name
+                move_atomic(src, dest_ignored)
+                json_log("duplicate_ignored",
+                         original_name=src.name, dest_path=str(dest_ignored),
+                         profile=profile, sig=pre_sig)
+                return
+
+            # Classification
+            classification, details = classify_file(src, datasources)
+            if classification == "unknown":
+                triage = debug_probe_file(src)
+                json_log("skipped_unknown", original_name=src.name, src_path=str(src), profile=profile,
+                         sig=pre_sig, **triage)
+                return
+
+            hostname = details.get("hostname") or src.stem
+            dest = build_destination(src, datasources, classification, details)
+
+            # If a same-named file already exists and bytes match, ignore (no "__1")
+            if dest.exists():
+                try:
+                    if quick_content_sig(dest) == pre_content_sig:
+                        ignored = STAGING_ROOT / "ignored"
+                        ensure_dirs(ignored)
+                        dest_ignored = ignored / src.name
+                        move_atomic(src, dest_ignored)
+                        json_log("duplicate_ignored_existing",
+                                 original_name=src.name, existing=str(dest),
+                                 dest_path=str(dest_ignored), profile=profile,
+                                 content_sig=pre_content_sig)
+                        return
+                except Exception:
+                    pass
+
+            # Move / E01 handling
+            final_path = dest
+            fragged = None
+            if classification == "e01":
+                fragged = details.get("fragmentation")
+                merged_path = defragment_e01_fragments(src, dest.parent, owner) if (fragged and fragged.get("fragmented")) else None
+                if merged_path:
+                    final_path = merged_path
+                    # Re-enrich hostname/date from merged
+                    if TARGET_INFO_PATH:
+                        rc, out, _ = run_cmd([TARGET_INFO_PATH, "-j", str(final_path)], timeout=30)
+                        if rc == 0:
+                            try:
+                                j = json.loads(out)
+                                if j.get("hostname"):
+                                    details["hostname"] = j["hostname"]; hostname = j["hostname"]
+                                if j.get("acquired_date"):
+                                    details["date_collected"] = j["acquired_date"]
+                            except Exception:
+                                pass
+                else:
+                    # Fall back to moving original
+                    move_atomic(src, dest)
+                    final_path = dest
+                    if fragged and fragged.get("fragmented"):
+                        append_fragment_note(fragged, final_path)
+            else:
+                # Non-E01: move final
+                move_atomic(src, dest)
+                final_path = dest
+
+            # Ownership
+            safe_chown(final_path, owner, owner)
+            safe_chown(final_path.parent, owner, owner)
+
+            # Work order & DB
+            final_sig = fast_signature(final_path)
+            final_content_sig = quick_content_sig(final_path)
+            work = {
+                "schema": "wade.queue.workorder",
+                "version": 1,
+                "id": str(uuid.uuid4()),
+                "created_utc": utc_now_iso(),
+                "profile": profile,
+                "classification": classification,
+                "original_name": src.name,
+                "source_host": os.uname().nodename,
+                "dest_path": str(final_path),
+                "size_bytes": final_path.stat().st_size,
+                "sig": final_sig,
+                "content_sig": final_content_sig,
+            }
+            if classification in ("e01", "mem"):
+                work.update(hostname=hostname, date_collected=details.get("date_collected"))
+            if classification == "network_config":
+                work.update(vendor=details.get("vendor"),
+                            os_version=details.get("os_version"),
+                            hostname=hostname)
+            if classification == "vm_disk":
+                work.update(vm_format=details.get("format"))
+
+            queue_path = enqueue_work(queue_root, work)
+
+            # Rich log payload
+            log_payload: Dict[str, Any] = {
+                "event": "staged",
+                "profile": profile,
+                "classification": classification,
+                "original_name": src.name,
+                "src_path": str(src),
+                "dest_path": str(final_path),
+                "sig": final_sig,
+                "content_sig": final_content_sig,
+                "size_bytes": final_path.stat().st_size,
+                "started_utc": utc_from_ts(start_ts),
+                "finished_utc": utc_now_iso(),
+                "duration_seconds": round(time.time() - start_ts, 3),
+                "queue_path": str(queue_path),
+            }
+
+            if classification in ("disk_raw", "vm_disk"):
+                md = {
+                    "os": details.get("os"),
+                    "version": details.get("version"),
+                    "edition": details.get("edition"),
+                    "arch": details.get("arch"),
+                    "build": details.get("build"),
+                    "kernel": details.get("kernel"),
+                    "distro": details.get("distro"),
+                    "confidence": details.get("confidence"),
+                }
+                if classification == "vm_disk":
+                    md["vm_format"] = details.get("format")
+                log_payload["metadata"] = {k: v for k, v in md.items() if v is not None}
+
+            elif classification in ("e01", "mem", "vm_package", "windows_etl"):
+                md = {
+                    "hostname": details.get("hostname"),
+                    "date_collected": details.get("date_collected"),
+                }
+                if classification == "e01":
+                    md["fragmented"] = bool(fragged and fragged.get("fragmented"))
+                if classification == "mem":
+                    md["mem_kind"] = (details.get("mem_signature") or {}).get("kind")
+                if classification == "vm_package":
+                    md["package"] = details.get("package")
+                log_payload["metadata"] = {k: v for k, v in md.items() if v is not None}
+
+            json_log(**log_payload)
+
+            # Record pre-move snapshot (no stat on src after move)
+            record_processed_snapshot(
+                conn, pre_sig, str(src), pre_st.st_size, int(pre_st.st_mtime_ns),
+                final_path, classification, profile, content_sig=final_content_sig
+            )
+
+    except Exception as exc:
+        failed = src.with_suffix(".failed")
+        try:
+            src.rename(failed)
+        except Exception:
+            pass
+        json_log("processing_failed", original_name=src.name, src_path=str(src),
+                 error=str(exc), profile=profile)
+        raise
+
+# -----------------------------
+# Paths & housekeeping
+# -----------------------------
+def build_paths() -> Tuple[str, Path, Path, Path, Path]:
+    env = load_env()
+    owner = env.get("WADE_OWNER_USER", DEFAULT_OWNER)
+    datadir = Path(env.get("WADE_DATADIR", DEFAULT_DATADIR))
+    staging = Path(env.get("WADE_STAGINGDIR", DEFAULT_STAGINGDIR))
+    home = Path(f"/home/{owner}")
+    staging_root = home / staging
+    full = staging_root / "full"
+    light = staging_root / "light"
+    datasources = home / datadir
+    queue_root = Path(env.get("WADE_QUEUE_DIR", "_queue"))
+    if not queue_root.is_absolute():
+        queue_root = datasources / queue_root
+
+    global STATE_DIR, LOG_ROOT, SQLITE_DB, STAGING_ROOT, FRAGMENT_LOG
+    STATE_DIR = Path("/var/wade/state")
+    LOG_ROOT = Path("/var/wade/logs/stage")
+    SQLITE_DB = STATE_DIR / "staging_index.sqlite3"
+    STAGING_ROOT = staging_root
+    FRAGMENT_LOG = datasources / "images_to_be_defragmented.log"
+
+    ensure_dirs(full, light, datasources / "Hosts", datasources / "Network",
+                staging_root / "ignored", queue_root, STATE_DIR, LOG_ROOT)
+
+    # Queue hygiene: delete >7 day old files
+    now = time.time()
+    for cls in ("e01", "mem", "disk_raw", "vm_disk", "vm_package", "network_config", "windows_etl", "misc", "unknown"):
+        for prof in ("full", "light"):
+            qdir = queue_root / cls / prof
+            if qdir.exists():
+                for f in qdir.iterdir():
+                    if f.is_file() and f.stat().st_mtime < now - 7*86400:
+                        f.unlink(missing_ok=True)
+
+    return owner, full, light, datasources, queue_root
+
+# -----------------------------
+# Main Loop
+# -----------------------------
+def iter_files(dir_: Path) -> Iterable[Path]:
+    """Yield candidate files (skip temp-ish) from dir_. Recursive when enabled."""
+    skip_suffixes = (".part", ".tmp", ".crdownload")
+    if not WADE_STAGE_RECURSIVE:
+        for p in dir_.iterdir():
+            if p.is_file() and not p.name.lower().endswith(skip_suffixes):
+                yield p
+        return
+
+    # Recursive walk
+    for root, dirs, files in os.walk(dir_):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.lower().endswith(skip_suffixes):
+                continue
+            p = Path(root) / name
+            if p.is_file():
+                yield p
+
+def polling_loop(conn, full, light, datasources, queue_root, owner):
+    print(f"[+] Polling mode – scanning every {SCAN_INTERVAL_SEC}s")
+    while True:
+        for directory, prof in ((full, "full"), (light, "light")):
+            for p in iter_files(directory):
+                process_one(conn, p, datasources, prof, owner, queue_root)
+        time.sleep(SCAN_INTERVAL_SEC)
+
+def inotify_loop(conn, full, light, datasources, queue_root, owner):
+    inotify = INotify()
+    base_flags = flags.CLOSE_WRITE if REQUIRE_CLOSE_WRITE else (flags.CLOSE_WRITE | flags.MOVED_TO | flags.CREATE)
+    dir_flags = base_flags | flags.MOVED_TO | flags.CREATE  # for new files/dirs
+    watch_map: Dict[int, Path] = {}
+
+    def add_watch_dir(d: Path):
+        if not d.exists() or not d.is_dir():
+            return None
+        wd = inotify.add_watch(str(d), dir_flags)
+        watch_map[wd] = d
+        return wd
+
+    def add_tree(root: Path):
+        add_watch_dir(root)
+        if WADE_STAGE_RECURSIVE:
+            for r, dirs, _ in os.walk(root):
+                for d in dirs:
+                    add_watch_dir(Path(r) / d)
+
+    add_tree(full)
+    add_tree(light)
+
+    print("[+] inotify mode – waiting for events (recursive=%s)" % ("on" if WADE_STAGE_RECURSIVE else "off"))
+
+    while True:
+        for ev in inotify.read(timeout=1000):
+            parent = watch_map.get(ev.wd)
+            if parent is None:
+                continue
+            name = ev.name
+            if not name:
+                continue
+            path = parent / name
+
+            # If a directory appears and recursion is enabled, start watching it
+            if WADE_STAGE_RECURSIVE and (ev.mask & flags.ISDIR):
+                if path.is_dir():
+                    add_watch_dir(path)
+                continue
+
+            # Skip temp-ish partials
+            nl = name.lower()
+            if nl.endswith((".part", ".tmp", ".crdownload")):
+                continue
+
+            # Only proceed on files
+            if path.is_file():
+                # extra debounce: ensure stable + no writers
+                if not wait_stable(path, STABLE_SECONDS):
+                    continue
+                if not no_open_writers(path):
+                    continue
+
+                prof = "full" if parent == full else "light"
+                process_one(conn, path, datasources, prof, owner, queue_root)
+
+def main() -> None:
+    owner, stage_full, stage_light, datasources, queue_root = build_paths()
+    conn = init_db()
+    def _sig(*_): sys.exit(0)
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+
+    print("[*] WADE staging daemon starting…")
+    try:
+        if INOTIFY_AVAILABLE:
+            inotify_loop(conn, stage_full, stage_light, datasources, queue_root, owner)
+        else:
+            polling_loop(conn, stage_full, stage_light, datasources, queue_root, owner)
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()
