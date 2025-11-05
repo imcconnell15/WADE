@@ -135,8 +135,17 @@ STEPS_DIR="${WADE_VAR_DEFAULT}/state/steps"; mkdir -p "$STEPS_DIR"
 
 _inlist(){ local item="$1" list_csv="$2"; [[ -z "$list_csv" ]] && return 0; IFS=',' read -ra arr <<< "$list_csv"; for x in "${arr[@]}"; do [[ "$item" == "$x" ]] && return 0; done; return 1; }
 mark_done(){ local step="$1" ver="$2"; shift 2 || true; printf '%s\n' "$ver" > "${STEPS_DIR}/${step}.ver"; [[ $# -gt 0 ]] && printf '%s\n' "$*" > "${STEPS_DIR}/${step}.note"; }
-get_mark_ver(){ local step="$1" [[ -f "${STEPS_DIR}/${step}.ver" ]] && cat "${STEPS_DIR}/${step}.ver" || echo ""; }
 report_step(){ printf " - %-16s want=%-12s have=%-14s [%s]\n" "$1" "${2:-n/a}" "${3:-n/a}" "$4"; }
+
+get_mark_ver(){
+  local step="$1"
+  if [[ -f "${STEPS_DIR}/${step}.ver" ]]; then
+    cat "${STEPS_DIR}/${step}.ver"
+  else
+    echo ""
+  fi
+}
+
 
 # Caches/symbols for vol3 & friends
 CACHEDIR="${CACHEDIR:-/var/wade/cache}"
@@ -278,7 +287,7 @@ wade_doctor() {
     echo "[!] Splunk UF not installed"
   fi
   echo "[*] Listening ports (smbd 139/445, solr 8983, postgres 5432):"
-  ss -plnt | awk 'NR==1 || /:139 |:445 |:8983 |:5432 /'
+  ss -plnt | awk 'NR==1 || /:(139|445|8983|5432)\b/'
   echo "===================="
 }
 
@@ -289,6 +298,9 @@ require_root
 CPU_MIN=4; RAM_MIN_GB=16; DISK_MIN_GB=200
 CPU_CORES=$(nproc || echo 1)
 MEM_GB=$(( ( $(awk '/MemTotal/{print $2}' /proc/meminfo) + 1048575 ) / 1048576 ))
+if (( MEM_GB < 32 )); then
+  SOLR_JAVA_MEM='-Xms2g -Xmx4g'
+fi
 ROOT_AVAIL_GB=$(( ( $(df --output=avail / | tail -1) + 1048575 ) / 1048576 ))
 echo "[*] Cores:${CPU_CORES} RAM:${MEM_GB}GB Free/:${ROOT_AVAIL_GB}GB"
 WARN=false
@@ -732,7 +744,9 @@ EOF
   CASESDIR="/home/${LWADEUSER}/${WADE_CASESDIR}"
   STAGINGDIR="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
   mkdir -p "$DATADIR" "$CASESDIR" "$STAGINGDIR"
-  chown -R "${LWADEUSER}:${LWADEUSER}" "/home/${LWADEUSER}"
+  chown -R "${LWADEUSER}:${LWADEUSER}" "/home/${LWADEUSER}/${WADE_DATADIR}" \
+                                     "/home/${LWADEUSER}/${WADE_CASESDIR}" \
+                                     "/home/${LWADEUSER}/${WADE_STAGINGDIR}"
   chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
   HOSTS_DENY_LINE="   hosts deny = 0.0.0.0/0"
@@ -939,7 +953,7 @@ EOF
 #####################################
 # pipx tools: volatility3 + dissect
 #####################################
-run_step "pipx-vol3" "installed" get_ver_pipx_vol3 '
+run_step "pipx-vol3" "" get_ver_pipx_vol3 '
   set -e
   export PIPX_HOME=/opt/pipx
   export PIPX_BIN_DIR=/usr/local/bin
@@ -959,7 +973,7 @@ run_step "pipx-vol3" "installed" get_ver_pipx_vol3 '
   pipx install volatility3 || pipx upgrade volatility3
 ' || fail_note "pipx-vol3" "install failed"
 
-run_step "pipx-dissect" "installed" get_ver_pipx_dissect '
+run_step "pipx-dissect" "" get_ver_pipx_dissect '
   set -e
   export PIPX_HOME=/opt/pipx
   export PIPX_BIN_DIR=/usr/local/bin
@@ -1181,9 +1195,9 @@ run_step "vol3-symbols" "current" 'get_mark_ver vol3-symbols' '
 
   # Pull the official prebuilt packs when online, or use offline cache if present
   for z in windows.zip mac.zip linux.zip; do
-    test -f "'"${VOL3_SYMBOLS_DIR}"'/$z" && continue
+    [[ -f "${VOL3_SYMBOLS_DIR}/$z" ]] && continue
     fetch_pkg "volatility3/symbols" "$z" || curl -L "https://downloads.volatilityfoundation.org/volatility3/symbols/${z}" -o "$z"
-    cp -f "$z" "'"${VOL3_SYMBOLS_DIR}"'/"
+    cp -f "$z" "${VOL3_SYMBOLS_DIR}/"
   done
 
   # Ownership so your primary operator can add symbols later
@@ -1391,7 +1405,7 @@ run_step "barracuda" "installed" get_ver_barracuda '
     '\''s|load_techniques_enriched\("enterprise-attack\.json"\)|load_techniques_enriched("/opt/barracuda/enterprise-attack.json")|'\'' \
     /opt/barracuda/app.py || true
 
-  install -d -o autopsy -g autopsy -m 0750 /opt/barracuda/uploads
+  install -d -o "${LWADEUSER}" -g "${LWADEUSER}" -m 0750 /opt/barracuda/uploads
 
   cat >/usr/local/bin/barracuda <<'\''EOF'\''
 #!/usr/bin/env bash
@@ -1641,21 +1655,21 @@ run_step "stig-prereqs" "installed" get_ver_stig_pkgs '
 ' || fail_note "stig" "could not install prerequisites"
 fi
 
+
 #####################################
-# Splunk Universal Forwarder (DEB path; soft-fail)
+# Splunk Universal Forwarder (UF-only)
 #####################################
-run_step "splunk-uf" "installed" get_ver_uf '
+run_step "splunk-uf" "installed" get_ver_splunkuf '
   set -e
 
-  if [[ "$PM" != "apt" ]]; then
-    echo "[!] Splunk UF step currently implements the Debian/Ubuntu path."
-    exit 1
+  # Basic deps
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || true
+    apt-get install -y --no-install-recommends procps curl
   fi
 
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y || true
-  apt-get install -y --no-install-recommends procps curl || true
-
+  # System user for UF
   id splunkfwd >/dev/null 2>&1 || useradd --system --home-dir /opt/splunkforwarder --shell /usr/sbin/nologin splunkfwd || true
 
   # ---- locate UF package (env URL, /var/wade/pkg, or script dir) ----
@@ -1665,106 +1679,73 @@ run_step "splunk-uf" "installed" get_ver_uf '
     curl -L "${SPLUNK_UF_DEB_URL}" -o "$PKG"
   elif ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb >/dev/null 2>&1; then
     PKG="$(ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb | sort -V | tail -1)"
-  elif ls "'"$SPLUNK_SRC_DIR"'"/splunkforwarder*.deb >/dev/null 2>&1; then
-    PKG="$(ls "'"$SPLUNK_SRC_DIR"'"/splunkforwarder*.deb | sort -V | tail -1)"
+  elif [[ -n "${SPLUNK_SRC_DIR:-}" ]] && ls "${SPLUNK_SRC_DIR}"/splunkforwarder*.deb >/dev/null 2>&1; then
+    PKG="$(ls "${SPLUNK_SRC_DIR}"/splunkforwarder*.deb | sort -V | tail -1)"
   fi
 
-    if [[ -z "$PKG" || ! -f "$PKG" ]]; then
-  echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/"
-  exit 0   # soft-skip UF so the installer keeps going
-    fi
+  # Soft-skip if you didn't provide a UF package
+  if [[ -z "$PKG" || ! -f "$PKG" ]]; then
+    echo "[!] No UF .deb provided. Set SPLUNK_UF_DEB_URL or place a .deb under ${WADE_PKG_DIR:-/var/wade/pkg}/splunkforwarder/"
+    exit 0
+  fi
 
   dpkg -i "$PKG" || apt-get -f install -y
+
+  # Accept license + enable at boot under splunkfwd
   /opt/splunkforwarder/bin/splunk enable boot-start -systemd-managed 1 -user splunkfwd --accept-license --answer-yes || true
+
+  # ---- defaults from wade.conf (with sane fallbacks) ----
+  SERVER_LINE="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
+  DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
+  COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
+  USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
+  SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
+  SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
+  DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
+
+  # If early prompts pre-set values, prefer them
+  if [[ "${PRESET_SPLUNK:-0}" -eq 1 ]]; then
+    SERVER_LINE="${PRESET_SPLUNK_SERVER_LINE:-$SERVER_LINE}"
+    DEFAULT_INDEX="${PRESET_SPLUNK_INDEX:-$DEFAULT_INDEX}"
+    COMPRESSED="${PRESET_SPLUNK_COMPRESSED:-$COMPRESSED}"
+    USE_ACK="${PRESET_SPLUNK_USEACK:-$USE_ACK}"
+    SSL_VERIFY="${PRESET_SPLUNK_SSL_VERIFY:-$SSL_VERIFY}"
+    SSL_CN="${PRESET_SPLUNK_SSL_CN:-$SSL_CN}"
+    DS_TARGET="${PRESET_SPLUNK_DS:-$DS_TARGET}"
+  fi
 
   mkdir -p /opt/splunkforwarder/etc/system/local
 
-  # ---- defaults from wade.conf (with sane fallbacks) ----
-DEFAULT_HOSTS="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
-DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
-COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
-USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
-SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
-SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
-DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
-
-
-  local SERVER_LINE=""
-
-  if [[ "${NONINTERACTIVE:-0}" -eq 0 ]]; then
-# ---- derive UF settings from early prompt stack or defaults ----
-    if [[ "${PRESET_SPLUNK:-0}" -eq 1 ]]; then
-    SERVER_LINE="${PRESET_SPLUNK_SERVER_LINE}"
-    DEFAULT_INDEX="${PRESET_SPLUNK_INDEX}"
-    COMPRESSED="${PRESET_SPLUNK_COMPRESSED}"
-    USE_ACK="${PRESET_SPLUNK_USEACK}"
-    SSL_VERIFY="${PRESET_SPLUNK_SSL_VERIFY}"
-    SSL_CN="${PRESET_SPLUNK_SSL_CN}"
-    DS_TARGET="${PRESET_SPLUNK_DS}"
-    else
-    # fall back to wade.conf defaults silently
-    SERVER_LINE="${SPLUNK_UF_RCVR_HOSTS:-splunk.example.org:9997}"
-    DEFAULT_INDEX="${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}"
-    COMPRESSED="${SPLUNK_UF_COMPRESSED:-true}"
-    USE_ACK="${SPLUNK_UF_USE_ACK:-true}"
-    SSL_VERIFY="${SPLUNK_UF_SSL_VERIFY:-false}"
-    SSL_CN="${SPLUNK_UF_SSL_COMMON_NAME:-*}"
-    DS_TARGET="${SPLUNK_UF_DEPLOYMENT_SERVER:-}"
-    fi
-  else
-    SERVER_LINE="${DEFAULT_HOSTS}"
-  fi
-
-  # ---- write outputs.conf ----
-  SSL_BLOCK=""
-  if [[ "$SSL_VERIFY" == "true" ]]; then
-    SSL_BLOCK=$'"'"'sslVerifyServerCert = true
-sslCommonNameToCheck = '"'"'"${SSL_CN}"'"'"''"'"'
-  fi
-
-  cat >/opt/splunkforwarder/etc/system/local/outputs.conf <<OUTCONF
+  cat >/opt/splunkforwarder/etc/system/local/outputs.conf <<EOF
 [tcpout]
 defaultGroup = default-autolb-group
-indexAndForward = false
 
 [tcpout:default-autolb-group]
 server = ${SERVER_LINE}
-autoLB = true
 compressed = ${COMPRESSED}
 useACK = ${USE_ACK}
-${SSL_BLOCK}
-OUTCONF
+EOF
 
-  # ---- write inputs.conf (basic WADE monitors) ----
-  cat >/opt/splunkforwarder/etc/system/local/inputs.conf <<INCONF
-[monitor:///var/wade/logs]
-index = ${DEFAULT_INDEX}
-sourcetype = wade:log
-
-[monitor:///var/log/wade/piranha]
-index = ${DEFAULT_INDEX}
-sourcetype = wade:piranha
-
-[monitor:///var/log/wade]
-index = ${DEFAULT_INDEX}
-sourcetype = wade:misc
-INCONF
-
-  # ---- deployment server (optional) ----
-  if [[ -n "$DS_TARGET" ]]; then
-    cat >/opt/splunkforwarder/etc/system/local/deploymentclient.conf <<DCONF
-[deployment-client]
-[target-broker:deploymentServer]
-targetUri = ${DS_TARGET}
-DCONF
+  # Optional SSL common name pinning
+  if [[ "$SSL_VERIFY" == "true" ]]; then
+    cat >>/opt/splunkforwarder/etc/system/local/outputs.conf <<EOF
+sslVerifyServerCert = true
+sslCommonNameToCheck = ${SSL_CN}
+EOF
   fi
 
-  chown -R splunkfwd:splunkfwd /opt/splunkforwarder || true
-systemctl daemon-reload
-systemctl enable --now SplunkForwarder.service \
-  || systemctl enable --now splunkforwarder.service \
-  || systemctl restart SplunkForwarder.service \
-  || systemctl restart splunkforwarder.service || true
+  # Optional Deployment Server
+  if [[ -n "$DS_TARGET" ]]; then
+    cat >/opt/splunkforwarder/etc/system/local/deploymentclient.conf <<EOF
+[deployment-client]
+clientName = wade-uf
+
+[target-broker:deploymentServer]
+targetUri = ${DS_TARGET}
+EOF
+  fi
+
+  systemctl enable --now SplunkForwarder.service 2>/dev/null || systemctl enable --now splunkforwarder.service || true
 ' || fail_note "splunk-uf" "install/config failed"
 
 #####################################
@@ -1883,6 +1864,8 @@ install_wade_logrotate_bulk() {
 # Rotate JSONL under /var/wade/logs/malware weekly, keep 14 copies
 install_wade_logrotate "wade-mw-extractor" "/var/wade/logs/malware" "${LWADEUSER:-autopsy}" "${LWADEUSER:-autopsy}" 14 "weekly" "copytruncate"
 
+install_wade_logrotate "wade-staging" "/var/wade/logs/stage" "${LWADEUSER:-autopsy}" "${LWADEUSER:-autopsy}" 14 "daily" "copytruncate"
+
 #####################################
 # Persist facts & endpoints
 #####################################
@@ -1944,16 +1927,23 @@ HAYABUSA_RULES_DIR="${HAYABUSA_RULES_DIR}"
 SIGMA_RULES_DIR="${SIGMA_RULES_DIR}"
 
 # Staging safety & performance
-WADE_STAGE_STABLE_SECONDS=60
-WADE_STAGE_REQUIRE_CLOSE=1
-WADE_STAGE_OPENFD_STABLE_SECONDS=5
-WADE_STAGE_HEAD_SCAN_BYTES=1048576
+WADE_STAGE_STABLE_SECONDS=180
+WADE_STAGE_REQUIRE_CLOSE_WRITE=1
+WADE_STAGE_VERIFY_NO_WRITERS=1
+WADE_STAGE_RECURSIVE=1
+WADE_STAGE_ACCEPT_DOCS=1
+WADE_STAGE_SMALL_FILE_BYTES=2097152
+WADE_STAGE_SMALL_FILE_STABLE=5
 
 # Offline flag
 OFFLINE="${OFFLINE}"
 
 # Queue 
 WADE_QUEUE_DIR=_queue
+
+# WHIFF
+WHIFF_ENABLE=1
+WHIFF_URL=http://127.0.0.1:8088/annotate
 
 # ===== Network ports in use =====
 SSH_PORT="22"
@@ -1982,7 +1972,7 @@ SPLUNK_FORWARD_PORT="\${SPLUNK_FORWARD_PORT}"
 WADE_SERVICE_PORTS_CSV="\${SSH_PORT},\${SMB_TCP_139},\${SMB_TCP_445},\${SMB_UDP_137},\${SMB_UDP_138},\${ZK_CLIENT_PORT},\${ZK_QUORUM_PORT},\${ZK_ELECTION_PORT},\${SOLR_PORT},\${ACTIVEMQ_OPENWIRE_PORT},\${ACTIVEMQ_WEB_CONSOLE_PORT},\${ACTIVEMQ_AMQP_PORT},\${ACTIVEMQ_STOMP_PORT},\${ACTIVEMQ_MQTT_PORT},\${ACTIVEMQ_WS_PORT},\${POSTGRES_PORT},\${PIRANHA_PORT},\${BARRACUDA_PORT},\${SPLUNK_WEB_PORT},\${SPLUNK_MGMT_PORT},\${SPLUNK_HEC_PORT},\${SPLUNK_FORWARD_PORT}"
 ENV
 
- chown root:autopsy "$ENV_FILE"
+ chown root:"${LWADEUSER}" "$ENV_FILE"
  chmod 0640 "$ENV_FILE"
 
 
@@ -2015,6 +2005,12 @@ fi
 echo "    Log       : ${LOG_FILE}"
 echo
 echo "NOTE: New tools default to SPLUNK index: '${SPLUNK_DEFAULT_INDEX:-wade_custom}'."
+
+#####################################
+# Call The Doctor
+#####################################
+
+wade_doctor
 
 #####################################
 # Interactive STIG assessment (end; reads from ./stigs)
