@@ -20,6 +20,33 @@ yesno_with_default() {
 
 set -Euo pipefail   # no -e (we soft-fail via step runner); still strict on unset + pipefail
 
+# ---- Debug + transcript logging ----
+WADE_DEBUG="${WADE_DEBUG:-0}"
+
+LOG_DIR="/var/log/wade"
+mkdir -p "$LOG_DIR"
+
+# use UTC for easy cross-host correlation; change to +%Y%m%d_%H%M%S if you prefer local
+LOG_FILE="$LOG_DIR/install_$(date -u +%F_%H%M%S).log"
+export LOG_FILE
+
+# tee everything (children inherit our stdout); keep Python unbuffered
+export PYTHONUNBUFFERED=1
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Optional: send xtrace to the log file only (keeps console cleaner)
+if [[ "$WADE_DEBUG" = "1" ]]; then
+  exec {__XFD}>>"$LOG_FILE"
+  export BASH_XTRACEFD=${__XFD}
+  export PS4='+ ${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]:-main}: '
+  set -x
+fi
+
+# Pretty error frames without killing soft-fail flow
+# (Don’t exit here; let run_step() capture failures.)
+trap 'rc=$?; line=${BASH_LINENO[0]:-$LINENO}; cmd=${BASH_COMMAND}
+echo "[ERR] ${BASH_SOURCE##*/}:${line} rc=${rc}  cmd: ${cmd}" >&2' ERR
+
 #####################################
 # Banner
 #####################################
@@ -71,13 +98,6 @@ done
 
 NONINTERACTIVE=${WADE_NONINTERACTIVE:-$NONINTERACTIVE}
 OFFLINE="${OFFLINE:-0}"
-
-#####################################
-# Logging
-#####################################
-LOG_DIR="/var/log/wade"; mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/install_$(date +%Y%m%d_%H%M%S).log"
-exec > >(tee -a "$LOG_FILE") 2>&1
 
 #####################################
 # Helpers
@@ -277,8 +297,9 @@ get_ver_capa_rules(){
   if [[ -d "$dir/.git" ]]; then
     git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo ""
   elif [[ -d "$dir" ]]; then
-    local n; n=$(find "$dir" -type f -name '*.yml' 2>/dev/null | wc -l | tr -d ' ')
-    [[ "$n" =~ ^[0-9]+$ ]] && echo "files-${n}" || echo ""
+    local rules_count
+    rules_count="$(find "$dir" -type f -name '*.yml' 2>/dev/null | wc -l | tr -d ' ')"
+    [[ "${rules_count:-0}" =~ ^[0-9]+$ ]] && echo "files-${rules_count}" || echo ""
   else
     echo ""
   fi
@@ -787,13 +808,13 @@ EOF
   chown -R "${LWADEUSER}:${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
   chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
-  HOSTS_BLOCK=""
-  if [[ "${#ALLOW_NETS_ARR[@]}" -gt 0 ]]; then
+    HOSTS_BLOCK=""
+  # Only build the allow/deny lines if we really have nets; safe under set -u
+  if [[ -n "${ALLOW_NETS_ARR+x}" && ${#ALLOW_NETS_ARR[@]} -gt 0 ]]; then
     HOSTS_BLOCK="   hosts allow ="
-    for n in "${ALLOW_NETS_ARR[@]}"; do HOSTS_BLOCK+=" ${n}"; done
+    for net in "${ALLOW_NETS_ARR[@]}"; do HOSTS_BLOCK+=" ${net}"; done
     HOSTS_BLOCK+=$'\n''   hosts deny = 0.0.0.0/0'
   fi
-  VALID_USERS="$(echo "${SMB_USERS_CSV}" | sed "s/[[:space:]]//g")"
 
   # Delete previous managed block, if any
   sed -e "/^\[WADE-BEGIN\]/,/^\[WADE-END\]/d" -i "$SMB_CONF"
@@ -873,13 +894,13 @@ EOF
     systemctl enable firewalld --now || true
     if [[ "${WADE_STRICT_FIREWALL:-0}" -eq 1 ]]; then
       firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true
-      for n in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${n}' service name='samba' accept" || true
+      for net in "${ALLOW_NETS_ARR[@]}"; do
+        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${net}' service name='samba' accept" || true
       done
     else
       firewall-cmd --permanent --add-service=samba || true
-      for n in "${ALLOW_NETS_ARR[@]}"; do
-        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${n}' service name='samba' accept" || true
+      for net in "${ALLOW_NETS_ARR[@]}"; do
+        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${net}' service name='samba' accept" || true
       done
     fi
     firewall-cmd --reload || true
@@ -1098,8 +1119,8 @@ fi
 EOF
   chmod 0755 /usr/local/sbin/update-capa-rules
 
-  n=$(find "$WADE_CAPA_RULES_DIR" -type f -name "*.yml" 2>/dev/null | wc -l | tr -d " ")
-  [[ "${n:-0}" -gt 0 ]] || { echo "no rules found"; exit 1; }
+  rules_count="$(find "$WADE_CAPA_RULES_DIR" -type f -name "*.yml" 2>/dev/null | wc -l | tr -d " ")"
+  [[ "${rules_count:-0}" -gt 0 ]] || { echo "no rules found"; exit 1; }
 ' || fail_note "capa-rules" "rules install failed"
 
 #####################################
@@ -1577,8 +1598,8 @@ run_step "postgresql" "configured" get_ver_pg '
     grep -q "listen_addresses" "${PG_DIR}/postgresql.conf" && \
       sed -ri "s/^#?listen_addresses\s*=.*/listen_addresses = '"'"'${PG_LISTEN_ADDR}'"'"'/" "${PG_DIR}/postgresql.conf" \
       || echo "listen_addresses = '"'"'${PG_LISTEN_ADDR}'"'"'" >> "${PG_DIR}/postgresql.conf"
-    for n in ${ALLOW_NETS_CSV//,/ }; do
-      grep -qE "^\s*host\s+all\s+all\s+${n}\s+md5" "${PG_DIR}/pg_hba.conf" || echo "host all all ${n} md5" >> "${PG_DIR}/pg_hba.conf"
+    for net in ${ALLOW_NETS_CSV//,/ }; do
+      grep -qE "^\s*host\s+all\s+all\s+${net}\s+md5" "${PG_DIR}/pg_hba.conf" || echo "host all all ${net} md5" >> "${PG_DIR}/pg_hba.conf"
     done
     systemctl restart postgresql || true
   fi
