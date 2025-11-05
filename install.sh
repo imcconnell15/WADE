@@ -274,7 +274,7 @@ run_step(){
     report_step "$name" "$want" "$have" "OK"; return 0
   fi
   echo "[*] Installing/updating ${name} (want=${want:-n/a}, have=${have:-none})…"
-  if ( set -Eeuo pipefail; eval "$do_install" ); then
+  if ( set -Eeo pipefail; eval "$do_install" ); then
     have="$($get_have 2>/dev/null || true)"
     mark_done "$name" "${have:-unknown}"
     report_step "$name" "$want" "$have" "OK"
@@ -902,27 +902,17 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
   confirm "Proceed with installation?" || exit 0
 fi
 
-#####################################
-# Samba shares (DataSources, Cases, Staging)
-#####################################
-get_ver_samba(){
-  local SMB_CONF="/etc/samba/smb.conf"
-  grep -q '^\[WADE-BEGIN\]' "$SMB_CONF" 2>/dev/null || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_DATADIR}" ]]    || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_CASESDIR}" ]]   || { echo ""; return; }
-  [[ -d "/home/${LWADEUSER}/${WADE_STAGINGDIR}" ]] || { echo ""; return; }
-  echo configured
-}
-
-run_step "samba" "configured" get_ver_samba '
+######################
+# Samba non-sense
+######################
+wade_install_samba() {
   set -e
-
   SMB_CONF="/etc/samba/smb.conf"
   install -d /etc/samba
 
+  # Seed minimal global if missing (literal heredoc)
   if [[ ! -f "$SMB_CONF" ]]; then
-    # literal heredoc (no expansion)
-    cat >"$SMB_CONF" <<\EOF
+    cat >"$SMB_CONF" <<'EOF'
 [global]
    workgroup = WORKGROUP
    server string = WADE
@@ -942,6 +932,7 @@ EOF
   chown -R "${LWADEUSER}:${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
   chmod 755 "/home/${LWADEUSER}" "$DATADIR" "$CASESDIR" "$STAGINGDIR"
 
+  # Optional allow/deny block
   HOSTS_BLOCK=""
   if [[ -n "${ALLOW_NETS_CSV:-}" ]]; then
     HOSTS_BLOCK="   hosts allow ="
@@ -950,10 +941,10 @@ EOF
     HOSTS_BLOCK+=$'\n   hosts deny = 0.0.0.0/0'
   fi
 
-  # remove old WADE section (if any)
-  sed -e "/^\[WADE-BEGIN\]/,/^\[WADE-END\]/d" -i "$SMB_CONF"
+  # Replace prior WADE section
+  sed -e '/^\[WADE-BEGIN\]/,/^\[WADE-END\]/d' -i "$SMB_CONF"
 
-  # expanding heredoc (uses vars)
+  # Expanding heredoc (uses vars)
   cat >>"$SMB_CONF" <<EOF
 [WADE-BEGIN]
 [DataSources]
@@ -991,10 +982,10 @@ EOF
   if ! testparm -s >/dev/null 2>&1; then
     echo "[!] testparm failed; restoring ${SMB_CONF}.bak"
     cp -f "${SMB_CONF}.bak" "$SMB_CONF"
-    exit 1
+    return 1
   fi
 
-  # optional Samba password batch (only if you captured SMB_ALL_PW)
+  # Optional bulk set of Samba passwords if captured
   if [[ "$NONINTERACTIVE" -eq 0 && -n "${SMB_ALL_PW:-}" ]]; then
     IFS=',' read -ra users <<< "${SMB_USERS_CSV}"
     for u in "${users[@]}"; do
@@ -1006,6 +997,7 @@ EOF
   systemd_queue_enable smbd || systemd_queue_enable smb
   systemd_queue_enable nmbd || systemd_queue_enable nmb || true
 
+  # Firewall open
   if [[ "$FIREWALL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
     ufw allow Samba || true
   elif command -v firewall-cmd >/dev/null 2>&1; then
@@ -1013,7 +1005,21 @@ EOF
     firewall-cmd --permanent --add-service=samba || true
     firewall-cmd --reload || true
   fi
-' || fail_note "samba" "share setup failed"
+}
+
+#####################################
+# Samba shares (DataSources, Cases, Staging)
+#####################################
+get_ver_samba(){
+  local SMB_CONF="/etc/samba/smb.conf"
+  grep -q '^\[WADE-BEGIN\]' "$SMB_CONF" 2>/dev/null || { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_DATADIR}" ]]    || { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_CASESDIR}" ]]   || { echo ""; return; }
+  [[ -d "/home/${LWADEUSER}/${WADE_STAGINGDIR}" ]] || { echo ""; return; }
+  echo configured
+}
+
+run_step "samba" "configured" get_ver_samba 'wade_install_samba' || fail_note "samba" "share setup failed"
 
 #####################################
 # Staging Service Install (venv-managed)
