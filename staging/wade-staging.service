@@ -1,33 +1,59 @@
+# /etc/systemd/system/wade-staging.service
 [Unit]
 Description=WADE Staging Daemon (full vs light)
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/opt/wade/stage_daemon.py
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
+# Run daemon as your WADE owner (overridable via env file)
 User=autopsy
 Group=autopsy
 # Uncomment if your Splunk UF runs as 'splunk' and you created the group:
-SupplementaryGroups=splunk
+#SupplementaryGroups=splunk
 
 EnvironmentFile=-/etc/wade/wade.env
 Environment=PYTHONUNBUFFERED=1
+
+# Preflight: create dirs and set ownership (runs as root only for these steps)
+PermissionsStartOnly=yes
+ExecStartPre=/bin/sh -lc 'set -eu; owner="${WADE_OWNER_USER:-autopsy}"; \
+  umask 0002; \
+  mkdir -p /var/wade/logs/stage /var/wade/state "/home/$owner/Staging/full" "/home/$owner/Staging/light" "/home/$owner/DataSources/_queue" "/home/$owner/DataSources/Hosts" "/home/$owner/DataSources/Network" "/home/$owner/DataSources/Unknown" "/home/$owner/Staging/ignored"; \
+  chown -R "$owner:$owner" "/home/$owner/Staging" "/home/$owner/DataSources"; \
+  chown -R "$owner:$owner" /var/wade'
+
 WorkingDirectory=/opt/wade
 ExecStart=/usr/bin/python3 /opt/wade/stage_daemon.py
 
+# Restart policy tuned to avoid crash loops
 Restart=on-failure
-RestartSec=5s
+RestartSec=3s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
 
-# Make files group-readable for UF; keep group on new dirs/files
+# Make files group-readable (UF) and keep group on new files/dirs
 UMask=002
 
-# Sandboxing — allow access to /home and /var/wade for moves & logs
+# Security hardening (allow writes only where needed)
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=full
+PrivateDevices=yes
+ProtectSystem=strict
 ProtectHome=false
 ReadWritePaths=/home/autopsy /var/wade
+# Allow Whiff HTTP to localhost if enabled; otherwise still fine
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
