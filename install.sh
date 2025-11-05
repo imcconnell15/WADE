@@ -1693,6 +1693,63 @@ EOF
 ' || fail_note "splunk-uf" "install/config failed"
 
 #####################################
+# WADE Workers
+#####################################
+install -d -m 0755 /opt/wade/wade_workers/bin
+rsync -a "${SCRIPT_DIR}/wade_workers/wade_workers/" /opt/wade/wade_workers/
+rsync -a "${SCRIPT_DIR}/wade_workers/bin/" /opt/wade/wade_workers/bin/
+
+# Runner systemd
+cat >/etc/systemd/system/wade-queue@.service <<'EOF'
+[Unit]
+Description=WADE Queue Runner (%i)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/opt/wade/wade_workers/bin/wade_queue_runner.py
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+EnvironmentFile=-/etc/wade/wade.env
+WorkingDirectory=/opt/wade/wade_workers
+ExecStart=/usr/bin/env python3 /opt/wade/wade_workers/bin/wade_queue_runner.py
+Restart=always
+RestartSec=2
+UMask=002
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/home/%i /var/wade
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Ensure logs dir exists
+install -d -m 0775 /var/wade/logs/workers
+chown -R autopsy:autopsy /var/wade /opt/wade
+
+systemd_queue_enable wade-queue@autopsy.service
+
+# ---- Splunk UF inputs overlay (if UF installed)
+if [[ -d "/opt/splunkforwarder/etc/apps/TA-wade-uf" ]]; then
+  install -d -m 0755 /opt/splunkforwarder/etc/apps/TA-wade-uf/local
+  cat >/opt/splunkforwarder/etc/apps/TA-wade-uf/local/inputs.conf <<'EOF'
+# (inputs overlay from Phase 2)
+EOF
+  /opt/splunkforwarder/bin/splunk restart || true
+fi
+
+#####################################
+# Whiff
+#####################################
+if [[ "${WHIFF_ENABLE:-1}" == "1" ]]; then
+  bash "${SCRIPT_DIR}/WHIFF/install_whiff.sh"
+fi
+
+#####################################
 # WADE: logrotate setup (per-service)
 #####################################
 _wade_ensure_logrotate() {
