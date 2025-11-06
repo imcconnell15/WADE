@@ -5,6 +5,21 @@
 set -Eeuo pipefail
 
 #####################################
+# Early logging + debug (from fast installer style)
+#####################################
+WHIFF_DEBUG="${WHIFF_DEBUG:-0}"
+LOG_DIR="/var/log/whiff"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/install_$(date -u +%F_%H%M%S).log"
+export PYTHONUNBUFFERED=1
+exec > >(tee -a "$LOG_FILE") 2>&1
+if [[ "$WHIFF_DEBUG" = "1" ]]; then
+  export PS4='+ ${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]:-main}: '
+  set -x
+fi
+trap 'rc=$?; line=${BASH_LINENO[0]:-$LINENO}; cmd=${BASH_COMMAND}; echo "[ERR] ${BASH_SOURCE##*/}:${line} rc=${rc}  cmd: ${cmd}" >&2' ERR
+
+#####################################
 # Banner
 #####################################
 cat <<'BANNER'
@@ -24,6 +39,24 @@ prompt() { local q="$1" d="$2" a; read -r -p "$q [$d]: " a; echo "${a:-$d}"; }
 yn() { local q="$1" d="${2:-Y}" a; read -r -p "$q [${d}/$( [[ "$d" =~ ^[Yy]$ ]] && echo n || echo y )]: " a; a="${a:-$d}"; [[ "$a" =~ ^[Yy]$ ]] && echo "1" || echo "0"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 req(){ command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
+prompt_secret() {
+  local q="$1" a1 a2
+  while :; do
+    read -r -s -p "$q: " a1; echo
+    read -r -s -p "Confirm $q: " a2; echo
+    [[ -z "$a1" ]] && { echo "Password cannot be empty. Try again."; continue; }
+    [[ "$a1" != "$a2" ]] && { echo "Passwords do not match. Try again."; continue; }
+    echo "$a1"; break
+  done
+}
+prompt_secret_opt() {
+  local q="$1" a1 a2
+  read -r -s -p "$q (press Enter to skip): " a1; echo
+  [[ -z "$a1" ]] && { echo ""; return; }
+  read -r -s -p "Confirm token: " a2; echo
+  [[ "$a1" != "$a2" ]] && { echo ""; echo "[!] Tokens did not match; skipping token."; return; }
+  echo "$a1"
+}
 
 #####################################
 # Prompts (all configuration here)
@@ -33,7 +66,7 @@ DB_HOST="$(prompt "Postgres host" "127.0.0.1")"
 DB_PORT="$(prompt "Postgres port" "5432")"
 DB_NAME="$(prompt "Database name" "whiff")"
 DB_USER="$(prompt "Database user" "whiff")"
-DB_PASS="$(prompt "Database password" "whiff")"
+DB_PASS="$(prompt_secret "Database password")"
 
 WHIFF_BIND="$(prompt "Whiff bind address" "127.0.0.1")"
 WHIFF_PORT="$(prompt "Whiff port" "8088")"
@@ -43,7 +76,7 @@ WHIFF_CTX="$(prompt "Model context tokens" "4096")"
 ONLINE_MODE="$(yn "Online mode (allow model downloads + crawling now)?" N)"
 DL_MODELS_NOW="0"
 if [[ "$ONLINE_MODE" == "1" ]]; then
-  DL_MODELS_NOW="$(yn "Download models now via huggingface-cli?" Y)"
+  DL_MODELS_NOW="$(yn "Download models now via HF CLI (resumable)?" Y)"
 fi
 LLM_PATH="$(prompt "Path to LLM .gguf (if already on disk)" "/opt/whiff/models/whiff-llm.gguf")"
 EMBED_DIR="$(prompt "Path to embeddings model dir" "/opt/whiff/models/emb/snowflake-m-v2")"
@@ -59,6 +92,12 @@ if [[ "$SEED_DOCS_NOW" == "1" && "$ONLINE_MODE" != "1" ]]; then
   echo "[!] Seeding needs network access. Set Online mode = Y or run /opt/whiff/scripts/whiff-seed-docs.sh later."
 fi
 
+# Optional Hugging Face token (for gated models like Meta Llama 3.1)
+HF_TOKEN=""
+if [[ "$DL_MODELS_NOW" == "1" ]]; then
+  HF_TOKEN="$(prompt_secret_opt "Hugging Face token")"
+fi
+
 ENABLE_NIGHTLY_BACKFILL="$(yn "Install (disabled) nightly backfill service+timer?" Y)"
 PATCH_WADE_ENV="$(yn "Add WHIFF_* toggles to /etc/wade/wade.env if present?" Y)"
 PACKAGE_SPLUNK_ADDON="$(yn "Package Splunk custom command tarball for your Search Head?" Y)"
@@ -67,23 +106,25 @@ PACKAGE_SPLUNK_ADDON="$(yn "Package Splunk custom command tarball for your Searc
 # Preflight
 #####################################
 [[ "$EUID" -eq 0 ]] || exec sudo -E bash "$0" "$@"
-req apt-get
-req systemctl
-req sed
-req awk
-req curl
-req psql || true  # we'll install if needed
+req apt-get; req systemctl; req sed; req awk; req curl; req jq
+command -v psql >/dev/null 2>&1 || true  # we'll install if needed
 
 #####################################
 # OS packages
 #####################################
 echo "[*] Installing OS packages…"
 apt-get update -y
-apt-get install -y python3-venv build-essential libopenblas-dev \
-  postgresql-client jq rsync git
+apt-get install -y python3-venv build-essential cmake ninja-build libopenblas-dev \
+  postgresql-client rsync git
 
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
   apt-get install -y postgresql postgresql-contrib
+  # Try to install pgvector package for the installed major version (best-effort)
+  if command -v psql >/dev/null 2>&1; then
+    PG_MAJ="$(psql -V 2>/dev/null | awk '{print $3}' | cut -d. -f1)"
+    apt-get install -y "postgresql-${PG_MAJ}-pgvector" >/dev/null 2>&1 || \
+    apt-get install -y postgresql-pgvector >/dev/null 2>&1 || true
+  fi
 fi
 
 #####################################
@@ -96,7 +137,7 @@ mkdir -p /opt/whiff/{scripts,ingest,sql,packaging,splunk/SA-WADE-Search/bin,splu
 chown -R whiff:whiff /opt/whiff /var/log/whiff
 
 #####################################
-# requirements.txt  (added: docutils, python-docx, chardet)
+# requirements.txt  (extra deps for more formats + CLI)
 #####################################
 cat > /opt/whiff/requirements.txt <<'REQ'
 fastapi==0.115.0
@@ -115,6 +156,8 @@ sentence-transformers==3.0.1
 docutils==0.20.1
 python-docx==1.1.2
 chardet==5.2.0
+huggingface_hub[cli]==0.23.2
+hf_transfer==0.1.6
 REQ
 
 #####################################
@@ -168,8 +211,8 @@ def generate(prompt: str, max_tokens=400, temperature=0.2) -> str:
 PY
 
 cat > /opt/whiff/whiff_api.py <<'PY'
-import os, json
-import psycopg2, numpy as np, orjson
+import os, json, orjson
+import psycopg2, numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
@@ -196,7 +239,8 @@ def search_docs(q_emb: np.ndarray, k=6, tool=None, version=None):
       ORDER BY embedding <#> %s::vector
       LIMIT %s
     """
-    params.extend([q_emb.tolist(), q_emb.tolist(), k])
+    vec = json.dumps(q_emb.tolist())
+    params.extend([vec, vec, k])
     cur.execute(sql, params); rows=cur.fetchall(); cur.close(); conn.close()
     return [{"title":r[0],"chunk":r[1],"url":r[2],"tool":r[3],"version":r[4],"distance":float(r[5])} for r in rows]
 @app.get("/health")
@@ -260,7 +304,9 @@ Return ONLY JSON.
     return {"help": help_obj, "cached": False}
 PY
 
-# --------- Enhanced indexer: supports PDF/HTML/MD/RST/TXT/LOG/INI/CFG/DOCX/CSV/JSON ---------
+#####################################
+# Enhanced indexer (PDF/HTML/MD/RST/TXT/LOG/INI/CFG/DOCX/CSV/JSON) + proper vector casts
+#####################################
 cat > /opt/whiff/whiff_index.py <<'PY'
 import os, uuid, glob, json, csv
 from pathlib import Path
@@ -291,13 +337,11 @@ def load_text(p:Path)->str:
     sfx=p.suffix.lower()
     if sfx in {".md",".txt",".log",".ini",".cfg"}:
         return sniff_file_text(p)
-
     if sfx in {".html",".htm"}:
         html = sniff_file_text(p)
         soup=BeautifulSoup(html,"lxml")
         for bad in soup(["script","style","nav","aside","footer","header"]): bad.decompose()
         return soup.get_text("\n", strip=True)
-
     if sfx == ".rst":
         rst = sniff_file_text(p)
         try:
@@ -305,7 +349,6 @@ def load_text(p:Path)->str:
             return parts.get("whole","").strip()
         except Exception:
             return rst
-
     if sfx == ".pdf":
         out=[]
         with open(p,"rb") as f:
@@ -316,7 +359,6 @@ def load_text(p:Path)->str:
                 except Exception:
                     out.append("")
         return "\n".join(out)
-
     if sfx == ".docx":
         try:
             doc=Document(p)
@@ -329,7 +371,6 @@ def load_text(p:Path)->str:
             return "\n".join(chunks)
         except Exception:
             return ""
-
     if sfx == ".csv":
         try:
             text = sniff_file_text(p)
@@ -342,21 +383,20 @@ def load_text(p:Path)->str:
             return "\n".join(rows)
         except Exception:
             return ""
-
     if sfx == ".json":
         try:
             obj=json.loads(sniff_file_text(p))
             return json.dumps(obj, indent=2, ensure_ascii=False)
         except Exception:
             return ""
-
     return ""
 
 def insert_docs(conn,rows):
     cur=conn.cursor()
     cur.executemany("""
       INSERT INTO sage_docs (id,title,source_url,tool,version,license,chunk,chunk_hash,meta,embedding)
-      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING
+      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector)
+      ON CONFLICT DO NOTHING
     """, rows)
     conn.commit(); cur.close()
 
@@ -375,7 +415,7 @@ def main(root="docs_ingest"):
         chunks=list(simple_chunks(text, max_words=400))
         if not chunks: continue
         embs=embed_texts(chunks)
-        rows=[(str(uuid.uuid4()), p.stem, None, tool, version, license_, c, str(hash(c)), json.dumps(meta), e.tolist())
+        rows=[(str(uuid.uuid4()), p.stem, None, tool, version, license_, c, str(hash(c)), json.dumps(meta), json.dumps(e.tolist()))
               for c,e in zip(chunks, embs)]
         insert_docs(conn, rows)
     conn.close()
@@ -385,7 +425,9 @@ if __name__=="__main__":
     main(sys.argv[1] if len(sys.argv)>1 else "docs_ingest")
 PY
 
-# --------- Crawler: use uuid in Python; HTML/PDF supported ---------
+#####################################
+# Crawler (HTML/PDF) + proper vector cast
+#####################################
 cat > /opt/whiff/whiff_crawl.py <<'PY'
 #!/usr/bin/env python3
 import os, time, re, json, urllib.parse, queue, uuid
@@ -414,11 +456,11 @@ def fetch(s,u):
 def index_chunks(conn,title,url,tool,version,license_,chunks,embs):
     rows=[]
     for c,e in zip(chunks,embs):
-        rows.append((str(uuid.uuid4()), title[:512], url, tool, version, license_, c, str(hash(c)), json.dumps({"source_url":url}), e.tolist()))
+        rows.append((str(uuid.uuid4()), title[:512], url, tool, version, license_, c, str(hash(c)), json.dumps({"source_url":url}), json.dumps(e.tolist())))
     cur=conn.cursor()
     cur.executemany("""
       INSERT INTO sage_docs (id,title,source_url,tool,version,license,chunk,chunk_hash,meta,embedding)
-      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector)
       ON CONFLICT DO NOTHING
     """, rows)
     conn.commit(); cur.close()
@@ -641,7 +683,7 @@ enableheader = true
 CONF
 
 #####################################
-# Scripts: whiff-help, packer, importer
+# Scripts: whiff-help, packer, importer, seeders
 #####################################
 cat > /opt/whiff/scripts/whiff-help <<'SH'
 #!/usr/bin/env bash
@@ -669,7 +711,7 @@ work="$(mktemp -d)"
 mkdir -p "$work/db" "$work/ingest" "$work/models"
 pg_dump "$DB" -t sage_docs -a -Fc -f "$work/db/sage_docs.dump"
 [[ -f /opt/whiff/ingest/sites.yaml ]] && cp /opt/whiff/ingest/sites.yaml "$work/ingest/sites.yaml"
-if [[ -f /opt/whiff/models/whiff-llm.gguf" ]]; then cp /opt/whiff/models/whiff-llm.gguf "$work/models/"; fi
+if [[ -f /opt/whiff/models/whiff-llm.gguf ]]; then cp /opt/whiff/models/whiff-llm.gguf "$work/models/"; fi
 if [[ -d /opt/whiff/models/emb/snowflake-m-v2 ]]; then mkdir -p "$work/models/emb"; rsync -a /opt/whiff/models/emb/snowflake-m-v2 "$work/models/emb/"; fi
 tar -C "$work" -czf "$OUT" .
 echo "Wrote $OUT"
@@ -692,9 +734,7 @@ echo "Imported KB into $DB and copied any bundled models."
 SH
 chmod +x /opt/whiff/scripts/whiff-import-kb.sh
 
-#####################################
-# NEW: MITRE STIX → Markdown converter
-#####################################
+# MITRE STIX → Markdown converter
 cat > /opt/whiff/scripts/mitre_to_md.py <<'PY'
 #!/usr/bin/env python3
 # Usage: mitre_to_md.py /path/to/attack-stix-data /opt/whiff/docs_ingest/mitre_attack v14.1
@@ -747,15 +787,11 @@ for p in bundles:
 PY
 chmod +x /opt/whiff/scripts/mitre_to_md.py
 
-#####################################
-# NEW: Docs seeder (clones + copies + ATTRIBUTION)
-#####################################
+# Docs seeder
 cat > /opt/whiff/scripts/whiff-seed-docs.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 TARGET_ROOT="${1:-/opt/whiff/docs_ingest}"
-
-# Version pins for folder names
 ATTACK_VER="${ATTACK_VER:-v14.1}"
 VOL3_VER="${VOL3_VER:-2.7}"
 HAYABUSA_VER="${HAYABUSA_VER:-2.18}"
@@ -764,66 +800,38 @@ YARA_VER="${YARA_VER:-4.5}"
 ARKIME_VER="${ARKIME_VER:-3.9}"
 JA_VER="${JA_VER:-2024}"
 WADE_SOP_DATE="${WADE_SOP_DATE:-$(date +%F)}"
+LIC_CC_BY="CC-BY-4.0"; LIC_APACHE="Apache-2.0"; LIC_MIT="MIT"; LIC_AGPL="AGPL-2.0"; LIC_PROP="Proprietary"; LIC_VARIOUS="Various"
+WORK="$(mktemp -d)"; mkdir -p "$TARGET_ROOT"; echo "[*] Working in $WORK"
 
-LIC_CC_BY="CC-BY-4.0"
-LIC_APACHE="Apache-2.0"
-LIC_MIT="MIT"
-LIC_AGPL="AGPL-2.0"
-LIC_PROP="Proprietary"
-LIC_VARIOUS="Various"
-
-WORK="$(mktemp -d)"
-mkdir -p "$TARGET_ROOT"
-echo "[*] Working in $WORK"
-
-# MITRE ATT&CK (STIX → MD)
 git clone --depth 1 https://github.com/mitre-attack/attack-stix-data.git "$WORK/attack-stix-data"
 mkdir -p "$TARGET_ROOT/mitre_attack/${ATTACK_VER}/${LIC_CC_BY}"
 /opt/whiff/scripts/mitre_to_md.py "$WORK/attack-stix-data" "$TARGET_ROOT/mitre_attack" "$ATTACK_VER"
 echo "[+] ATT&CK rendered."
 
-# Volatility3
 git clone --depth 1 https://github.com/volatilityfoundation/volatility3.git "$WORK/vol3"
 mkdir -p "$TARGET_ROOT/volatility3/${VOL3_VER}/docs/${LIC_APACHE}"
-if [[ -d "$WORK/vol3/docs" ]]; then
-  rsync -a --include="*/" --include="*.md" --include="*.rst" --exclude="*" \
-    "$WORK/vol3/docs/" "$TARGET_ROOT/volatility3/${VOL3_VER}/docs/${LIC_APACHE}/"
-fi
+[[ -d "$WORK/vol3/docs" ]] && rsync -a --include="*/" --include="*.md" --include="*.rst" --exclude="*" "$WORK/vol3/docs/" "$TARGET_ROOT/volatility3/${VOL3_VER}/docs/${LIC_APACHE}/"
 
-# Hayabusa (GitHub wiki)
 git clone --depth 1 https://github.com/Yamato-Security/hayabusa.wiki.git "$WORK/hayabusa-wiki"
 mkdir -p "$TARGET_ROOT/hayabusa/${HAYABUSA_VER}/docs/${LIC_MIT}"
-rsync -a --include="*/" --include="*.md" --exclude="*" \
-  "$WORK/hayabusa-wiki/" "$TARGET_ROOT/hayabusa/${HAYABUSA_VER}/docs/${LIC_MIT}/"
+rsync -a --include="*/" --include="*.md" --exclude="*" "$WORK/hayabusa-wiki/" "$TARGET_ROOT/hayabusa/${HAYABUSA_VER}/docs/${LIC_MIT}/"
 
-# capa
 git clone --depth 1 https://github.com/mandiant/capa.git "$WORK/capa"
 mkdir -p "$TARGET_ROOT/capa/${CAPA_VER}/docs/${LIC_APACHE}"
 if [[ -d "$WORK/capa/docs" ]]; then
-  rsync -a --include="*/" --include="*.md" --exclude="*" \
-    "$WORK/capa/docs/" "$TARGET_ROOT/capa/${CAPA_VER}/docs/${LIC_APACHE}/"
+  rsync -a --include="*/" --include="*.md" --exclude="*" "$WORK/capa/docs/" "$TARGET_ROOT/capa/${CAPA_VER}/docs/${LIC_APACHE}/"
 elif [[ -d "$WORK/capa/doc" ]]; then
-  rsync -a --include="*/" --include="*.md" --exclude="*" \
-    "$WORK/capa/doc/" "$TARGET_ROOT/capa/${CAPA_VER}/docs/${LIC_APACHE}/"
+  rsync -a --include="*/" --include="*.md" --exclude="*" "$WORK/capa/doc/" "$TARGET_ROOT/capa/${CAPA_VER}/docs/${LIC_APACHE}/"
 fi
 
-# YARA
 git clone --depth 1 https://github.com/VirusTotal/yara.git "$WORK/yara"
 mkdir -p "$TARGET_ROOT/yara/${YARA_VER}/docs/${LIC_APACHE}"
-if [[ -d "$WORK/yara/docs" ]]; then
-  rsync -a --include="*/" --include="*.md" --include="*.rst" --exclude="*" \
-    "$WORK/yara/docs/" "$TARGET_ROOT/yara/${YARA_VER}/docs/${LIC_APACHE}/"
-fi
+[[ -d "$WORK/yara/docs" ]] && rsync -a --include="*/" --include="*.md" --include="*.rst" --exclude="*" "$WORK/yara/docs/" "$TARGET_ROOT/yara/${YARA_VER}/docs/${LIC_APACHE}/"
 
-# Arkime
 git clone --depth 1 https://github.com/arkime/arkime.git "$WORK/arkime"
 mkdir -p "$TARGET_ROOT/arkime/${ARKIME_VER}/docs/${LIC_APACHE}"
-if [[ -d "$WORK/arkime/docs" ]]; then
-  rsync -a --include="*/" --include="*.md" --exclude="*" \
-    "$WORK/arkime/docs/" "$TARGET_ROOT/arkime/${ARKIME_VER}/docs/${LIC_APACHE}/"
-fi
+[[ -d "$WORK/arkime/docs" ]] && rsync -a --include="*/" --include="*.md" --exclude="*" "$WORK/arkime/docs/" "$TARGET_ROOT/arkime/${ARKIME_VER}/docs/${LIC_APACHE}/"
 
-# JA3/JA4 (links only)
 mkdir -p "$TARGET_ROOT/ja3_ja4/${JA_VER}/docs/${LIC_VARIOUS}"
 cat > "$TARGET_ROOT/ja3_ja4/${JA_VER}/docs/${LIC_VARIOUS}/README.md" <<'EOF'
 # JA3 / JA4 Reading List (links only)
@@ -832,11 +840,9 @@ cat > "$TARGET_ROOT/ja3_ja4/${JA_VER}/docs/${LIC_VARIOUS}/README.md" <<'EOF'
 - Cloudflare docs on JA3/JA4: https://developers.cloudflare.com/bots/additional-configurations/ja3-ja4-fingerprint/
 EOF
 
-# Your SOP placeholder
 mkdir -p "$TARGET_ROOT/wade_sop/${WADE_SOP_DATE}/${LIC_PROP}"
 touch "$TARGET_ROOT/wade_sop/${WADE_SOP_DATE}/${LIC_PROP}/.gitkeep"
 
-# Attribution
 cat > "$TARGET_ROOT/ATTRIBUTION.md" <<EOF
 # Whiff Docs Ingest — Attribution & Licenses
 
@@ -867,23 +873,26 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 #####################################
-# (Optional) Download models (Meta Llama 3.1 + Snowflake Arctic Embed)
+# Optional: Download models (Meta Llama 3.1 + Snowflake Arctic Embed) via hf (resumable)
 #####################################
 if [[ "$DL_MODELS_NOW" == "1" ]]; then
-  echo "[*] Downloading models (huggingface-cli)…"
-  pip install -q 'huggingface_hub[cli]'
+  echo "[*] Preparing Hugging Face CLI…"
+  export HF_HUB_ENABLE_HF_TRANSFER=1
+  if [[ -n "$HF_TOKEN" ]]; then
+    export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+    /opt/whiff/.venv/bin/hf login --token "$HF_TOKEN" >/dev/null 2>&1 || true
+  fi
   mkdir -p /opt/whiff/models/emb
-  # Meta Llama 3.1 8B Instruct (GGUF Q4_K_M) -> whiff-llm.gguf
-  huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+  echo "[*] Downloading LLM (Meta Llama 3.1 8B Instruct Q4_K_M GGUF)…"
+  /opt/whiff/.venv/bin/hf download --repo-type model bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
     --include "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" \
-    --local-dir /opt/whiff/models --local-dir-use-symlinks False || true
+    --local-dir /opt/whiff/models --resume >/dev/null || true
   [[ -f /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf ]] && \
     mv /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf /opt/whiff/models/whiff-llm.gguf || true
 
-  # Snowflake Arctic-Embed-M-v2.0 (768-dim)
-  huggingface-cli download Snowflake/snowflake-arctic-embed-m-v2.0 \
-    --local-dir /opt/whiff/models/emb/snowflake-m-v2 \
-    --local-dir-use-symlinks False || true
+  echo "[*] Downloading Snowflake Arctic-Embed-M-v2.0 (768-dim)…"
+  /opt/whiff/.venv/bin/hf download --repo-type model Snowflake/snowflake-arctic-embed-m-v2.0 \
+    --local-dir /opt/whiff/models/emb/snowflake-m-v2 --resume >/dev/null || true
 fi
 
 #####################################
@@ -892,23 +901,20 @@ fi
 DB_DSN="postgresql://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/$DB_NAME"
 echo "[*] Bootstrapping database schema…"
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
-  sudo -u postgres psql >/dev/null <<SQL || true
-DO \$\$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '$DB_NAME') THEN
-    PERFORM dblink_exec('dbname=' || current_database(), 'CREATE DATABASE $DB_NAME');
-  END IF;
-END\$\$;
-SQL
-  sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null || true
+  # Create DB if missing
+  sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 || \
+    sudo -u postgres createdb "$DB_NAME"
+  # Create user if missing
   sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname = '$DB_USER'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';" >/dev/null
-  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" >/dev/null || true
+    sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';"
+  # Grant + vector extension
+  sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS vector;" || true
+  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" || true
 fi
 
-# Run schema file using provided DSN (works for local or remote, if perms allow)
+# Run schema (works local or remote if perms allow)
 WHIFF_DB_DSN="$DB_DSN" psql "$DB_DSN" -f /opt/whiff/sql/00_bootstrap.sql >/dev/null || \
-  echo "[!] Schema bootstrap skipped (insufficient privs?). Ensure 'vector' ext + tables exist."
+  echo "[!] Schema bootstrap skipped (ensure 'vector' ext + tables exist)."
 
 #####################################
 # Env + systemd
@@ -950,7 +956,7 @@ cp /opt/whiff/packaging/whiff-api.service /etc/systemd/system/whiff-api.service
 systemctl daemon-reload
 systemctl enable --now whiff-api
 sleep 1
-curl -s "http://${WHIFF_BIND}:${WHIFF_PORT}/health" || echo "[!] Health check failed (service may still be starting)."
+curl -fsS "http://${WHIFF_BIND}:${WHIFF_PORT}/health" || echo "[!] Health check failed (service may still be starting)."
 
 #####################################
 # Optional: Nightly backfill
@@ -990,7 +996,7 @@ fi
 #####################################
 if [[ "$PATCH_WADE_ENV" == "1" && -f /etc/wade/wade.env ]]; then
   echo "[*] Adding WHIFF_* toggles to /etc/wade/wade.env"
-  awk 'BEGIN{added=0} /WHIFF_ENABLE=/{found=1} END{if(!found)print "WHIFF_ENABLE=1"}' /etc/wade/wade.env >> /etc/wade/wade.env.tmp || true
+  awk 'BEGIN{found=0} /WHIFF_ENABLE=/{found=1} END{if(!found)print "WHIFF_ENABLE=1"}' /etc/wade/wade.env >> /etc/wade/wade.env.tmp || true
   echo "WHIFF_URL=http://${WHIFF_BIND}:${WHIFF_PORT}/annotate" >> /etc/wade/wade.env.tmp
   sort -u /etc/wade/wade.env.tmp > /etc/wade/wade.env
   rm -f /etc/wade/wade.env.tmp
@@ -1061,6 +1067,5 @@ Quick API test:
     -H 'Content-Type: application/json' \
     -d '{"query":"What does Volatility pslist output represent?"}'
 
-Semper,
 Whiff is up.
 EOF
