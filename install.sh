@@ -2073,13 +2073,22 @@ OUTCONF="/opt/splunkforwarder/etc/system/local/outputs.conf"
 INCONF="/opt/splunkforwarder/etc/system/local/inputs.conf"
 DCONF="/opt/splunkforwarder/etc/system/local/deploymentclient.conf"
 
-UF_RCVR="$(awk -F= '/^\s*server\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$OUTCONF" 2>/dev/null)"
-UF_COMP="$(awk -F= '/^\s*compressed\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
-UF_ACKS="$(awk -F= '/^\s*useACK\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
-UF_SSLV="$(awk -F= '/^\s*sslVerifyServerCert\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null)"
-UF_SSLN="$(awk -F= '/^\s*sslCommonNameToCheck\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$OUTCONF" 2>/dev/null)"
-UF_DS="$(awk -F= '/^\s*targetUri\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$DCONF" 2>/dev/null)"
-UF_IDX="$(awk -F= '/^\s*index\s*=/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$INCONF" 2>/dev/null)"
+UF_RCVR=""; UF_COMP=""; UF_ACKS=""; UF_SSLV=""; UF_SSLN=""; UF_DS=""; UF_IDX=""
+
+# Only parse if the file exists; also add `|| true` to suppress ERR trap
+if [[ -r "$OUTCONF" ]]; then
+  UF_RCVR="$(awk -F= '/^\s*server\s*=/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$OUTCONF" 2>/dev/null || true)"
+  UF_COMP="$(awk -F= '/^\s*compressed\s*=/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null || true)"
+  UF_ACKS="$(awk -F= '/^\s*useACK\s*=/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null || true)"
+  UF_SSLV="$(awk -F= '/^\s*sslVerifyServerCert\s*=/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2); exit}' "$OUTCONF" 2>/dev/null || true)"
+  UF_SSLN="$(awk -F= '/^\s*sslCommonNameToCheck\s*=/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$OUTCONF" 2>/dev/null || true)"
+fi
+if [[ -r "$DCONF" ]]; then
+  UF_DS="$(awk -F= '/^\s*targetUri\s*=/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$DCONF" 2>/dev/null || true)"
+fi
+if [[ -r "$INCONF" ]]; then
+  UF_IDX="$(awk -F= '/^\s*index\s*=/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$INCONF" 2>/dev/null || true)"
+fi
 
 UF_RCVR="${UF_RCVR:-${SPLUNK_UF_RCVR_HOSTS:-${SPLUNK_UF_RCVR_HOST:-}}}"
 UF_COMP="${UF_COMP:-${SPLUNK_UF_COMPRESSED:-true}}"
@@ -2310,17 +2319,19 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
           REP_HTML="${STIG_REPORT_DIR}/stig-ubuntu-${OS_VER_ID}-${TS}.html"
           REP_ARF="${STIG_REPORT_DIR}/stig-ubuntu-${OS_VER_ID}-${TS}.arf.xml"
           if oscap xccdf eval --skip-valid ${SKIP_ARGS} \
-               --profile "${CHOSEN_PROFILE}" \
-               --results-arf "${REP_ARF}" \
-               --report "${REP_HTML}" \
-               "${DS_FILE}"; then
-            echo "[+] STIG report: ${REP_HTML}"
-            echo "[+] STIG ARF   : ${REP_ARF}"
-            cp -f "${DS_FILE}" "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || true
-            mark_done "stig-eval" "$(sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || echo run-${TS})"
-          else
-            fail_note "stig-eval" "oscap eval failed"
-          fi
+                --profile "${CHOSEN_PROFILE}" \
+                --results-arf "${REP_ARF}" \
+                --report "${REP_HTML}" \
+                "${DS_FILE}"
+            ec=$?
+            if [[ $ec -eq 0 || $ec -eq 1 ]]; then
+                echo "[+] STIG report: ${REP_HTML}"
+                echo "[+] STIG ARF   : ${REP_ARF}"
+                cp -f "${DS_FILE}" "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || true
+                mark_done "stig-eval" "$(sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || echo run-${TS})"
+            else
+                fail_note "stig-eval" "oscap eval failed (exit ${ec})"
+            fi
         fi
       fi
       [[ -n "$TMP_EXTRACT" ]] && rm -rf "$TMP_EXTRACT"
