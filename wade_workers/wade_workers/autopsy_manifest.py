@@ -1,13 +1,11 @@
-# wade_workers/autopsy_manifest.py
 #!/usr/bin/env python3
 from pathlib import Path
 from .base import BaseWorker, WorkerResult
-from .utils import now_iso
+from .utils import wade_paths, now_iso
 
 CASE_TPL = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <AutopsyManifest>
     <CaseName>{name}</CaseName>
-    <Created>{created}</Created>
     <IngestModule>Disk Image Ingest</IngestModule>
     <DataSource>{image}</DataSource>
 </AutopsyManifest>
@@ -15,19 +13,21 @@ CASE_TPL = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 
 class AutopsyManifestWorker(BaseWorker):
     tool = "autopsy"
-    help_text = "Generate Autopsy manifest XML beside image."
-    prefer_jsonl = False
+    module = "manifest"
+    help_text = "Generate Autopsy manifest XML into the wade_autopsy tree."
 
     def run(self, ticket: dict) -> WorkerResult:
-        path = Path(ticket.get("dest_path",""))
         host = ticket.get("host") or self.env.get("WADE_HOSTNAME","host")
-        if not path.exists():
-            return WorkerResult(None, 0, ["image_missing"])
-        xml = path.with_suffix(path.suffix + ".autopsy.xml")
-        xml.write_text(CASE_TPL.format(
-            name=f"{host}-{path.stem}",
-            created=now_iso(),
-            image=str(path)
-        ), encoding="utf-8")
-        self.module = "manifest"
-        return self.run_records(host, [{"ts": now_iso(), "manifest": str(xml), "image_path": str(path)}], str(path))
+        img = Path(ticket.get("dest_path") or ticket.get("path") or "")
+        if not img.exists():
+            return WorkerResult(None, 0, [f"missing image: {img}"])
+
+        out_dir, _ = wade_paths(self.env, host, self.tool, self.module)
+        case_name = f"{host}_{img.stem}"
+        xml_path = out_dir / f"{case_name}.manifest.xml"
+        xml_path.write_text(CASE_TPL.format(name=case_name, image=str(img)), encoding="utf-8")
+
+        # Emit a small JSON pointer for Splunk and traceability
+        rec = {"ts": now_iso(), "manifest": str(xml_path), "image": str(img)}
+        out, cnt = self.run_records(host, [rec], str(img))
+        return WorkerResult(out, cnt, [])
