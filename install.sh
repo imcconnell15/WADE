@@ -201,6 +201,18 @@ systemd_finalize_enable() {
   done
 }
 
+solr_wait_ready() {
+  local url="http://127.0.0.1:8983/solr/admin/info/system?wt=json"
+  local tries=40
+  while (( tries-- )); do
+    if curl -fsS "$url" >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 #####################################
 # NEW: Package bundle aggregator (single install)
 #####################################
@@ -227,14 +239,21 @@ pkg_install_bundle_once() {
   fi
 }
 
-# NEW: shared wheelhouse helper for venvs
 pip_cached_install() {
   # usage: pip_cached_install <venv_bin_dir> <reqs_or_pkgs...>
-  local vbin="$1"; shift
+  local vbin="$1"; shift || true
   local wheelhouse="${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels"
   mkdir -p "$wheelhouse"
+
+  # Always prime build tools into the wheelhouse (so PEP 517 can find them offline)
+  "$vbin/pip" download -d "$wheelhouse" pip setuptools wheel >/dev/null 2>&1 || true
+
+  # Pre-download requested pkgs (best-effort; sdists are fine)
   "$vbin/pip" download -d "$wheelhouse" "$@" >/dev/null 2>&1 || true
-  "$vbin/pip" install --no-index --find-links "$wheelhouse" "$@" || "$vbin/pip" install "$@"
+
+  # Prefer offline + NO build isolation (lets venv's setuptools satisfy sdists like intervaltree)
+  "$vbin/pip" install --no-index --find-links "$wheelhouse" --no-build-isolation "$@" \
+    || "$vbin/pip" install "$@"
 }
 
 #####################################
@@ -1516,10 +1535,22 @@ run_step "barracuda" "installed" get_ver_barracuda '
     [[ -d /opt/barracuda/.git ]] || git clone https://github.com/williamjsmail/Barracuda /opt/barracuda || true
   fi
 
+    # --- Barracuda venv bootstrap (idempotent) ---
+  if [[ ! -d /opt/barracuda/.venv ]]; then
+    python3 -m venv /opt/barracuda/.venv
+    "/opt/barracuda/.venv/bin/pip" install -U pip setuptools wheel
+  fi
+
+    # requirements file optional; ignore if missing
+  if [[ -f /opt/barracuda/requirements.txt ]]; then
+    "/opt/barracuda/.venv/bin/pip" install -r /opt/barracuda/requirements.txt
+  fi
+
+
   python3 -m venv /opt/barracuda/.venv || python3 -m virtualenv /opt/barracuda/.venv
   /opt/barracuda/.venv/bin/pip install --upgrade pip >/dev/null 2>&1 || true
   if [[ -f /opt/barracuda/requirements.txt ]]; then
-    pip_cached_install \"/opt/barracuda/.venv/bin\" -r /opt/barracuda/requirements.txt
+    pip_cached_install "/opt/barracuda/.venv/bin" -r /opt/barracuda/requirements.txt
   fi
 
   if [[ ! -f /opt/barracuda/enterprise-attack.json ]]; then
@@ -1589,20 +1620,21 @@ run_step "hayabusa" "" get_ver_hayabusa '
 
   HAY_ARCH="${HAY_ARCH:-$(detect_hayabusa_arch)}"
   HAY_ZIP=""
-  HAY_ZIP_LOCAL="$(ls "'"${WADE_PKG_DIR}"'/hayabusa/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
+  # look in WADE_PKG_DIR first
+  HAY_ZIP_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa"/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
 
   if [[ -n "$HAY_ZIP_LOCAL" ]]; then
     cp "$HAY_ZIP_LOCAL" .
     HAY_ZIP="$(basename "$HAY_ZIP_LOCAL")"
   elif [[ "$OFFLINE" == "1" ]]; then
-    HAY_ZIP_USB="$(ls "'"${OFFLINE_SRC}"'/hayabusa/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
-    [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '\''${HAY_ARCH:-}'\'' not found offline"; exit 1; }
+    HAY_ZIP_USB="$(ls "${OFFLINE_SRC}/hayabusa"/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
+    [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '"'"'${HAY_ARCH:-}'"'"' not found offline"; exit 1; }
     cp "$HAY_ZIP_USB" .
     HAY_ZIP="$(basename "$HAY_ZIP_USB")"
   else
     if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
       echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
-      FILTER=".assets[] | select(.name | test(\\$pat) or test(\\$pat2) or test(\"lin-x64-gnu\") or test(\"lin-aarch64-gnu\")) | .browser_download_url"
+      FILTER=".assets[] | select(.name | test(\$pat) or test(\$pat2) or test(\"lin-x64-gnu\") or test(\"lin-aarch64-gnu\")) | .browser_download_url"
       DL_URL="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest \
         | jq -r --arg pat "${HAY_ARCH:-}" --arg pat2 "${HAY_ARCH/-/}" "$FILTER" | head -1)"
       [[ -n "$DL_URL" ]] || { echo "Could not resolve latest Hayabusa asset for ${HAY_ARCH:-}"; exit 1; }
@@ -1626,9 +1658,11 @@ run_step "hayabusa" "" get_ver_hayabusa '
 
   install -d -m 0755 "${HAYABUSA_RULES_DIR}"
   [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules/"*  "${HAYABUSA_RULES_DIR}/"; echo "[+] Copied Hayabusa rules → ${HAYABUSA_RULES_DIR}"; }
-  [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config"    /etc/wade/hayabusa/;     echo "[+] Copied Hayabusa config → /etc/wade/hayabusa/"; }
 
-  # (kept on purpose per your request)
+  mkdir -p /etc/wade/hayabusa
+  [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config"/* /etc/wade/hayabusa/; echo "[+] Copied Hayabusa config → /etc/wade/hayabusa/"; }
+
+  # (kept on purpose)
   [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules"  /usr/local/bin/; echo "[+] Copied Hayabusa rules/ to /usr/local/bin/rules"; }
   [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config" /usr/local/bin/; echo "[+] Copied Hayabusa config/ to /usr/local/bin/config"; }
 
@@ -1695,6 +1729,15 @@ run_step "solr" "${SOLR_VER}" get_ver_solr '
   fi
   sed -i "s|^#\?SOLR_JETTY_HOST=.*|SOLR_JETTY_HOST=\"${IPV4}\"|" /etc/default/solr.in.sh
   systemctl restart solr
+
+
+  # After service start:
+  if solr_wait_ready; then
+    echo "[OK] Solr responded to /admin/info/system"
+  else
+    echo "[!] Solr did not become ready in time; check logs:"
+    echo "    tail -n 200 /var/solr/logs/solr.log"
+  fi
 
   AUTOPSY_ZIP="SOLR_8.6.3_AutopsyService.zip"
   fetch_pkg autopsy "$AUTOPSY_ZIP" || curl -L "https://sourceforge.net/projects/autopsy/files/CollaborativeServices/Solr/${AUTOPSY_ZIP}/download" -o "$AUTOPSY_ZIP"
