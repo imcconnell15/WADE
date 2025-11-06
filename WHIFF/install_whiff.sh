@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 #####################################
-# Early logging + debug (from fast installer style)
+# Early logging + debug
 #####################################
 WHIFF_DEBUG="${WHIFF_DEBUG:-0}"
 LOG_DIR="/var/log/whiff"
@@ -33,7 +33,7 @@ cat <<'BANNER'
 BANNER
 
 #####################################
-# Prompt helpers
+# Helpers
 #####################################
 prompt() { local q="$1" d="$2" a; read -r -p "$q [$d]: " a; echo "${a:-$d}"; }
 yn() { local q="$1" d="${2:-Y}" a; read -r -p "$q [${d}/$( [[ "$d" =~ ^[Yy]$ ]] && echo n || echo y )]: " a; a="${a:-$d}"; [[ "$a" =~ ^[Yy]$ ]] && echo "1" || echo "0"; }
@@ -57,6 +57,11 @@ prompt_secret_opt() {
   [[ "$a1" != "$a2" ]] && { echo ""; echo "[!] Tokens did not match; skipping token."; return; }
   echo "$a1"
 }
+urlenc() { python3 - "$1" <<'PY'
+import sys, urllib.parse as u
+print(u.quote(sys.argv[1], safe=''))
+PY
+}
 
 #####################################
 # Prompts (all configuration here)
@@ -67,6 +72,8 @@ DB_PORT="$(prompt "Postgres port" "5432")"
 DB_NAME="$(prompt "Database name" "whiff")"
 DB_USER="$(prompt "Database user" "whiff")"
 DB_PASS="$(prompt_secret "Database password")"
+DB_USER_ENC="$(urlenc "$DB_USER")"
+DB_PASS_ENC="$(urlenc "$DB_PASS")"
 
 WHIFF_BIND="$(prompt "Whiff bind address" "127.0.0.1")"
 WHIFF_PORT="$(prompt "Whiff port" "8088")"
@@ -86,16 +93,14 @@ if [[ "$ONLINE_MODE" == "1" ]]; then
   RUN_INITIAL_CRAWL="$(yn "Run initial crawl of tuned sites.yaml after install?" Y)"
 fi
 
-# Seed docs (no export to git)
 SEED_DOCS_NOW="$(yn "Seed baseline docs (ATT&CK, Vol3, Hayabusa, capa, YARA, Arkime, JA3/JA4 links) into /opt/whiff/docs_ingest now?" Y)"
 if [[ "$SEED_DOCS_NOW" == "1" && "$ONLINE_MODE" != "1" ]]; then
-  echo "[!] Seeding needs network access. Set Online mode = Y or run /opt/whiff/scripts/whiff-seed-docs.sh later."
+  echo "[!] Seeding needs network. Either set Online mode = Y or run /opt/whiff/scripts/whiff-seed-docs.sh later."
 fi
 
-# Optional Hugging Face token (for gated models like Meta Llama 3.1)
 HF_TOKEN=""
 if [[ "$DL_MODELS_NOW" == "1" ]]; then
-  HF_TOKEN="$(prompt_secret_opt "Hugging Face token")"
+  HF_TOKEN="$(prompt_secret_opt "Hugging Face token (for Meta gated model)")"
 fi
 
 ENABLE_NIGHTLY_BACKFILL="$(yn "Install (disabled) nightly backfill service+timer?" Y)"
@@ -107,7 +112,7 @@ PACKAGE_SPLUNK_ADDON="$(yn "Package Splunk custom command tarball for your Searc
 #####################################
 [[ "$EUID" -eq 0 ]] || exec sudo -E bash "$0" "$@"
 req apt-get; req systemctl; req sed; req awk; req curl; req jq
-command -v psql >/dev/null 2>&1 || true  # we'll install if needed
+command -v psql >/dev/null 2>&1 || true
 
 #####################################
 # OS packages
@@ -119,7 +124,7 @@ apt-get install -y python3-venv build-essential cmake ninja-build libopenblas-de
 
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
   apt-get install -y postgresql postgresql-contrib
-  # Try to install pgvector package for the installed major version (best-effort)
+  # try to install pgvector package for the installed major version (best-effort)
   if command -v psql >/dev/null 2>&1; then
     PG_MAJ="$(psql -V 2>/dev/null | awk '{print $3}' | cut -d. -f1)"
     apt-get install -y "postgresql-${PG_MAJ}-pgvector" >/dev/null 2>&1 || \
@@ -137,7 +142,7 @@ mkdir -p /opt/whiff/{scripts,ingest,sql,packaging,splunk/SA-WADE-Search/bin,splu
 chown -R whiff:whiff /opt/whiff /var/log/whiff
 
 #####################################
-# requirements.txt  (extra deps for more formats + CLI)
+# requirements.txt
 #####################################
 cat > /opt/whiff/requirements.txt <<'REQ'
 fastapi==0.115.0
@@ -161,7 +166,7 @@ hf_transfer==0.1.6
 REQ
 
 #####################################
-# Core Python files
+# Core Python files (utils/models/api/index/crawl)
 #####################################
 cat > /opt/whiff/whiff_utils.py <<'PY'
 import hashlib, json, re
@@ -304,9 +309,6 @@ Return ONLY JSON.
     return {"help": help_obj, "cached": False}
 PY
 
-#####################################
-# Enhanced indexer (PDF/HTML/MD/RST/TXT/LOG/INI/CFG/DOCX/CSV/JSON) + proper vector casts
-#####################################
 cat > /opt/whiff/whiff_index.py <<'PY'
 import os, uuid, glob, json, csv
 from pathlib import Path
@@ -318,20 +320,17 @@ from docutils.core import publish_parts
 from docx import Document
 from whiff_models import embed_texts
 from whiff_utils import simple_chunks
-
 DB_DSN=os.environ.get("WHIFF_DB_DSN","postgresql://whiff:whiff@127.0.0.1:5432/whiff")
-MAX_BYTES=int(os.environ.get("WHIFF_INDEX_MAX_BYTES","5242880"))  # 5 MiB per file
+MAX_BYTES=int(os.environ.get("WHIFF_INDEX_MAX_BYTES","5242880"))
 CSV_MAX_ROWS=int(os.environ.get("WHIFF_INDEX_CSV_MAX_ROWS","500"))
-
 def sniff_file_text(p: Path) -> str:
     data = p.read_bytes()
     if not data: return ""
-    enc = chardet.detect(data).get("encoding") or "utf-8"
+    try_enc = (chardet.detect(data).get("encoding") or "utf-8")
     try:
-        return data.decode(enc, errors="ignore")
+        return data.decode(try_enc, errors="ignore")
     except Exception:
         return data.decode("utf-8", errors="ignore")
-
 def load_text(p:Path)->str:
     if p.stat().st_size > MAX_BYTES: return ""
     sfx=p.suffix.lower()
@@ -390,7 +389,6 @@ def load_text(p:Path)->str:
         except Exception:
             return ""
     return ""
-
 def insert_docs(conn,rows):
     cur=conn.cursor()
     cur.executemany("""
@@ -399,7 +397,6 @@ def insert_docs(conn,rows):
       ON CONFLICT DO NOTHING
     """, rows)
     conn.commit(); cur.close()
-
 def main(root="docs_ingest"):
     conn=psycopg2.connect(DB_DSN)
     for f in glob.glob(f"{root}/**/*", recursive=True):
@@ -419,15 +416,11 @@ def main(root="docs_ingest"):
               for c,e in zip(chunks, embs)]
         insert_docs(conn, rows)
     conn.close()
-
 if __name__=="__main__":
     import sys
     main(sys.argv[1] if len(sys.argv)>1 else "docs_ingest")
 PY
 
-#####################################
-# Crawler (HTML/PDF) + proper vector cast
-#####################################
 cat > /opt/whiff/whiff_crawl.py <<'PY'
 #!/usr/bin/env python3
 import os, time, re, json, urllib.parse, queue, uuid
@@ -443,6 +436,7 @@ def allowed(url, allow, deny):
     bad = any(re.search(p,url) for p in deny) if deny else False
     return ok and not bad
 def text_from_html(html):
+    from bs4 import BeautifulSoup
     soup=BeautifulSoup(html,"lxml")
     for bad in soup(["script","style","nav","aside","footer","header"]): bad.decompose()
     return soup.get_text("\n", strip=True), soup
@@ -683,7 +677,7 @@ enableheader = true
 CONF
 
 #####################################
-# Scripts: whiff-help, packer, importer, seeders
+# Scripts: whiff-help, packer, importer, seeds
 #####################################
 cat > /opt/whiff/scripts/whiff-help <<'SH'
 #!/usr/bin/env bash
@@ -734,10 +728,8 @@ echo "Imported KB into $DB and copied any bundled models."
 SH
 chmod +x /opt/whiff/scripts/whiff-import-kb.sh
 
-# MITRE STIX → Markdown converter
 cat > /opt/whiff/scripts/mitre_to_md.py <<'PY'
 #!/usr/bin/env python3
-# Usage: mitre_to_md.py /path/to/attack-stix-data /opt/whiff/docs_ingest/mitre_attack v14.1
 import json, sys, re, os, pathlib
 src, out_root, ver = sys.argv[1], sys.argv[2], sys.argv[3]
 out_dir = os.path.join(out_root, ver, "CC-BY-4.0")
@@ -787,7 +779,6 @@ for p in bundles:
 PY
 chmod +x /opt/whiff/scripts/mitre_to_md.py
 
-# Docs seeder
 cat > /opt/whiff/scripts/whiff-seed-docs.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -863,17 +854,18 @@ SH
 chmod +x /opt/whiff/scripts/whiff-seed-docs.sh
 
 #####################################
-# Python venv & deps
+# Python venv & deps (CPU-only Torch first)
 #####################################
 echo "[*] Creating venv and installing Python deps…"
 cd /opt/whiff
 python3 -m venv .venv
 . .venv/bin/activate
 pip install --upgrade pip
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
 pip install -r requirements.txt
 
 #####################################
-# Optional: Download models (Meta Llama 3.1 + Snowflake Arctic Embed) via hf (resumable)
+# Optional: Download models via hf (resumable)
 #####################################
 if [[ "$DL_MODELS_NOW" == "1" ]]; then
   echo "[*] Preparing Hugging Face CLI…"
@@ -886,35 +878,38 @@ if [[ "$DL_MODELS_NOW" == "1" ]]; then
   echo "[*] Downloading LLM (Meta Llama 3.1 8B Instruct Q4_K_M GGUF)…"
   /opt/whiff/.venv/bin/hf download --repo-type model bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
     --include "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" \
-    --local-dir /opt/whiff/models --resume >/dev/null || true
+    --local-dir /opt/whiff/models --resume || true
   [[ -f /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf ]] && \
     mv /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf /opt/whiff/models/whiff-llm.gguf || true
 
   echo "[*] Downloading Snowflake Arctic-Embed-M-v2.0 (768-dim)…"
   /opt/whiff/.venv/bin/hf download --repo-type model Snowflake/snowflake-arctic-embed-m-v2.0 \
-    --local-dir /opt/whiff/models/emb/snowflake-m-v2 --resume >/dev/null || true
+    --local-dir /opt/whiff/models/emb/snowflake-m-v2 --resume || true
 fi
 
 #####################################
 # Postgres bootstrap (DB, user, extension)
 #####################################
-DB_DSN="postgresql://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/$DB_NAME"
+# libpq "key=value" DSN (safe with special chars and spaces)
+DB_DSN="host=$DB_HOST port=$DB_PORT dbname=$DB_NAME user=$DB_USER password=$DB_PASS"
 echo "[*] Bootstrapping database schema…"
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
-  # Create DB if missing
   sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 || \
     sudo -u postgres createdb "$DB_NAME"
-  # Create user if missing
   sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname = '$DB_USER'" | grep -q 1 || \
     sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';"
-  # Grant + vector extension
   sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS vector;" || true
   sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" || true
 fi
 
-# Run schema (works local or remote if perms allow)
-WHIFF_DB_DSN="$DB_DSN" psql "$DB_DSN" -f /opt/whiff/sql/00_bootstrap.sql >/dev/null || \
-  echo "[!] Schema bootstrap skipped (ensure 'vector' ext + tables exist)."
+# If we can connect, apply schema; otherwise warn
+if psql "$DB_DSN" -c "SELECT 1;" >/dev/null 2>&1; then
+  psql "$DB_DSN" -f /opt/whiff/sql/00_bootstrap.sql >/dev/null || \
+    echo "[!] Schema file ran with warnings; ensure pgvector exists."
+else
+  echo "[!] Could not connect to ${DB_HOST}:${DB_PORT}/${DB_NAME} as ${DB_USER}. Check reachability/creds and rerun the schema:"
+  echo "    psql \"$DB_DSN\" -f /opt/whiff/sql/00_bootstrap.sql"
+fi
 
 #####################################
 # Env + systemd
@@ -955,8 +950,14 @@ SERVICE
 cp /opt/whiff/packaging/whiff-api.service /etc/systemd/system/whiff-api.service
 systemctl daemon-reload
 systemctl enable --now whiff-api
-sleep 1
-curl -fsS "http://${WHIFF_BIND}:${WHIFF_PORT}/health" || echo "[!] Health check failed (service may still be starting)."
+
+for i in {1..15}; do
+  if curl -fsS "http://${WHIFF_BIND}:${WHIFF_PORT}/health" >/dev/null; then
+    echo "[+] whiff-api healthy"
+    break
+  fi
+  sleep 1
+done || echo "[!] Health check failed (service may still be starting)."
 
 #####################################
 # Optional: Nightly backfill
@@ -984,7 +985,7 @@ TMR
 fi
 
 #####################################
-# Run docs seeding (no export)
+# Seed docs (if chosen + online)
 #####################################
 if [[ "$SEED_DOCS_NOW" == "1" && "$ONLINE_MODE" == "1" ]]; then
   echo "[*] Seeding docs into /opt/whiff/docs_ingest …"
@@ -992,7 +993,7 @@ if [[ "$SEED_DOCS_NOW" == "1" && "$ONLINE_MODE" == "1" ]]; then
 fi
 
 #####################################
-# Optional: Patch WADE env toggles
+# Patch WADE env toggles (optional)
 #####################################
 if [[ "$PATCH_WADE_ENV" == "1" && -f /etc/wade/wade.env ]]; then
   echo "[*] Adding WHIFF_* toggles to /etc/wade/wade.env"
@@ -1003,7 +1004,7 @@ if [[ "$PATCH_WADE_ENV" == "1" && -f /etc/wade/wade.env ]]; then
 fi
 
 #####################################
-# Optional: Package Splunk add-on tarball
+# Package Splunk add-on (optional)
 #####################################
 if [[ "$PACKAGE_SPLUNK_ADDON" == "1" ]]; then
   echo "[*] Packaging Splunk custom command for deployment…"
@@ -1012,7 +1013,7 @@ if [[ "$PACKAGE_SPLUNK_ADDON" == "1" ]]; then
 fi
 
 #####################################
-# Optional: Initial crawl
+# Initial crawl (optional)
 #####################################
 if [[ "$RUN_INITIAL_CRAWL" == "1" ]]; then
   echo "[*] Running initial crawl (this can take a while)…"
@@ -1039,6 +1040,8 @@ Models:
 DB:
   DSN: ${DB_DSN}
   Schema file: /opt/whiff/sql/00_bootstrap.sql
+  If schema didn’t run automatically:
+    psql "${DB_DSN}" -f /opt/whiff/sql/00_bootstrap.sql
 
 Crawler:
   Config: /opt/whiff/ingest/sites.yaml
@@ -1047,7 +1050,7 @@ Crawler:
 Index local docs (PDF, HTML, MD, RST, TXT/LOG/INI/CFG, DOCX, CSV, JSON):
   WHIFF_DB_DSN="${DB_DSN}" /opt/whiff/.venv/bin/python /opt/whiff/whiff_index.py /opt/whiff/docs_ingest
 
-Seed baseline docs (can run anytime):
+Seed baseline docs:
   /opt/whiff/scripts/whiff-seed-docs.sh /opt/whiff/docs_ingest
 
 Packer/Importer:
@@ -1055,17 +1058,13 @@ Packer/Importer:
   /opt/whiff/scripts/whiff-import-kb.sh /tmp/whiff_kb.tgz
 
 Splunk:
-  Tarball for Search Head: /opt/whiff/whiff_splunk_addon.tgz
-  Usage after deploy:
+  Tarball: /opt/whiff/whiff_splunk_addon.tgz
+  Usage:
     index=wade_volatility sourcetype=wade_volatility
     | head 20
     | whiff max_refs=3
     | table _time host whiff_summary whiff_mitre whiff_next_steps whiff_conf
 
-Quick API test:
-  curl -s http://${WHIFF_BIND}:${WHIFF_PORT}/ask \
-    -H 'Content-Type: application/json' \
-    -d '{"query":"What does Volatility pslist output represent?"}'
-
+Semper,
 Whiff is up.
 EOF
