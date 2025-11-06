@@ -1,65 +1,94 @@
 #!/usr/bin/env python3
-import os, json, subprocess, shutil
+import os, json, shutil, subprocess
 from pathlib import Path
-from typing import List, Iterable
+from typing import List, Dict, Tuple
+
 from .base import BaseWorker, WorkerResult
 from .utils import wade_paths, now_iso
 
-DEFAULT_MODULES = [
-    # safe, broadly useful windows modules
-    "windows.info", "windows.pslist", "windows.pstree", "windows.cmdline",
-    "windows.netscan", "windows.handles", "windows.dlllist", "windows.services",
-    "windows.malfind",
-]
+def _vol_cmd(env: Dict[str,str]) -> str:
+    # Prefer explicit path; else vol.py; else python3 -m volatility3
+    for c in (env.get("VOL_CMD"), "vol.py"):
+        if c and shutil.which(c):
+            return c
+    return "python3 -m volatility3"
+
+def _modules(env: Dict[str,str], cfg: dict) -> List[str]:
+    # YAML: volatility.modules: [windows.pslist, windows.netscan]
+    if "volatility" in cfg and isinstance(cfg["volatility"], dict) and cfg["volatility"].get("modules"):
+        m = cfg["volatility"]["modules"]
+        if isinstance(m, list) and m:
+            return [str(x) for x in m]
+    # ENV fallback
+    mods = env.get("VOL_MODULES", "windows.pslist,windows.psscan")
+    return [m.strip() for m in mods.split(",") if m.strip()]
 
 class VolatilityWorker(BaseWorker):
-    tool = "volatility3"
-    help_text = "Volatility3 memory analysis; modules vary by OS profile."
-    prefer_jsonl = True
+    tool = "volatility"
+    module = "multi"
+    help_text = "Run Volatility3 modules against a memory image. Outputs JSONL per module."
 
-    def __init__(self, env=None, config=None):
-        super().__init__(env, config)
-        self.vol = shutil.which("vol3") or shutil.which("vol") or shutil.which("volatility3")
+    def _host_and_img(self, ticket) -> Tuple[str, Path]:
+        host = ticket.get("host") or self.env.get("WADE_HOSTNAME","host")
+        p = Path(ticket.get("dest_path") or ticket.get("path") or "")
+        if not p.exists():
+            raise FileNotFoundError(f"memory image not found: {p}")
+        return host, p
 
-    def _run_module(self, image: Path, module: str) -> Iterable[dict]:
-        if not self.vol:
-            yield {"ts": now_iso(), "error": "volatility3_not_found", "module": module}
-            return
-        # Use JSON output if supported; some plugins print tables only.
-        out = subprocess.run(
-            [self.vol, "-f", str(image), module, "--output", "json"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        if out.returncode != 0 or not out.stdout.strip():
-            yield {"ts": now_iso(), "module": module, "stderr": out.stderr.strip()[:4000], "error": "module_failed"}
-            return
-        try:
-            data = json.loads(out.stdout)
-            if isinstance(data, list):
-                for row in data:
-                    row["module"] = module
-                    yield row
-            else:
-                yield {"module": module, "data": data}
-        except Exception:
-            # Fallback: one blob per run
-            yield {"module": module, "data_raw": out.stdout}
+    def _append_log(self, host: str, text: str):
+        _, log_dir = wade_paths(self.env, host, self.tool, self.module)
+        with open(log_dir / f"{self.tool}_{self.module}.log", "a", encoding="utf-8") as fh:
+            fh.write(text.rstrip() + "\n")
 
     def run(self, ticket: dict) -> WorkerResult:
-        kind = ticket.get("kind")
-        path = Path(ticket.get("dest_path",""))
-        host = ticket.get("host") or self.env.get("WADE_HOSTNAME","host")
-        if kind != "memory" or not path.exists():
-            return WorkerResult(None, 0, [f"skip kind={kind} path_exists={path.exists()}"])
-        if self.should_skip_by_splunk(host, "multi", str(path)):
-            return WorkerResult(None, 0, ["dedupe_splunk"])
+        host, img = self._host_and_img(ticket)
+        cmd = _vol_cmd(self.env)
+        mods = _modules(self.env, self.config)
+        out_count = 0
+        errors: List[str] = []
+        last_out = None
 
-        modules = self.config.get("volatility", {}).get("modules", DEFAULT_MODULES)
-        all_records = []
-        for m in modules:
-            for rec in self._run_module(path, m):
-                all_records.append(rec)
+        for mod in mods:
+            args = [cmd, "-f", str(img), mod, "-r", "json"]
+            self._append_log(host, f"{now_iso()} running: {' '.join(args)}")
+            try:
+                cp = subprocess.run(args, capture_output=True, text=True, check=False)
+            except Exception as e:
+                errors.append(f"{mod}: spawn error: {e!r}")
+                continue
 
-        # Write one file per tool/module-group
-        self.module = "memory-suite"
-        return self.run_records(host, all_records, str(path))
+            if cp.returncode != 0:
+                errors.append(f"{mod}: rc={cp.returncode} stderr={cp.stderr.strip()[:4000]}")
+                # still record a small error artifact for Splunk visibility
+                rec = {"ts": now_iso(), "module": mod, "rc": cp.returncode, "stderr": cp.stderr}
+                last_out, _ = self.run_records(host, [rec], str(img))
+                continue
+
+            # try to parse Vol3 JSON; if unknown, store raw
+            records = []
+            try:
+                data = json.loads(cp.stdout)
+                if isinstance(data, dict) and "columns" in data and "rows" in data:
+                    cols = data.get("columns") or []
+                    for row in data.get("rows") or []:
+                        try:
+                            records.append({"module": mod, **{cols[i]: row[i] for i in range(min(len(cols), len(row)))}})
+                        except Exception:
+                            records.append({"module": mod, "row": row})
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            item = {"module": mod, **item}
+                        else:
+                            item = {"module": mod, "row": item}
+                        records.append(item)
+                else:
+                    records.append({"module": mod, "raw": cp.stdout})
+            except Exception:
+                records.append({"module": mod, "raw": cp.stdout})
+
+            last_out, cnt = self.run_records(host, records, str(img))
+            out_count += cnt
+            self._append_log(host, f"{now_iso()} {mod} -> {cnt} records")
+
+        return WorkerResult(last_out, out_count, errors)
