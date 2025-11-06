@@ -85,7 +85,7 @@ CHECK_ONLY=0
 FORCE_ALL=0
 ONLY_LIST=""
 
-for arg in "${@:-}"; do
+for arg in "$@"; do
   case "$arg" in
     -y|--yes|--noninteractive) NONINTERACTIVE=1 ;;
     --check) CHECK_ONLY=1 ;;
@@ -94,7 +94,7 @@ for arg in "${@:-}"; do
   esac
 done
 
-NONINTERACTIVE=${WADE_NONINTERACTIVE:-$NONINTERACTIVE}
+NONINTERACTIVE="${WADE_NONINTERACTIVE:-${NONINTERACTIVE:-0}}"
 OFFLINE="${OFFLINE:-0}"
 
 #####################################
@@ -362,9 +362,16 @@ wade_doctor() {
   echo "=== WADE Doctor ==="
   if systemctl is-active --quiet smbd || systemctl is-active --quiet smb; then
     echo "[*] Samba: active"
+      if testparm -s 2>/dev/null | grep -qiE '^\s*map to guest\s*=\s*never'; then
+       echo "[+] Samba auth: map to guest = Never"
+      else
+       echo "[!] Samba auth: map to guest is not 'Never' (Windows may try Guest)"
+      fi
+       echo "[*] Samba users present:"; pdbedit -L 2>/dev/null | awk -F: '{print "   - "$1}' || echo "   (none)"
   else
     echo "[!] Samba: inactive"
   fi
+  PATH_LINE=""
   SMB_CONF="/etc/samba/smb.conf"
   for SHARE in DataSources Cases Staging; do
     if testparm -s 2>/dev/null | grep -q "^\[$SHARE\]"; then
@@ -657,12 +664,22 @@ for f in "${WADE_ETC}/conf.d/"*.conf; do [[ -f "$f" ]] && source "$f"; done
 for f in "${WADE_ETC}/modules/"*.conf; do [[ -f "$f" ]] && source "$f"; done
 OFFLINE="${OFFLINE:-${WADE_OFFLINE:-0}}"
 
-# ---- Guard against set -u for expected vars ----
-: "${VOL3_BASE_DIR:=/var/wade/vol3}"
-: "${VOL3_SYMBOLS_DIR:=${VOL3_BASE_DIR}/symbols}"
-: "${VOL3_CACHE_DIR:=${VOL3_BASE_DIR}/cache}"
-: "${VOL3_PLUGIN_DIR:=${VOL3_BASE_DIR}/plugins}"
-: "${LWADEUSER:=${WADE_OWNER_USER:-autopsy}}"
+# ---- Safe defaults so set -u never trips on older configs
+: "${WADE_PKG_DIR:=/var/wade/pkg}"
+: "${SOLR_HEAP:=}"                      # empty means "leave Jetty heap default"
+: "${SOLR_JAVA_MEM:=-Xms24G -Xmx48G}"   # you override below for low-RAM hosts
+: "${PG_PERF_FSYNC:=off}"
+: "${PG_PERF_SYNCCOMMIT:=off}"
+: "${PG_PERF_FULLPAGE:=off}"
+: "${HAYABUSA_DEST:=/usr/local/bin/hayabusa}"
+: "${HAYABUSA_RULES_DIR:=/etc/wade/hayabusa/rules}"
+: "${SIGMA_RULES_DIR:=/etc/wade/sigma}"
+: "${WADE_CAPA_VENV:=/opt/wade/venvs/capa}"
+: "${WADE_CAPA_RULES_DIR:=/opt/capa-rules}"
+
+if (( MEM_GB < 32 )); then
+  SOLR_JAVA_MEM='-Xms2g -Xmx4g'
+fi
 
 #####################################
 # NEW: Build the package bundle & install once
@@ -916,11 +933,23 @@ wade_install_samba() {
 [global]
    workgroup = WORKGROUP
    server string = WADE
+   server role = standalone server
    security = user
-   map to guest = Bad User
+
+   # Never map unknowns to guest (prevents Windows "unauthenticated guest" policy error)
+   map to guest = Never
+   usershare allow guests = no
+
+   # Require modern SMB (avoid SMB1 guest dances)
+   server min protocol = SMB2_10
+   client min protocol = SMB2
+
+   # Sensible auth defaults for Win10/11
+   encrypt passwords = yes
+   # ntlm auth defaults to 'no' in modern Samba; Windows uses NTLMv2/Kerberos anyway.
    dns proxy = no
 EOF
-  fi
+fi
 
   [[ -f "${SMB_CONF}.bak" ]] || cp "$SMB_CONF" "${SMB_CONF}.bak"
 
@@ -985,14 +1014,34 @@ EOF
     return 1
   fi
 
-  # Optional bulk set of Samba passwords if captured
-  if [[ "$NONINTERACTIVE" -eq 0 && -n "${SMB_ALL_PW:-}" ]]; then
-    IFS=',' read -ra users <<< "${SMB_USERS_CSV}"
-    for u in "${users[@]}"; do
-      u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
+IFS=',' read -ra users <<< "${SMB_USERS_CSV}"
+need_pw_note=0
+
+gen_pw() {
+  # 20-char safe default for noninteractive runs
+  tr -dc 'A-Za-z0-9@#%+=' </dev/urandom | head -c 20
+}
+
+for u in "${users[@]}"; do
+  u="$(echo "$u" | xargs)"; [[ -z "$u" ]] && continue
+  if ! pdbedit -L 2>/dev/null | awk -F: '{print $1}' | grep -qx "$u"; then
+    if [[ -n "${SMB_ALL_PW:-}" ]]; then
       ( printf "%s\n%s\n" "$SMB_ALL_PW" "$SMB_ALL_PW" ) | smbpasswd -s -a "$u" >/dev/null || true
-    done
+    elif [[ "$NONINTERACTIVE" -eq 1 ]]; then
+      AUTOPW="$(gen_pw)"
+      ( printf "%s\n%s\n" "$AUTOPW" "$AUTOPW" ) | smbpasswd -s -a "$u" >/dev/null || true
+      echo "[wade] SMB password for user '$u' (auto-generated): ${AUTOPW}" >> "$LOG_FILE"
+      need_pw_note=1
+    else
+      echo "Set Samba password for user '$u':"
+      smbpasswd -a "$u" || true
+    fi
   fi
+done
+
+if (( need_pw_note )); then
+  echo "[wade] NOTE: Auto-generated Samba passwords were written to ${LOG_FILE}. Change them with 'smbpasswd <user>'." >&2
+fi
 
   systemd_queue_enable smbd || systemd_queue_enable smb
   systemd_queue_enable nmbd || systemd_queue_enable nmb || true
@@ -1215,7 +1264,7 @@ fi
 EOF
   chmod 0755 /usr/local/sbin/update-capa-rules
 
-  rules_count="$(find "$WADE_CAPA_RULES_DIR" -type f -name "*.yml" 2>/dev/null | wc -l | tr -d " ")"
+  rules_count="$(find "$WADE_CAPA_RULES_DIR" -type f -name "*.yml" 2>/dev/null | wc -l | tr -d " " || echo 0)"
   [[ "${rules_count:-0}" -gt 0 ]] || { echo "no rules found"; exit 1; }
 ' || fail_note "capa-rules" "rules install failed"
 
@@ -1429,9 +1478,9 @@ run_step "piranha" "installed" get_ver_piranha '
 
   python3 -m venv /opt/piranha/.venv || python3 -m virtualenv /opt/piranha/.venv
   /opt/piranha/.venv/bin/pip install --upgrade pip >/dev/null 2>&1 || true
-  if [[ -f /opt/piranha/requirements.txt ]]; then
-    '"pip_cached_install \"/opt/piranha/.venv/bin\" -r /opt/piranha/requirements.txt"'
-  fi
+    if [[ -f /opt/piranha/requirements.txt ]]; then
+      pip_cached_install "/opt/piranha/.venv/bin" -r /opt/piranha/requirements.txt
+    fi
 
   FEIX="$(ls "'"$LOAD_PATCH_DIR"'"/*patch.py 2>/dev/null | sort -V | tail -1)"
   if [[ -n "$FEIX" ]]; then
@@ -1470,7 +1519,7 @@ run_step "barracuda" "installed" get_ver_barracuda '
   python3 -m venv /opt/barracuda/.venv || python3 -m virtualenv /opt/barracuda/.venv
   /opt/barracuda/.venv/bin/pip install --upgrade pip >/dev/null 2>&1 || true
   if [[ -f /opt/barracuda/requirements.txt ]]; then
-    '"pip_cached_install \"/opt/barracuda/.venv/bin\" -r /opt/barracuda/requirements.txt"'
+    pip_cached_install \"/opt/barracuda/.venv/bin\" -r /opt/barracuda/requirements.txt
   fi
 
   if [[ ! -f /opt/barracuda/enterprise-attack.json ]]; then
