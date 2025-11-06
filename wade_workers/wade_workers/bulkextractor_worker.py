@@ -1,52 +1,68 @@
 #!/usr/bin/env python3
-import os, json, shutil, subprocess, tempfile
+import os, shutil, subprocess
 from pathlib import Path
+from typing import List, Dict, Tuple
+
 from .base import BaseWorker, WorkerResult
-from .utils import now_iso
+from .utils import wade_paths, now_iso
+
+def _be_cmd(env: Dict[str,str]) -> str:
+    return env.get("BULK_EXTRACTOR_CMD") or (shutil.which("bulk_extractor") and "bulk_extractor") or "bulk_extractor"
 
 class BulkExtractorWorker(BaseWorker):
-    tool = "bulk_extractor"
-    help_text = "Bulk Extractor content scanning summary (emails, URLs, CCNs)."
-    prefer_jsonl = True
+    tool = "bulkextractor"
+    module = "features"
+    help_text = "Run bulk_extractor to carve feature files; we emit a summary JSON."
 
-    def __init__(self, env=None, config=None):
-        super().__init__(env, config)
-        self.be = shutil.which("bulk_extractor")
+    def _host_and_img(self, ticket) -> Tuple[str, Path]:
+        host = ticket.get("host") or self.env.get("WADE_HOSTNAME","host")
+        p = Path(ticket.get("dest_path") or ticket.get("path") or "")
+        if not p.exists():
+            raise FileNotFoundError(f"artifact not found: {p}")
+        return host, p
 
-    def _summarize_outdir(self, outdir: Path) -> list:
-        recs = []
-        for f in outdir.glob("*.txt"):
-            try:
-                sz = f.stat().st_size
-                head = f.read_text(errors="ignore")[:2000]
-                recs.append({"file": f.name, "size": sz, "preview": head})
-            except Exception:
-                pass
-        return recs
+    def _append_log(self, host: str, text: str):
+        _, log_dir = wade_paths(self.env, host, self.tool, self.module)
+        with open(log_dir / f"{self.tool}_{self.module}.log", "a", encoding="utf-8") as fh:
+            fh.write(text.rstrip() + "\n")
 
     def run(self, ticket: dict) -> WorkerResult:
-        kind = ticket.get("kind")
-        path = Path(ticket.get("dest_path",""))
-        host = ticket.get("host") or self.env.get("WADE_HOSTNAME","host")
-        if kind not in ("ewf-e01","disk-raw","archive","memory","unknown") or not path.exists():
-            return WorkerResult(None, 0, [f"skip kind={kind} path_exists={path.exists()}"])
-        if not self.be:
-            return WorkerResult(None,0,["bulk_extractor_not_found"])
-        if self.should_skip_by_splunk(host, "bulkextractor", str(path)):
-            return WorkerResult(None,0,["dedupe_splunk"])
+        host, f = self._host_and_img(ticket)
+        be = _be_cmd(self.env)
+        if not shutil.which(be):
+            return WorkerResult(None, 0, [f"bulk_extractor not found (BULK_EXTRACTOR_CMD={be})"])
 
-        tmp = Path(tempfile.mkdtemp(prefix="be-"))
+        # Put BE output in the same wade_ tree for traceability
+        out_dir, _ = wade_paths(self.env, host, self.tool, self.module)
+        be_out = out_dir / f"be_{int(os.stat(f).st_mtime)}"
+        be_out.mkdir(parents=True, exist_ok=True)
+
+        args = [be, "-o", str(be_out), str(f)]
+        self._append_log(host, f"{now_iso()} running: {' '.join(args)}")
         try:
-            p = subprocess.run([self.be, "-o", str(tmp), str(path)],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            recs = [{
-                "ts": now_iso(),
-                "image_path": str(path),
-                "rc": p.returncode,
-                "stderr": p.stderr[:4000],
-                "summary": self._summarize_outdir(tmp),
-            }]
-            self.module = "scan"
-            return self.run_records(host, recs, str(path))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            cp = subprocess.run(args, capture_output=True, text=True, check=False)
+        except Exception as e:
+            return WorkerResult(None, 0, [f"spawn: {e!r}"])
+
+        errors: List[str] = []
+        if cp.returncode != 0:
+            errors.append(f"rc={cp.returncode} stderr={cp.stderr.strip()[:4000]}")
+
+        # Summarize feature files present
+        feats = []
+        for ff in sorted(be_out.glob("*.txt")):
+            try:
+                size = ff.stat().st_size
+            except Exception:
+                size = 0
+            feats.append({"file": ff.name, "bytes": size})
+
+        rec = {
+            "ts": now_iso(),
+            "be_out_dir": str(be_out),
+            "feature_files": feats,
+            "stderr": cp.stderr.strip() if cp.stderr else "",
+            "rc": cp.returncode,
+        }
+        out, cnt = self.run_records(host, [rec], str(f))
+        return WorkerResult(out, cnt, errors)
