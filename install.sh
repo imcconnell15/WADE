@@ -1654,20 +1654,26 @@ run_step "hayabusa" "" get_ver_hayabusa '
 
   HAY_ARCH="${HAY_ARCH:-$(detect_hayabusa_arch)}"
   HAY_ZIP=""
+
   # look in WADE_PKG_DIR first
   HAY_ZIP_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa"/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
 
   if [[ -n "$HAY_ZIP_LOCAL" ]]; then
     cp "$HAY_ZIP_LOCAL" .
     HAY_ZIP="$(basename "$HAY_ZIP_LOCAL")"
+
   elif [[ "$OFFLINE" == "1" ]]; then
     HAY_ZIP_USB="$(ls "${OFFLINE_SRC}/hayabusa"/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
     [[ -n "$HAY_ZIP_USB" ]] || { echo "Hayabusa zip for arch '"'"'${HAY_ARCH:-}'"'"' not found offline"; exit 1; }
     cp "$HAY_ZIP_USB" .
     HAY_ZIP="$(basename "$HAY_ZIP_USB")"
+
   else
     if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
       echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
+
+      # Get latest release JSON from GitHub
+      JSON="$(curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest)"
 
       # Map our arch tokens to matching asset names
       case "${HAY_ARCH:-$(detect_hayabusa_arch)}" in
@@ -1676,18 +1682,19 @@ run_step "hayabusa" "" get_ver_hayabusa '
         *)           ARCH_RE="x86_64|amd64|x64" ;;
       esac
 
+      # Use jq without inner single quotes (so it plays nice with the outer run_step quotes)
       DL_URL="$(
-        jq -r --arg archre "$ARCH_RE" '
-          [ .assets[] 
-            | select(
-              (.name | test("(?i)(^|[-_])lin(ux)?([-_]|$)")) and
-              (.name | test($archre)) and
-              (.name | test("\\.zip$"))
-            )
-          ]
-          | ( map(select(.name | test("(?i)gnu"))) + map(select(.name | test("(?i)musl"))) )
-          | .[0].browser_download_url // empty
-        ' <<< "$JSON"
+        jq -r --arg archre "$ARCH_RE" \
+          "[ .assets[]
+              | select(
+                  (.name | test(\"(?i)(^|[-_])lin(ux)?([-_]|$)\")) and
+                  (.name | test(\$archre)) and
+                  (.name | test(\"\\.zip$\")) 
+                )
+           ]
+           | ( map(select(.name | test(\"(?i)gnu\"))) + map(select(.name | test(\"(?i)musl\"))) )
+           | .[0].browser_download_url // empty" \
+          <<< "$JSON"
       )"
 
       [[ -n "$DL_URL" ]] || { echo "Could not resolve a Linux asset for arch regex ${ARCH_RE}"; exit 1; }
@@ -1697,7 +1704,7 @@ run_step "hayabusa" "" get_ver_hayabusa '
     else
       echo "curl/jq required to auto-fetch Hayabusa online"; exit 1
     fi
-  fi  
+  fi
 
   # --- Extract & verify arch before install ---
   TMPDIR="$(mktemp -d)"; cleanup(){ rm -rf "$TMPDIR"; }; trap cleanup EXIT
@@ -1705,11 +1712,14 @@ run_step "hayabusa" "" get_ver_hayabusa '
 
   HAY_BIN_PATH="$(find "$TMPDIR" -type f -name "hayabusa*" ! -name "*.exe" | head -1 || true)"
   if [[ -z "$HAY_BIN_PATH" ]]; then
-    echo "Hayabusa binary not found in ${HAY_ZIP}"; find "$TMPDIR" -maxdepth 3 -type f -printf "  %P\n"; exit 1
+    echo "Hayabusa binary not found in ${HAY_ZIP}"
+    find "$TMPDIR" -maxdepth 3 -type f -printf "  %P\n"
+    exit 1
   fi
 
   if ! file "$HAY_BIN_PATH" | grep -qiE "ELF 64-bit.*(x86-64|aarch64)"; then
-    echo "Downloaded binary is not the right CPU arch for this host ($(uname -m))"; exit 1
+    echo "Downloaded binary is not the right CPU arch for this host ($(uname -m))"
+    exit 1
   fi
 
   install -m 0755 "$HAY_BIN_PATH" "${HAYABUSA_DEST}"
