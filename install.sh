@@ -1682,14 +1682,14 @@ run_step "hayabusa" "" get_ver_hayabusa '
         *)           ARCH_RE="x86_64|amd64|x64" ;;
       esac
 
-      # Use jq without inner single quotes (so it plays nice with the outer run_step quotes)
+      # Use jq, but avoid backslash hell by matching the literal dot as [.]
       DL_URL="$(
         jq -r --arg archre "$ARCH_RE" \
           "[ .assets[]
               | select(
                   (.name | test(\"(?i)(^|[-_])lin(ux)?([-_]|$)\")) and
                   (.name | test(\$archre)) and
-                  (.name | test(\"\\.zip$\")) 
+                  (.name | test(\"[.]zip$\")) 
                 )
            ]
            | ( map(select(.name | test(\"(?i)gnu\"))) + map(select(.name | test(\"(?i)musl\"))) )
@@ -1704,11 +1704,11 @@ run_step "hayabusa" "" get_ver_hayabusa '
     else
       echo "curl/jq required to auto-fetch Hayabusa online"; exit 1
     fi
-  fi
+  fi  
 
   # --- Extract & verify arch before install ---
   TMPDIR="$(mktemp -d)"; cleanup(){ rm -rf "$TMPDIR"; }; trap cleanup EXIT
-  bsdtar -xf "$HAY_ZIP" -C "$TMPDIR"
+  unzip -q "$HAY_ZIP" -d "$TMPDIR"
 
   HAY_BIN_PATH="$(find "$TMPDIR" -type f -name "hayabusa*" ! -name "*.exe" | head -1 || true)"
   if [[ -z "$HAY_BIN_PATH" ]]; then
