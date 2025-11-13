@@ -1677,12 +1677,17 @@ run_step "hayabusa" "" get_ver_hayabusa '
       esac
 
       DL_URL="$(
-        curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest |
-        jq -r --arg archre "$ARCH_RE" "
-          .assets[]
-          | select((.name|test(\"(?i)linux\")) and (.name|test(\$archre)) and (.name|test(\"\\\\.(zip|tar\\\\.gz)$\")))
-          | .browser_download_url
-        " | head -1
+        jq -r --arg archre "$ARCH_RE" '
+          [ .assets[] 
+            | select(
+              (.name | test("(?i)(^|[-_])lin(ux)?([-_]|$)")) and
+              (.name | test($archre)) and
+              (.name | test("\\.zip$"))
+            )
+          ]
+          | ( map(select(.name | test("(?i)gnu"))) + map(select(.name | test("(?i)musl"))) )
+          | .[0].browser_download_url // empty
+        ' <<< "$JSON"
       )"
 
       [[ -n "$DL_URL" ]] || { echo "Could not resolve a Linux asset for arch regex ${ARCH_RE}"; exit 1; }
@@ -1761,12 +1766,14 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
   systemd_queue_enable zookeeper
+  systemctl start zookeeper.service
 ' || fail_note "zookeeper" "install/config failed"
 
 #####################################
 # Solr (pinned; soft-fail)
 #####################################
 run_step "solr" "${SOLR_VER}" get_ver_solr '
+  sudo apt-get install -y openjdk-11-jre-headless
   set -e
   SOLR_TGZ="solr-${SOLR_VER}.tgz"
   fetch_pkg solr "$SOLR_TGZ" || curl -L "https://archive.apache.org/dist/lucene/solr/${SOLR_VER}/${SOLR_TGZ}" -o "$SOLR_TGZ"
@@ -1774,6 +1781,7 @@ run_step "solr" "${SOLR_VER}" get_ver_solr '
   tar -xvzf "$SOLR_TGZ" "solr-${SOLR_VER}/bin/install_solr_service.sh" --strip-components=2
   bash ./install_solr_service.sh "$SOLR_TGZ" || true
   IPV4=$(hostname -I 2>/dev/null | awk '"'"'{print $1}'"'"')
+  sed -i 's|^#\?SOLR_JAVA_HOME=.*|SOLR_JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64|' /etc/default/solr.in.sh
   sed -i "s/^#\?SOLR_HEAP=.*/SOLR_HEAP=\"${SOLR_HEAP}\"/" /etc/default/solr.in.sh
   sed -i "s|^#\?SOLR_JAVA_MEM=.*|SOLR_JAVA_MEM=\"${SOLR_JAVA_MEM}\"|" /etc/default/solr.in.sh
   if grep -q "^#\?ZK_HOST=" /etc/default/solr.in.sh; then
@@ -2386,6 +2394,7 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
             else
                 fail_note "stig-eval" "oscap eval failed (exit ${ec})"
             fi
+          fi
         fi
       fi
       [[ -n "$TMP_EXTRACT" ]] && rm -rf "$TMP_EXTRACT"
