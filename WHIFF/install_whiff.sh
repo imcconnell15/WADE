@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Whiff - DFIR RAG Companion :: Idempotent Installer (online/offline)
-# Author: You + GPT (Meta Llama 3.1 + Snowflake Arctic Embed)
+# Author: You + GPT
 # Tested on: Ubuntu 22.04/24.04 (root required)
 set -Eeuo pipefail
 
@@ -29,9 +29,21 @@ prompt_secret_confirm() {
   while true; do
     read -rs -p "$q: " p1; echo
     read -rs -p "Confirm $q: " p2; echo
-    [[ "$p1" == "$p2" ]] && { echo "$p1"; return 0; }
-    echo "Passwords don't match. Try again."
+    if [[ "$p1" == "$p2" ]]; then
+      printf '%s' "$p1"
+      return 0
+    fi
+    echo "Passwords don't match. Try again." >&2
   done
+}
+
+hf_get_bin() {
+  # Prefer venv 'hf', then 'huggingface-cli'; print path or empty
+  local cand
+  for cand in "/opt/whiff/.venv/bin/hf" "/opt/whiff/.venv/bin/huggingface-cli" "$(command -v hf || true)" "$(command -v huggingface-cli || true)"; do
+    [[ -n "$cand" && -x "$cand" ]] && { echo "$cand"; return 0; }
+  done
+  echo ""
 }
 
 #####################################
@@ -64,7 +76,7 @@ fi
 
 SEED_BASELINE_DOCS="0"
 if [[ "$ONLINE_MODE" == "1" ]]; then
-  SEED_BASELINE_DOCS="$(yn "Seed baseline docs (ATT&CK, Vol3, Hayabusa, capa, YARA, Arkime, JA3/JA4 links) into /opt/whiff/docs_ingest now?" Y)"
+  SEED_BASELINE_DOCS="$(yn "Seed baseline docs (ATT&CK, Vol3, Hayabusa, capa, YARA, Arkime) now?" Y)"
 fi
 HF_TOKEN="$(prompt "Hugging Face token (for Meta gated model) (press Enter to skip)" "")"
 
@@ -77,7 +89,7 @@ PACKAGE_SPLUNK_ADDON="$(yn "Package Splunk custom command tarball for your Searc
 #####################################
 [[ "$EUID" -eq 0 ]] || exec sudo -E bash "$0" "$@"
 req apt-get; req systemctl; req sed; req awk; req curl; req jq; req git
-command -v psql >/dev/null 2>&1 || true  # we'll install if needed
+command -v psql >/dev/null 2>&1 || true
 
 #####################################
 # OS packages
@@ -86,7 +98,6 @@ echo "[*] Installing OS packages…"
 apt-get update -y
 apt-get install -y python3-venv build-essential cmake ninja-build libopenblas-dev \
   postgresql-client jq rsync git
-
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
   apt-get install -y postgresql postgresql-contrib
 fi
@@ -125,7 +136,7 @@ hf_transfer==0.1.6
 REQ
 
 #####################################
-# Core Python files
+# Core Python (utils, models, API, indexer, crawler)
 #####################################
 cat > /opt/whiff/whiff_utils.py <<'PY'
 import hashlib, json, re
@@ -331,7 +342,6 @@ def insert_docs(conn,rows):
     conn.commit(); cur.close()
 
 def infer_meta(p:Path):
-    # Expecting: /opt/whiff/docs_ingest/<tool>/<version>/<license>/<files>
     parts = Path(p).parts
     tool="misc"; version="unknown"; license_="unknown"
     if len(parts) >= 4:
@@ -346,7 +356,7 @@ def main(root="docs_ingest"):
         p=Path(f)
         if not p.is_file(): continue
         text=load_text(p).strip()
-        if not text or len(text) < 200:  # avoid noise
+        if not text or len(text) < 200:
             continue
         tool, version, license_ = infer_meta(p)
         meta={"filename":p.name,"source_path":str(p)}
@@ -458,7 +468,7 @@ PY
 chmod +x /opt/whiff/whiff_crawl.py
 
 #####################################
-# SQL bootstrap (768-dim for Snowflake Arctic Embed)
+# SQL bootstrap
 #####################################
 cat > /opt/whiff/sql/00_bootstrap.sql <<'SQL'
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -486,15 +496,14 @@ CREATE TABLE IF NOT EXISTS annotation_cache (
 SQL
 
 #####################################
-# Ingest config (pre-tuned sites.yaml)
+# Ingest config (sites)
 #####################################
 mkdir -p /opt/whiff/ingest
 cat > /opt/whiff/ingest/sites.yaml <<'YAML'
 sites:
   - name: mitre-attack
     base: "https://attack.mitre.org"
-    allow:
-      - "^https://attack\\.mitre\\.org/(techniques|tactics|mitigations|datasources)/.*$"
+    allow: ["^https://attack\\.mitre\\.org/(techniques|tactics|mitigations|datasources)/.*$"]
     deny: []
     rate_per_sec: 1.0
     max_pages: 3000
@@ -504,10 +513,8 @@ sites:
 
   - name: volatility3-docs
     base: "https://volatility3.readthedocs.io"
-    allow:
-      - "^https://volatility3\\.readthedocs\\.io/en/(latest|stable)/.*$"
-    deny:
-      - "\\.(zip|tar|gz|jpg|png|gif|svg|ico)$"
+    allow: ["^https://volatility3\\.readthedocs\\.io/en/(latest|stable)/.*$"]
+    deny: ["\\.(zip|tar|gz|jpg|png|gif|svg|ico)$"]
     rate_per_sec: 1.0
     max_pages: 1200
     license: "See Volatility docs license"
@@ -516,8 +523,7 @@ sites:
 
   - name: hayabusa-wiki
     base: "https://github.com/Yamato-Security/hayabusa/wiki"
-    allow:
-      - "^https://github\\.com/Yamato-Security/hayabusa/wiki/.*$"
+    allow: ["^https://github\\.com/Yamato-Security/hayabusa/wiki/.*$"]
     deny: []
     rate_per_sec: 0.5
     max_pages: 600
@@ -527,8 +533,7 @@ sites:
 
   - name: capa-docs
     base: "https://mandiant.github.io/capa"
-    allow:
-      - "^https://mandiant\\.github\\.io/capa/.*$"
+    allow: ["^https://mandiant\\.github\\.io/capa/.*$"]
     deny: []
     rate_per_sec: 0.5
     max_pages: 400
@@ -538,8 +543,7 @@ sites:
 
   - name: yara-docs
     base: "https://yara.readthedocs.io"
-    allow:
-      - "^https://yara\\.readthedocs\\.io/.*$"
+    allow: ["^https://yara\\.readthedocs\\.io/.*$"]
     deny: []
     rate_per_sec: 0.8
     max_pages: 600
@@ -549,8 +553,7 @@ sites:
 
   - name: arkime-docs
     base: "https://arkime.com"
-    allow:
-      - "^https://arkime\\.com/(learn|faq|apiv3|settings).*"
+    allow: ["^https://arkime\\.com/(learn|faq|apiv3|settings).*"]
     deny: []
     rate_per_sec: 0.6
     max_pages: 400
@@ -560,8 +563,7 @@ sites:
 
   - name: zeek-docs
     base: "https://docs.zeek.org"
-    allow:
-      - "^https://docs\\.zeek\\.org/.+"
+    allow: ["^https://docs\\.zeek\\.org/.+"]
     deny: []
     rate_per_sec: 0.8
     max_pages: 1200
@@ -571,25 +573,13 @@ sites:
 
   - name: forensic-artifacts-kb
     base: "https://artifacts.readthedocs.io"
-    allow:
-      - "^https://artifacts\\.readthedocs\\.io/.*$"
+    allow: ["^https://artifacts\\.readthedocs\\.io/.*$"]
     deny: []
     rate_per_sec: 0.8
     max_pages: 800
     license: "Apache-2.0 (repo); docs site"
     tool: "forensic-artifacts"
     version: "kb"
-
-  - name: sysmon-learn
-    base: "https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon"
-    allow:
-      - "^https://learn\\.microsoft\\.com/en-us/sysinternals/downloads/sysmon.*$"
-    deny: []
-    rate_per_sec: 0.4
-    max_pages: 50
-    license: "Microsoft Learn terms"
-    tool: "sysmon"
-    version: "learn"
 YAML
 
 #####################################
@@ -628,7 +618,7 @@ enableheader = true
 CONF
 
 #####################################
-# Scripts: whiff-help, packer, importer, seeder
+# Scripts: helper/packer/importer/seeder
 #####################################
 cat > /opt/whiff/scripts/whiff-help <<'SH'
 #!/usr/bin/env bash
@@ -657,7 +647,7 @@ mkdir -p "$work/db" "$work/ingest" "$work/models"
 pg_dump "$DB" -t sage_docs -a -Fc -f "$work/db/sage_docs.dump"
 [[ -f /opt/whiff/ingest/sites.yaml ]] && cp /opt/whiff/ingest/sites.yaml "$work/ingest/sites.yaml"
 if [[ -f /opt/whiff/models/whiff-llm.gguf ]]; then cp /opt/whiff/models/whiff-llm.gguf "$work/models/"; fi
-if [[ -d /opt/whiff/models/emb/snowflake-m-v2 ]]; then mkdir -p "$work/models/emb"; rsync -a /opt/whiff/models/emb/snowflake-m-v2 "$work/models/emb/"; fi
+if [[ -d /opt/whiff/models/emb/snowflake-m-v2" ]]; then mkdir -p "$work/models/emb"; rsync -a /opt/whiff/models/emb/snowflake-m-v2 "$work/models/emb/"; fi
 tar -C "$work" -czf "$OUT" .
 echo "Wrote $OUT"
 SH
@@ -681,12 +671,10 @@ chmod +x /opt/whiff/scripts/whiff-import-kb.sh
 
 cat > /opt/whiff/scripts/whiff-seed-docs.sh <<'SH'
 #!/usr/bin/env bash
-# Seed a baseline of DFIR docs into /opt/whiff/docs_ingest
 set -euo pipefail
 DEST="/opt/whiff/docs_ingest"
 work="$(mktemp -d)"
 echo "[*] Working in $work"
-# ATT&CK (STIX -> very simple markdown index)
 git clone --depth=1 https://github.com/mitre-attack/attack-stix-data "$work/attack-stix-data" >/dev/null 2>&1 || true
 mkdir -p "$DEST/mitre_attack/v14.1/CC-BY-4.0"
 python3 - "$work/attack-stix-data" "$DEST/mitre_attack/v14.1/CC-BY-4.0" <<'PY'
@@ -706,24 +694,18 @@ for f in glob.glob(os.path.join(root,"enterprise-attack/attack-pattern/*.json"))
         with open(fn,"w",encoding="utf-8") as w:
             w.write(f"# {tid} — {name}\n\n{desc}\n")
 PY
-echo "[+] ATT&CK rendered."
-# Volatility3 docs
 git clone --depth=1 https://github.com/volatilityfoundation/volatility3 "$work/vol3" >/dev/null 2>&1 || true
 mkdir -p "$DEST/volatility3/2.7/Apache-2.0"
 rsync -a "$work/vol3/doc/" "$DEST/volatility3/2.7/Apache-2.0/" --exclude .git >/dev/null 2>&1 || true
-# Hayabusa wiki (HTML; crawler will handle later, but seed a pointer)
 git clone --depth=1 https://github.com/Yamato-Security/hayabusa.wiki.git "$work/hayabusa-wiki" >/dev/null 2>&1 || true
 mkdir -p "$DEST/hayabusa/2.18/MIT"
 rsync -a "$work/hayabusa-wiki/" "$DEST/hayabusa/2.18/MIT/" --exclude .git >/dev/null 2>&1 || true
-# capa docs
 git clone --depth=1 https://github.com/mandiant/capa "$work/capa" >/dev/null 2>&1 || true
 mkdir -p "$DEST/capa/7.1/Apache-2.0"
 rsync -a "$work/capa/doc/" "$DEST/capa/7.1/Apache-2.0/" --exclude .git >/dev/null 2>&1 || true
-# YARA docs (rtd source)
 git clone --depth=1 https://github.com/VirusTotal/yara "$work/yara" >/dev/null 2>&1 || true
 mkdir -p "$DEST/yara/4.5/Apache-2.0"
 rsync -a "$work/yara/docs/" "$DEST/yara/4.5/Apache-2.0/" --exclude .git >/dev/null 2>&1 || true
-# Arkime docs pointers
 git clone --depth=1 https://github.com/arkime/arkime "$work/arkime" >/dev/null 2>&1 || true
 mkdir -p "$DEST/arkime/3.9/AGPL-2.0"
 rsync -a "$work/arkime/docs/" "$DEST/arkime/3.9/AGPL-2.0/" --exclude .git >/dev/null 2>&1 || true
@@ -742,40 +724,51 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 #####################################
-# (Optional) Download models (Meta Llama 3.1 + Snowflake Arctic Embed)
+# (Optional) Download models (CLI or Python fallback)
 #####################################
 if [[ "$DL_MODELS_NOW" == "1" ]]; then
   echo "[*] Preparing Hugging Face CLI…"
-  # Already installed in requirements, ensure binary exists and prefer venv
-  HF_BIN="/opt/whiff/.venv/bin/hf"
-  if [[ ! -x "$HF_BIN" ]]; then HF_BIN="$(command -v hf || true)"; fi
-  if [[ -n "$HF_TOKEN" ]]; then
-    export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-    [[ -x "$HF_BIN" ]] && "$HF_BIN" login --token "$HF_TOKEN" >/dev/null 2>&1 || true
-  fi
+  [[ -n "$HF_TOKEN" ]] && export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+  HF_BIN="$(hf_get_bin)"
   export HF_HUB_ENABLE_HF_TRANSFER=1
-  mkdir -p /opt/whiff/models/emb
 
+  # LLM
   echo "[*] Downloading LLM (Meta Llama 3.1 8B Instruct Q4_K_M GGUF)…"
-  if [[ -x "$HF_BIN" ]]; then
+  if [[ -n "$HF_BIN" ]]; then
     "$HF_BIN" download --repo-type model bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
       --include "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" \
       --local-dir /opt/whiff/models --resume || true
   else
-    python -m huggingface_hub download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
-      --include "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" \
-      --local-dir /opt/whiff/models --resume || true
+    /opt/whiff/.venv/bin/python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(
+  repo_id="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+  allow_patterns=["Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"],
+  local_dir="/opt/whiff/models",
+  resume_download=True,
+  local_dir_use_symlinks=False,
+)
+PY
   fi
   [[ -f /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf ]] && \
-    mv /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf /opt/whiff/models/whiff-llm.gguf || true
+    mv -f /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf /opt/whiff/models/whiff-llm.gguf || true
 
+  # Embeddings
   echo "[*] Downloading Snowflake Arctic-Embed-M-v2.0 (768-dim)…"
-  if [[ -x "$HF_BIN" ]]; then
+  if [[ -n "$HF_BIN" ]]; then
     "$HF_BIN" download --repo-type model Snowflake/snowflake-arctic-embed-m-v2.0 \
       --local-dir /opt/whiff/models/emb/snowflake-m-v2 --resume || true
   else
-    python -m huggingface_hub download Snowflake/snowflake-arctic-embed-m-v2.0 \
-      --local-dir /opt/whiff/models/emb/snowflake-m-v2 --resume || true
+    /opt/whiff/.venv/bin/python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+  repo_id="Snowflake/snowflake-arctic-embed-m-v2.0",
+  local_dir="/opt/whiff/models/emb/snowflake-m-v2",
+  resume_download=True,
+  local_dir_use_symlinks=False,
+)
+PY
   fi
 fi
 
@@ -783,19 +776,17 @@ fi
 # Postgres bootstrap (DB, user, extension, pg_hba)
 #####################################
 DB_DSN="host=$DB_HOST port=$DB_PORT dbname=$DB_NAME user=$DB_USER password=$DB_PASS"
+DB_PASS_SQL="$(printf "%s" "$DB_PASS" | sed "s/'/''/g")"  # SQL-safe single quotes
+
 echo "[*] Bootstrapping database schema…"
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
-  # Create DB if missing
   sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 || \
     sudo -u postgres createdb "$DB_NAME"
-  # Ensure user exists; set password (always) and grant
   sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname = '$DB_USER'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE USER $DB_USER;" >/dev/null
-  sudo -u postgres psql -c "ALTER USER $DB_USER WITH PASSWORD '$DB_PASS';" >/dev/null
-  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" >/dev/null || true
-  # Vector extension
+    sudo -u postgres psql -c "CREATE USER \"$DB_USER\";" >/dev/null
+  sudo -u postgres psql -c "ALTER USER \"$DB_USER\" WITH PASSWORD '$DB_PASS_SQL';" >/dev/null
+  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$DB_USER\";" >/dev/null || true
   sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null || true
-  # Ensure pg_hba allows TCP localhost auth
   PG_HBA="$(ls /etc/postgresql/*/main/pg_hba.conf 2>/dev/null | head -n1 || true)"
   if [[ -n "$PG_HBA" ]]; then
     if ! grep -qE '^host\s+all\s+all\s+127\.0\.0\.1/32\s+(scram-sha-256|md5)\s*$' "$PG_HBA"; then
@@ -805,12 +796,11 @@ if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
   fi
 fi
 
-# Apply schema if we can connect
-if psql "$DB_DSN" -c "SELECT 1" >/dev/null 2>&1; then
+if psql "$DB_DSN" -Atqc "SELECT 1" >/dev/null 2>&1; then
   psql "$DB_DSN" -f /opt/whiff/sql/00_bootstrap.sql >/dev/null || \
-    echo "[!] Schema file ran with warnings; ensure pgvector exists."
+    echo "[!] Schema applied with warnings; ensure pgvector exists."
 else
-  echo "[!] Could not connect to ${DB_HOST}:${DB_PORT}/${DB_NAME} as ${DB_USER}. Check reachability/creds and rerun the schema with:"
+  echo "[!] Could not connect to ${DB_HOST}:${DB_PORT}/${DB_NAME} as ${DB_USER}. Re-run schema later with:"
   echo "    psql \"host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER} password=********\" -f /opt/whiff/sql/00_bootstrap.sql"
 fi
 
@@ -831,7 +821,7 @@ chmod 640 /etc/whiff/whiff.env
 cat > /opt/whiff/packaging/whiff-api.service <<SERVICE
 [Unit]
 Description=Whiff RAG API
-After=network-online.target postgresql.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -864,9 +854,7 @@ for i in {1..30}; do
   fi
   sleep 1
 done
-if [[ "$healthy" -ne 1 ]]; then
-  echo "[!] whiff-api did not become healthy in time."
-fi
+[[ "$healthy" -eq 1 ]] || echo "[!] whiff-api did not become healthy in time."
 
 #####################################
 # Optional: Nightly backfill
@@ -937,7 +925,7 @@ fi
 SAFE_DSN="host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER} password=********"
 cat <<EOF
 
-Whiff install complete (Meta Llama 3.1 8B Instruct + Snowflake Arctic Embed).
+Whiff install complete.
 
 Service:
   systemctl status whiff-api
@@ -946,24 +934,16 @@ Service:
 Models:
   LLM:    ${LLM_PATH}
   Embed:  ${EMBED_DIR}
-  (If missing and you chose offline, copy them into place and restart: systemctl restart whiff-api)
 
 DB (masked DSN):
   DSN: ${SAFE_DSN}
   Schema file: /opt/whiff/sql/00_bootstrap.sql
-  If schema didn’t run automatically:
-    psql "host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER} password=********" \
-         -f /opt/whiff/sql/00_bootstrap.sql
 
-Crawler:
-  Config: /opt/whiff/ingest/sites.yaml
-  Run:    WHIFF_DB_DSN="${SAFE_DSN}" /opt/whiff/.venv/bin/python /opt/whiff/whiff_crawl.py /opt/whiff/ingest/sites.yaml
-
-Index local docs (PDF, HTML, MD, RST, TXT/LOG/INI/CFG, DOCX, CSV, JSON):
+Indexer:
   WHIFF_DB_DSN="${SAFE_DSN}" /opt/whiff/.venv/bin/python /opt/whiff/whiff_index.py /opt/whiff/docs_ingest
 
-Seed baseline docs:
-  /opt/whiff/scripts/whiff-seed-docs.sh /opt/whiff/docs_ingest
+Crawler:
+  WHIFF_DB_DSN="${SAFE_DSN}" /opt/whiff/.venv/bin/python /opt/whiff/whiff_crawl.py /opt/whiff/ingest/sites.yaml
 
 Packer/Importer:
   /opt/whiff/scripts/whiff-pack-kb.sh  /tmp/whiff_kb.tgz
@@ -971,11 +951,6 @@ Packer/Importer:
 
 Splunk:
   Tarball: /opt/whiff/whiff_splunk_addon.tgz
-  Usage:
-    index=wade_volatility sourcetype=wade_volatility
-    | head 20
-    | whiff max_refs=3
-    | table _time host whiff_summary whiff_mitre whiff_next_steps whiff_conf
 
 Semper,
 Whiff is up.
