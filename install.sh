@@ -1781,7 +1781,6 @@ run_step "solr" "${SOLR_VER}" get_ver_solr '
   tar -xvzf "$SOLR_TGZ" "solr-${SOLR_VER}/bin/install_solr_service.sh" --strip-components=2
   bash ./install_solr_service.sh "$SOLR_TGZ" || true
   IPV4=$(hostname -I 2>/dev/null | awk '"'"'{print $1}'"'"')
-  sed -i 's|^#\?SOLR_JAVA_HOME=.*|SOLR_JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64|' /etc/default/solr.in.sh
   sed -i "s/^#\?SOLR_HEAP=.*/SOLR_HEAP=\"${SOLR_HEAP}\"/" /etc/default/solr.in.sh
   sed -i "s|^#\?SOLR_JAVA_MEM=.*|SOLR_JAVA_MEM=\"${SOLR_JAVA_MEM}\"|" /etc/default/solr.in.sh
   if grep -q "^#\?ZK_HOST=" /etc/default/solr.in.sh; then
