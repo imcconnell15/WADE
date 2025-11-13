@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # WADE - Wide-Area Data Extraction :: Idempotent Installer (soft-fail + interactive STIG)
 # Author: Ian McConnell
-# NOTE: keep LF endings (use `dos2unix install.sh` if needed)
 
 ### ---------- Prompt helpers ----------
 prompt_with_default() {
@@ -82,14 +81,14 @@ LOAD_PATCH_DIR="${SCRIPT_DIR}"
 #####################################
 NONINTERACTIVE=0
 CHECK_ONLY=0
-FORCE_ALL_FRONT=0
+FORCE_ALL=0
 ONLY_LIST=""
 
 for arg in "$@"; do
   case "$arg" in
     -y|--yes|--noninteractive) NONINTERACTIVE=1 ;;
     --check) CHECK_ONLY=1 ;;
-    --force) FORCE_ALL_FRONT=1 ;;
+    --force) FORCE_ALL=1 ;;
     --only=*) ONLY_LIST="${arg#--only=}" ;;
   esac
 done
@@ -223,28 +222,6 @@ wade_oscap_eval() {
   return $rc
 }
 
-# --- Robust downloader for flaky endpoints (resume + verify ZIP) ---
-fetch_with_resume() {
-  # usage: fetch_with_resume <url> <outfile>
-  local url="$1" out="$2"
-  local tmp="${out}.part"
-
-  curl -fL --retry 5 --retry-delay 2 --retry-connrefused \
-       --continue-at - --speed-time 30 --speed-limit 10240 \
-       -o "$tmp" "$url" || return 1
-
-  mv -f "$tmp" "$out"
-
-  # Validate if ZIP; if not zip, skip this test
-  if [[ "$out" =~ \.zip$ ]]; then
-    if ! unzip -t "$out" >/dev/null 2>&1; then
-      echo "[!] ZIP validation failed for $out (corrupt or truncated)." >&2
-      return 1
-    fi
-  fi
-  return 0
-}
-
 #####################################
 # NEW: Package bundle aggregator (single install)
 #####################################
@@ -255,9 +232,11 @@ pkg_add() {
   if [[ "$PM" == "apt" ]]; then
     APT_BUNDLE+=("$1")
   else
+    # if rpm alias not given, reuse $1
     RPM_BUNDLE+=("${2:-$1}")
   fi
 }
+
 pkg_install_bundle_once() {
   (( ${#APT_BUNDLE[@]} + ${#RPM_BUNDLE[@]} == 0 )) && return 0
   if [[ "$PM" == "apt" ]]; then
@@ -276,13 +255,13 @@ pip_cached_install() {
   local wheelhouse="${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels"
   mkdir -p "$wheelhouse"
 
-  # Always prime build tools into the wheelhouse
+  # Always prime build tools into the wheelhouse (so PEP 517 can find them offline)
   "$vbin/pip" download -d "$wheelhouse" pip setuptools wheel >/dev/null 2>&1 || true
 
-  # Pre-download requested pkgs
+  # Pre-download requested pkgs (best-effort; sdists are fine)
   "$vbin/pip" download -d "$wheelhouse" "$@" >/dev/null 2>&1 || true
 
-  # Prefer offline + NO build isolation
+  # Prefer offline + NO build isolation (lets venv's setuptools satisfy sdists like intervaltree)
   "$vbin/pip" install --no-index --find-links "$wheelhouse" --no-build-isolation "$@" \
     || "$vbin/pip" install "$@"
 }
@@ -320,7 +299,7 @@ run_step(){
     else report_step "$name" "$want" "$have" "OK"; fi
     return 0
   fi
-  if (( ! FORCE_ALL_FRONT )) && [[ -n "$have" && ( -z "$want" || "$want" == "$have" ) ]]; then
+  if (( ! FORCE_ALL )) && [[ -n "$have" && ( -z "$want" || "$want" == "$have" ) ]]; then
     report_step "$name" "$want" "$have" "OK"; return 0
   fi
   echo "[*] Installing/updating ${name} (want=${want:-n/a}, have=${have:-none})…"
@@ -659,13 +638,16 @@ WADE_CAPA_RULES_DIR="/opt/capa-rules"   # where rules live
 WADE_CAPA_RULES_COMMIT=""               # optionally pin: commit SHA or tag
 
 # ---- WHIFF (analyst assistant / KB) ----
-WHIFF_ENABLE="1"                       
+WHIFF_ENABLE="1"                       # 1=offer install by default; will be prompted
 WHIFF_BIND_ADDR="127.0.0.1"
 WHIFF_PORT="8088"
-# Backend: ollama | openai | http
+# Backend choices you support in install_whiff.sh: ollama | openai | http
 WHIFF_BACKEND="ollama"
+# Default to Meta Llama (avoids Qwen, per your constraint)
 WHIFF_MODEL="llama3.1:8b-instruct"
+# For backends that need it (e.g., http/vLLM or hosted endpoints)
 WHIFF_ENDPOINT=""
+# API keys/creds should NOT be persisted by default; leave empty.
 WHIFF_API_KEY=""
 
 # ---- STIG (assessment only; interactive at end) ----
@@ -713,8 +695,8 @@ OFFLINE="${OFFLINE:-${WADE_OFFLINE:-0}}"
 
 # ---- Safe defaults so set -u never trips on older configs
 : "${WADE_PKG_DIR:=/var/wade/pkg}"
-: "${SOLR_HEAP:=}"                      
-: "${SOLR_JAVA_MEM:=-Xms24G -Xmx48G}"   
+: "${SOLR_HEAP:=}"                      # empty means "leave Jetty heap default"
+: "${SOLR_JAVA_MEM:=-Xms24G -Xmx48G}"   # you override below for low-RAM hosts
 : "${PG_PERF_FSYNC:=off}"
 : "${PG_PERF_SYNCCOMMIT:=off}"
 : "${PG_PERF_FULLPAGE:=off}"
@@ -784,6 +766,7 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" ]]; then
     pkg_add ssg-debian
     pkg_add ssg-nondebian
     pkg_add ssg-applications
+    # scap-security-guide may or may not exist on Ubuntu; leave to best-effort in the step
   else
     pkg_add openscap-scanner
     pkg_add scap-security-guide
@@ -1492,7 +1475,7 @@ run_step "x11-forwarding" "configured" get_ver_x11fwd '
 ' || fail_note "x11-forwarding" "setup failed"
 
 #####################################
-# Piranha (install only; GUI via ssh -X, no systemd)
+# Piranha (install only; GUI via ssh -X, no systemd) – no shallow clone per your request
 #####################################
 get_ver_piranha(){ [[ -x /usr/local/bin/piranha && -d /opt/piranha/.venv && -f /opt/piranha/piranha.py ]] && echo installed || echo ""; }
 
@@ -1507,7 +1490,10 @@ run_step "piranha" "installed" get_ver_piranha '
   ln -sf /var/log/wade/piranha/APT_Report.log /opt/piranha/Documents/PiranhaLogs/APT_Report.log || true
 
   if [[ "$OFFLINE" == "1" ]]; then
-    PKG_ARC="$(ls "'"${WADE_PKG_DIR}"'/piranha/piranha*.tar.gz "'"${WADE_PKG_DIR}"'/piranha/piranha*.zip 2>/dev/null | head -1 || true)"
+    PKG_ARC="$(ls "'"${WADE_PKG_DIR}"'/piranha"/"piranha"*.tar.gz "'"${WADE_PKG_DIR}"'/piranha"/"piranha"*.zip 2>/dev/null | head -1 || true)"
+    if [[ -z "$PKG_ARC" ]]; then
+      PKG_ARC="$(ls "'"${WADE_PKG_DIR}"'/piranha/piranha*.tar.gz "'"${WADE_PKG_DIR}"'/piranha/piranha*.zip 2>/dev/null | head -1 || true)"
+    fi
     [[ -n "$PKG_ARC" ]] || { echo "offline Piranha archive missing"; exit 1; }
     cp "$PKG_ARC" /opt/piranha/
     pushd /opt/piranha >/dev/null
@@ -1534,15 +1520,25 @@ run_step "piranha" "installed" get_ver_piranha '
     cp "$FEIX" /opt/piranha/backend/loader.py || true
   fi
 
-  echo '\''exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"'\'' > /usr/local/bin/piranha
+  # Safer launcher: falls back to offscreen if DISPLAY is not usable
+  cat >/usr/local/bin/piranha <<'\''EOF'\''
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -z "${DISPLAY:-}" ]] || ! command -v xdpyinfo >/dev/null 2>&1 || ! xdpyinfo >/dev/null 2>&1; then
+  echo "[wade] No working X11 DISPLAY detected; launching Piranha with QT_QPA_PLATFORM=offscreen" >&2
+  export QT_QPA_PLATFORM=offscreen
+fi
+exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"
+EOF
   chmod 0755 /usr/local/bin/piranha
   chown "'"${LWADEUSER}:${LWADEUSER}"'" /usr/local/bin/piranha || true
 ' || fail_note "piranha" "setup failed"
 fi
 
 #####################################
-# Barracuda (soft-fail)
+# Barracuda
 #####################################
+
 get_ver_barracuda(){
   [[ -x /usr/local/bin/barracuda && -d /opt/barracuda/.venv ]] || { echo ""; return; }
   [[ -f /opt/barracuda/enterprise-attack.json ]] && echo installed || echo ""
@@ -1551,26 +1547,41 @@ if [[ "${MOD_BARRACUDA_ENABLED:-1}" == "1" ]]; then
 run_step "barracuda" "installed" get_ver_barracuda '
   set -e
   install -d /opt/barracuda
+  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /opt/barracuda
+
+  # --- source acquisition (online or offline) ---
   if [[ "$OFFLINE" == "1" ]]; then
-    PKG_ARC="$(ls "'"${WADE_PKG_DIR}"'/barracuda/barracuda*.tar.gz "'"${WADE_PKG_DIR}"'/barracuda/barracuda*.zip 2>/dev/null | head -1 || true)"
+    PKG_ARC="$(ls "'"${WADE_PKG_DIR}"'/barracuda"/"barracuda"*.tar.gz "'"${WADE_PKG_DIR}"'/barracuda"/"barracuda"*.zip 2>/dev/null | head -1 || true)"
+    if [[ -z "$PKG_ARC" ]]; then
+      PKG_ARC="$(ls "'"${WADE_PKG_DIR}"'/barracuda/barracuda*.tar.gz "'"${WADE_PKG_DIR}"'/barracuda/barracuda*.zip 2>/dev/null | head -1 || true)"
+    fi
     [[ -n "$PKG_ARC" ]] || { echo "offline Barracuda archive missing"; exit 1; }
     cp "$PKG_ARC" /opt/barracuda/
     pushd /opt/barracuda >/dev/null
-    [[ "$PKG_ARC" == *.zip ]] && unzip -o "$(basename "$PKG_ARC")" || tar -xzf "$(basename "$PKG_ARC")"
+    if [[ "$PKG_ARC" == *.zip ]]; then unzip -o "$(basename "$PKG_ARC")"
+    else tar -xzf "$(basename "$PKG_ARC")"
+    fi
     popd >/dev/null
   else
     [[ -d /opt/barracuda/.git ]] || git clone https://github.com/williamjsmail/Barracuda /opt/barracuda || true
   fi
 
+  [[ -f /opt/barracuda/app.py ]] || { echo "Barracuda sources missing under /opt/barracuda"; exit 1; }
+
+  # --- venv + deps (make sure pandas and numpy are present) ---
   if [[ ! -d /opt/barracuda/.venv ]]; then
     python3 -m venv /opt/barracuda/.venv
-    "/opt/barracuda/.venv/bin/pip" install -U pip setuptools wheel
   fi
+  /opt/barracuda/.venv/bin/pip install -U pip setuptools wheel >/dev/null 2>&1 || true
 
+  # Install repo requirements (if present) first
   if [[ -f /opt/barracuda/requirements.txt ]]; then
     pip_cached_install "/opt/barracuda/.venv/bin" -r /opt/barracuda/requirements.txt
   fi
+  # Ensure hard deps that often aren’t listed
+  pip_cached_install "/opt/barracuda/.venv/bin" pandas numpy
 
+  # --- MITRE CTI file path fix + acquisition ---
   if [[ ! -f /opt/barracuda/enterprise-attack.json ]]; then
     if [[ -f "'"${WADE_PKG_DIR}"'/mitre/enterprise-attack.json" ]]; then
       cp "'"${WADE_PKG_DIR}"'/mitre/enterprise-attack.json" /opt/barracuda/enterprise-attack.json
@@ -1582,20 +1593,24 @@ run_step "barracuda" "installed" get_ver_barracuda '
     fi
   fi
 
+  # Force app to use the absolute CTI path
   sed -i -E \
     '\''s|load_techniques_enriched\("enterprise-attack\.json"\)|load_techniques_enriched("/opt/barracuda/enterprise-attack.json")|'\'' \
     /opt/barracuda/app.py || true
 
   install -d -o "'"${LWADEUSER}"'" -g "'"${LWADEUSER}"'" -m 0750 /opt/barracuda/uploads
 
+  # CLI shim
   cat >/usr/local/bin/barracuda <<'\''EOF'\''
 #!/usr/bin/env bash
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
+set -euo pipefail
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"   # headless-safe
 cd /opt/barracuda
 exec /opt/barracuda/.venv/bin/python /opt/barracuda/app.py "$@"
 EOF
   chmod 0755 /usr/local/bin/barracuda
 
+  # systemd service (kept, runs headless)
   cat >/etc/systemd/system/barracuda.service <<EOF
 [Unit]
 Description=WADE Barracuda (DFIR helper)
@@ -1628,8 +1643,9 @@ EOF
 fi
 
 #####################################
-# Hayabusa (robust extract; soft-fail)
+# Hayabusa
 #####################################
+
 if [[ "${MOD_HAYABUSA_ENABLED:-1}" == "1" ]]; then
 run_step "hayabusa" "" get_ver_hayabusa '
   set -e
@@ -1638,6 +1654,7 @@ run_step "hayabusa" "" get_ver_hayabusa '
 
   HAY_ARCH="${HAY_ARCH:-$(detect_hayabusa_arch)}"
   HAY_ZIP=""
+  # look in WADE_PKG_DIR first
   HAY_ZIP_LOCAL="$(ls "${WADE_PKG_DIR}/hayabusa"/hayabusa-*-"${HAY_ARCH:-}".zip 2>/dev/null | sort -V | tail -1 || true)"
 
   if [[ -n "$HAY_ZIP_LOCAL" ]]; then
@@ -1649,48 +1666,44 @@ run_step "hayabusa" "" get_ver_hayabusa '
     cp "$HAY_ZIP_USB" .
     HAY_ZIP="$(basename "$HAY_ZIP_USB")"
   else
-   if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-    echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
+    if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+      echo "[*] Downloading latest Hayabusa release for ${HAY_ARCH:-}…"
 
-    case "${HAY_ARCH:-$(detect_hayabusa_arch)}" in
-      linux-x64)   ARCH_RE='"'"'x86_64|amd64|x64'"'"' ;;
-      linux-arm64) ARCH_RE='"'"'aarch64|arm64'"'"'    ;;
-      *)           ARCH_RE='"'"'x86_64|amd64|x64'"'"' ;;
-    esac
+      # Map our arch tokens to matching asset names
+      case "${HAY_ARCH:-$(detect_hayabusa_arch)}" in
+        linux-x64)   ARCH_RE="x86_64|amd64|x64" ;;
+        linux-arm64) ARCH_RE="aarch64|arm64"    ;;
+        *)           ARCH_RE="x86_64|amd64|x64" ;;
+      esac
 
-    DL_URL="$(
-      curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest |
-      jq -r --arg archre "$ARCH_RE" "
-        .assets[]
-        | select((.name|test(\"(?i)linux\")) and (.name|test(\$archre)) and (.name|test(\"\\\\.(zip|tar\\\\.gz)$\")))
-        | .browser_download_url
-      " | head -1
-    )"
+      DL_URL="$(
+        curl -fsSL https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest |
+        jq -r --arg archre "$ARCH_RE" "
+          .assets[]
+          | select((.name|test(\"(?i)linux\")) and (.name|test(\$archre)) and (.name|test(\"\\\\.(zip|tar\\\\.gz)$\")))
+          | .browser_download_url
+        " | head -1
+      )"
 
-    [[ -n "$DL_URL" ]] || { echo "Could not resolve a Linux asset for arch regex ${ARCH_RE}"; exit 1; }
+      [[ -n "$DL_URL" ]] || { echo "Could not resolve a Linux asset for arch regex ${ARCH_RE}"; exit 1; }
 
-    HAY_ZIP="$(basename "$DL_URL")"
-    curl -fL --retry 5 --retry-delay 2 --retry-connrefused -o "$HAY_ZIP" "$DL_URL"
-   else
-    echo "curl/jq required to auto-fetch Hayabusa online"; exit 1
-   fi
-  fi
+      HAY_ZIP="$(basename "$DL_URL")"
+      curl -fL "$DL_URL" -o "$HAY_ZIP"
+    else
+      echo "curl/jq required to auto-fetch Hayabusa online"; exit 1
+    fi
+  fi  
 
   # --- Extract & verify arch before install ---
   TMPDIR="$(mktemp -d)"; cleanup(){ rm -rf "$TMPDIR"; }; trap cleanup EXIT
+  bsdtar -xf "$HAY_ZIP" -C "$TMPDIR"
 
-  case "$HAY_ZIP" in
-    *.zip) unzip -q "$HAY_ZIP" -d "$TMPDIR" ;;
-    *.tar.gz|*.tgz) tar -xzf "$HAY_ZIP" -C "$TMPDIR" ;;
-    *) unzip -q "$HAY_ZIP" -d "$TMPDIR" 2>/dev/null || tar -xf "$HAY_ZIP" -C "$TMPDIR" || { echo "Unknown archive format: $HAY_ZIP"; exit 1; } ;;
-  esac
-
-  HAY_BIN_PATH="$(find "$TMPDIR" -type f -name '"'"'hayabusa*'"'"' ! -name '"'"'*.exe'"'"' | head -1 || true)"
+  HAY_BIN_PATH="$(find "$TMPDIR" -type f -name "hayabusa*" ! -name "*.exe" | head -1 || true)"
   if [[ -z "$HAY_BIN_PATH" ]]; then
     echo "Hayabusa binary not found in ${HAY_ZIP}"; find "$TMPDIR" -maxdepth 3 -type f -printf "  %P\n"; exit 1
   fi
 
-  if ! file "$HAY_BIN_PATH" | grep -qiE '"'"'ELF 64-bit.*(x86-64|aarch64)'"'"'; then
+  if ! file "$HAY_BIN_PATH" | grep -qiE "ELF 64-bit.*(x86-64|aarch64)"; then
     echo "Downloaded binary is not the right CPU arch for this host ($(uname -m))"; exit 1
   fi
 
@@ -1703,7 +1716,7 @@ run_step "hayabusa" "" get_ver_hayabusa '
   mkdir -p /etc/wade/hayabusa
   [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config"/* /etc/wade/hayabusa/; echo "[+] Copied Hayabusa config → /etc/wade/hayabusa/"; }
 
-  # (kept on purpose)
+  # (kept on purpose for your convenience)
   [[ -d "$TMPDIR/rules"  ]] && { cp -r "$TMPDIR/rules"  /usr/local/bin/; echo "[+] Copied Hayabusa rules/ to /usr/local/bin/rules"; }
   [[ -d "$TMPDIR/config" ]] && { cp -r "$TMPDIR/config" /usr/local/bin/; echo "[+] Copied Hayabusa config/ to /usr/local/bin/config"; }
 
@@ -1751,7 +1764,7 @@ EOF
 ' || fail_note "zookeeper" "install/config failed"
 
 #####################################
-# Solr (pinned; soft-fail + hardened autopsy ZIP)
+# Solr (pinned; soft-fail)
 #####################################
 run_step "solr" "${SOLR_VER}" get_ver_solr '
   set -e
@@ -1771,7 +1784,8 @@ run_step "solr" "${SOLR_VER}" get_ver_solr '
   sed -i "s|^#\?SOLR_JETTY_HOST=.*|SOLR_JETTY_HOST=\"${IPV4}\"|" /etc/default/solr.in.sh
   systemctl restart solr
 
-  # After service start: server-level readiness endpoint (exists even w/o cores)
+
+  # After service start:
   if solr_wait_ready; then
     echo "[OK] Solr responded to /admin/info/system"
   else
@@ -1779,30 +1793,13 @@ run_step "solr" "${SOLR_VER}" get_ver_solr '
     echo "    tail -n 200 /var/solr/logs/solr.log"
   fi
 
-  # --- Autopsy collection (hardened download/verify) ---
   AUTOPSY_ZIP="SOLR_8.6.3_AutopsyService.zip"
-  if [[ -f "'"${WADE_PKG_DIR}"'/autopsy/${AUTOPSY_ZIP}" ]]; then
-    cp "'"${WADE_PKG_DIR}"'/autopsy/${AUTOPSY_ZIP}" .
-  else
-    if ! fetch_with_resume "https://sourceforge.net/projects/autopsy/files/CollaborativeServices/Solr/${AUTOPSY_ZIP}/download" "$AUTOPSY_ZIP"; then
-      echo "[WARN] Autopsy Solr package download/verify failed; continuing without Autopsy config."
-      exit 0
-    fi
-  fi
-
-  mkdir -p /opt/autopsy-solr
-  if ! unzip -o "$AUTOPSY_ZIP" -d /opt/autopsy-solr >/dev/null 2>&1; then
-    echo "[WARN] Failed to unzip ${AUTOPSY_ZIP}; continuing without Autopsy config."
-    exit 0
-  fi
-
+  fetch_pkg autopsy "$AUTOPSY_ZIP" || curl -L "https://sourceforge.net/projects/autopsy/files/CollaborativeServices/Solr/${AUTOPSY_ZIP}/download" -o "$AUTOPSY_ZIP"
+  [[ -f "$AUTOPSY_ZIP" ]] || { echo "Autopsy Solr config zip missing"; exit 1; }
+  mkdir -p /opt/autopsy-solr; unzip -o "$AUTOPSY_ZIP" -d /opt/autopsy-solr >/dev/null
   CONF_DIR=$(find /opt/autopsy-solr -type d -path "*/AutopsyConfig/conf" | head -1 || true)
   chown -R solr:solr /opt/autopsy-solr
-  if [[ -n "$CONF_DIR" ]]; then
-    sudo -u solr /opt/solr/bin/solr create_collection -c AutopsyConfig -d "$CONF_DIR" || echo "[WARN] Could not create AutopsyConfig collection"
-  else
-    echo "[WARN] Autopsy conf dir not found in package"
-  fi
+  [[ -n "$CONF_DIR" ]] && sudo -u solr /opt/solr/bin/solr create_collection -c AutopsyConfig -d "$CONF_DIR" || true
 ' || fail_note "solr" "install/config failed"
 
 #####################################
@@ -1890,7 +1887,7 @@ run_step "splunk-uf" "installed" get_ver_splunkuf '
 
   id splunkfwd >/dev/null 2>&1 || useradd --system --home-dir /opt/splunkforwarder --shell /usr/sbin/nologin splunkfwd || true
 
-  PKG=""
+  PKG=""   # initialize to satisfy `set -u`
 
   if [[ -n "${SPLUNK_UF_DEB_URL:-}" ]]; then
     PKG="/tmp/$(basename "${SPLUNK_UF_DEB_URL}")"
@@ -2024,6 +2021,7 @@ WHIFF_API_KEY_EFF="${PRESET_WHIFF_API_KEY:-${WHIFF_API_KEY:-}}"
 
 if [[ "${WHIFF_ENABLE_EFF}" == "1" ]]; then
   echo "[*] Installing/configuring WHIFF…"
+  # If install_whiff.sh uses pip, allow it to leverage our wheelhouse via env
   env \
     PIP_FIND_LINKS="${WADE_PKG_DIR:-/var/wade/pkg}/pipwheels" \
     PIP_NO_INDEX=0 \
