@@ -1523,11 +1523,6 @@ run_step "piranha" "installed" get_ver_piranha '
   # Safer launcher: falls back to offscreen if DISPLAY is not usable
   cat >/usr/local/bin/piranha <<'\''EOF'\''
 #!/usr/bin/env bash
-set -euo pipefail
-if [[ -z "${DISPLAY:-}" ]] || ! command -v xdpyinfo >/dev/null 2>&1 || ! xdpyinfo >/dev/null 2>&1; then
-  echo "[wade] No working X11 DISPLAY detected; launching Piranha with QT_QPA_PLATFORM=offscreen" >&2
-  export QT_QPA_PLATFORM=offscreen
-fi
 exec /opt/piranha/.venv/bin/python /opt/piranha/piranha.py "$@"
 EOF
   chmod 0755 /usr/local/bin/piranha
@@ -1637,7 +1632,7 @@ ProtectSystem=full
 [Install]
 WantedBy=multi-user.target
 EOF
-
+  sed -i.bak 's/127\.0\.0\.1/0.0.0.0/g' /opt/barracuda/app.py
   systemd_queue_enable barracuda.service
 ' || fail_note "barracuda" "setup failed"
 fi
