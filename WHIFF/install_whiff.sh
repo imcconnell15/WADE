@@ -36,7 +36,6 @@ prompt_secret_confirm() {
     echo "Passwords don't match. Try again." >&2
   done
 }
-
 hf_get_bin() {
   # Prefer venv 'hf', then 'huggingface-cli'; print path or empty
   local cand
@@ -45,6 +44,67 @@ hf_get_bin() {
   done
   echo ""
 }
+
+# ---- Resilient model download helpers (resumable + fallback) ----
+: "${HF_HOME:=/opt/whiff/cache}"
+: "${TRANSFORMERS_CACHE:=/opt/whiff/cache}"
+export HF_HOME TRANSFORMERS_CACHE
+
+# Default repos/paths (override via env before running if desired)
+WHIFF_LLM_REPO="${WHIFF_LLM_REPO:-bartowski/Meta-Llama-3.1-8B-Instruct-GGUF}"
+WHIFF_LLM_FILE="${WHIFF_LLM_FILE:-Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf}"
+WHIFF_LLM_DIR="${WHIFF_LLM_DIR:-/opt/whiff/models}"
+WHIFF_LLM_PATH_DEFAULT="${WHIFF_LLM_PATH_DEFAULT:-/opt/whiff/models/whiff-llm.gguf}"
+
+WHIFF_EMBED_REPO="${WHIFF_EMBED_REPO:-Snowflake/snowflake-arctic-embed-m-v2.0}"
+# Minimal files for SentenceTransformers CPU path (skip big ONNX files)
+WHIFF_EMBED_ALLOW="${WHIFF_EMBED_ALLOW:-model.safetensors,*.json,modules.json,1_Pooling/*,configuration_hf_alibaba_nlp_gte.py,modeling_hf_alibaba_nlp_gte.py}"
+WHIFF_EMBED_DIR_DEFAULT="${WHIFF_EMBED_DIR_DEFAULT:-/opt/whiff/models/emb/snowflake-m-v2}"
+
+# Small fallback embedder (~90MB)
+WHIFF_EMBED_FALLBACK_REPO="${WHIFF_EMBED_FALLBACK_REPO:-sentence-transformers/all-MiniLM-L6-v2}"
+WHIFF_EMBED_FALLBACK_DIR="${WHIFF_EMBED_FALLBACK_DIR:-/opt/whiff/models/emb/all-MiniLM-L6-v2}"
+
+# Minimum free space guard (GB) for Snowflake
+WHIFF_MIN_FREE_GB="${WHIFF_MIN_FREE_GB:-6}"
+
+check_free_gb() {  # usage: check_free_gb /opt 6
+  local path="$1" min="$2"
+  local kb_free; kb_free=$(df -Pk "$path" | awk 'NR==2{print $4}')
+  local gb_free=$(( kb_free / 1024 / 1024 ))
+  [[ $gb_free -ge $min ]]
+}
+
+hf_snapshot_py() {  # repo allow_patterns dest_dir
+  /opt/whiff/.venv/bin/python - "$1" "$2" "$3" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+repo, allow, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+allow_patterns = [p.strip() for p in allow.split(',')] if allow else None
+snapshot_download(
+  repo_id=repo,
+  local_dir=dest,
+  allow_patterns=allow_patterns,
+  resume_download=True,
+  local_dir_use_symlinks=False,
+)
+PY
+}
+
+hf_resilient_download() {  # repo allow_patterns dest_dir
+  local repo="$1" allow="$2" dest="$3"
+  mkdir -p "$dest"
+  # Try with hf_transfer fast path, then without; retry up to 3x each
+  for mode in 1 0; do
+    export HF_HUB_ENABLE_HF_TRANSFER="$mode"
+    for attempt in 1 2 3; do
+      hf_snapshot_py "$repo" "$allow" "$dest" && return 0
+      sleep $((attempt*2))
+    done
+  done
+  return 1
+}
+# ----------------------------------------------------------------
 
 #####################################
 # Prompts (all config here)
@@ -64,10 +124,10 @@ WHIFF_CTX="$(prompt "Model context tokens" "4096")"
 ONLINE_MODE="$(yn "Online mode (allow model downloads + crawling now)?" N)"
 DL_MODELS_NOW="0"
 if [[ "$ONLINE_MODE" == "1" ]]; then
-  DL_MODELS_NOW="$(yn "Download models now via HF CLI (resumable)?" Y)"
+  DL_MODELS_NOW="$(yn "Download models now via HF (resumable)?" Y)"
 fi
-LLM_PATH="$(prompt "Path to LLM .gguf (if already on disk)" "/opt/whiff/models/whiff-llm.gguf")"
-EMBED_DIR="$(prompt "Path to embeddings model dir" "/opt/whiff/models/emb/snowflake-m-v2")"
+LLM_PATH="$(prompt "Path to LLM .gguf (if already on disk)" "$WHIFF_LLM_PATH_DEFAULT")"
+EMBED_DIR="$(prompt "Path to embeddings model dir" "$WHIFF_EMBED_DIR_DEFAULT")"
 
 RUN_INITIAL_CRAWL="0"
 if [[ "$ONLINE_MODE" == "1" ]]; then
@@ -90,6 +150,7 @@ PACKAGE_SPLUNK_ADDON="$(yn "Package Splunk custom command tarball for your Searc
 [[ "$EUID" -eq 0 ]] || exec sudo -E bash "$0" "$@"
 req apt-get; req systemctl; req sed; req awk; req curl; req jq; req git
 command -v psql >/dev/null 2>&1 || true
+[[ -n "$HF_TOKEN" ]] && export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 
 #####################################
 # OS packages
@@ -99,7 +160,12 @@ apt-get update -y
 apt-get install -y python3-venv build-essential cmake ninja-build libopenblas-dev \
   postgresql-client jq rsync git
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
-  apt-get install -y postgresql postgresql-contrib
+  apt-get install -y postgresql postgresql-contrib \
+    || true
+  # try to get pgvector for the installed PG major (best-effort)
+  apt-get install -y postgresql-16-pgvector || \
+  apt-get install -y postgresql-15-pgvector || \
+  apt-get install -y postgresql-14-pgvector || true
 fi
 
 #####################################
@@ -108,7 +174,7 @@ fi
 echo "[*] Creating whiff user and directories…"
 id -u whiff >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin whiff
 mkdir -p /opt/whiff/{scripts,ingest,sql,packaging,splunk/SA-WADE-Search/bin,splunk/SA-WADE-Search/default,models/emb,docs_ingest} \
-         /etc/whiff /var/log/whiff
+         /etc/whiff /var/log/whiff /opt/whiff/cache
 chown -R whiff:whiff /opt/whiff /var/log/whiff
 
 #####################################
@@ -647,7 +713,7 @@ mkdir -p "$work/db" "$work/ingest" "$work/models"
 pg_dump "$DB" -t sage_docs -a -Fc -f "$work/db/sage_docs.dump"
 [[ -f /opt/whiff/ingest/sites.yaml ]] && cp /opt/whiff/ingest/sites.yaml "$work/ingest/sites.yaml"
 if [[ -f /opt/whiff/models/whiff-llm.gguf ]]; then cp /opt/whiff/models/whiff-llm.gguf "$work/models/"; fi
-if [[ -d /opt/whiff/models/emb/snowflake-m-v2" ]]; then mkdir -p "$work/models/emb"; rsync -a /opt/whiff/models/emb/snowflake-m-v2 "$work/models/emb/"; fi
+if [[ -d /opt/whiff/models/emb/snowflake-m-v2 ]]; then mkdir -p "$work/models/emb"; rsync -a /opt/whiff/models/emb/snowflake-m-v2 "$work/models/emb/"; fi
 tar -C "$work" -czf "$OUT" .
 echo "Wrote $OUT"
 SH
@@ -724,52 +790,50 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 #####################################
-# (Optional) Download models (CLI or Python fallback)
+# (Optional) Download models (resilient + lean patterns + fallback)
 #####################################
 if [[ "$DL_MODELS_NOW" == "1" ]]; then
-  echo "[*] Preparing Hugging Face CLI…"
-  [[ -n "$HF_TOKEN" ]] && export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-  HF_BIN="$(hf_get_bin)"
-  export HF_HUB_ENABLE_HF_TRANSFER=1
-
-  # LLM
-  echo "[*] Downloading LLM (Meta Llama 3.1 8B Instruct Q4_K_M GGUF)…"
-  if [[ -n "$HF_BIN" ]]; then
-    "$HF_BIN" download --repo-type model bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
-      --include "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" \
-      --local-dir /opt/whiff/models --resume || true
+  echo "[*] Downloading LLM (${WHIFF_LLM_FILE}) …"
+  mkdir -p "$WHIFF_LLM_DIR"
+  if hf_resilient_download "$WHIFF_LLM_REPO" "$WHIFF_LLM_FILE" "$WHIFF_LLM_DIR"; then
+    if [[ -f "${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}" ]]; then
+      ln -sf "${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}" "$WHIFF_LLM_PATH_DEFAULT"
+      LLM_PATH="$WHIFF_LLM_PATH_DEFAULT"
+      echo "[+] LLM ready at $LLM_PATH"
+    else
+      echo "[!] LLM file missing after download: ${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}"
+    fi
   else
-    /opt/whiff/.venv/bin/python - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-snapshot_download(
-  repo_id="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
-  allow_patterns=["Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"],
-  local_dir="/opt/whiff/models",
-  resume_download=True,
-  local_dir_use_symlinks=False,
-)
-PY
+    echo "[!] LLM download failed; place a GGUF later at $LLM_PATH"
   fi
-  [[ -f /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf ]] && \
-    mv -f /opt/whiff/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf /opt/whiff/models/whiff-llm.gguf || true
 
-  # Embeddings
-  echo "[*] Downloading Snowflake Arctic-Embed-M-v2.0 (768-dim)…"
-  if [[ -n "$HF_BIN" ]]; then
-    "$HF_BIN" download --repo-type model Snowflake/snowflake-arctic-embed-m-v2.0 \
-      --local-dir /opt/whiff/models/emb/snowflake-m-v2 --resume || true
+  echo "[*] Downloading embeddings (Snowflake Arctic-Embed-M-v2.0, minimal set) …"
+  EMBED_DIR="$WHIFF_EMBED_DIR_DEFAULT"
+  if ! check_free_gb /opt "$WHIFF_MIN_FREE_GB"; then
+    echo "[!] Less than ${WHIFF_MIN_FREE_GB} GB free under /opt; using fallback embedder."
+    if hf_resilient_download "$WHIFF_EMBED_FALLBACK_REPO" "" "$WHIFF_EMBED_FALLBACK_DIR"; then
+      EMBED_DIR="$WHIFF_EMBED_FALLBACK_DIR"
+      echo "[+] Fallback embedder ready at $EMBED_DIR"
+    else
+      echo "[!] Fallback embedder failed to download; proceed without embeddings."
+    fi
   else
-    /opt/whiff/.venv/bin/python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(
-  repo_id="Snowflake/snowflake-arctic-embed-m-v2.0",
-  local_dir="/opt/whiff/models/emb/snowflake-m-v2",
-  resume_download=True,
-  local_dir_use_symlinks=False,
-)
-PY
+    if hf_resilient_download "$WHIFF_EMBED_REPO" "$WHIFF_EMBED_ALLOW" "$WHIFF_EMBED_DIR_DEFAULT"; then
+      echo "[+] Snowflake embedder ready at $EMBED_DIR"
+    else
+      echo "[!] Snowflake download failed; attempting fallback embedder."
+      if hf_resilient_download "$WHIFF_EMBED_FALLBACK_REPO" "" "$WHIFF_EMBED_FALLBACK_DIR"; then
+        EMBED_DIR="$WHIFF_EMBED_FALLBACK_DIR"
+        echo "[+] Fallback embedder ready at $EMBED_DIR"
+      else
+        echo "[!] Could not fetch any embedding model; API will start but semantic search will be limited."
+      fi
+    fi
   fi
+else
+  echo "[*] Online model pulls skipped. Ensure on disk:"
+  echo "    - LLM:   $LLM_PATH"
+  echo "    - Embed: $EMBED_DIR"
 fi
 
 #####################################
