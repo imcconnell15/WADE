@@ -377,6 +377,25 @@ get_ver_wade_mwex(){
   sha256sum "$bin" 2>/dev/null | awk '{print $1}'
 }
 
+get_ver_docker(){
+  if command -v docker >/dev/null 2>&1; then
+    docker --version 2>/dev/null | awk '{print $3}' | tr -d ','
+  else
+    echo ""
+  fi
+}
+
+get_ver_plaso_docker(){
+  # consider 'installed' if the image exists locally at the desired tag
+  local img="${PLASO_DOCKER_IMAGE:-log2timeline/plaso}"
+  local tag="${PLASO_DOCKER_TAG:-latest}"
+  if command -v docker >/dev/null 2>&1 && docker image inspect "${img}:${tag}" >/dev/null 2>&1; then
+    echo "${img}:${tag}"
+  else
+    echo ""
+  fi
+}
+
 # === Staging & Malware Extractor source (from repo) ===
 STAGE_SRC="${SCRIPT_DIR}/staging/stage_daemon.py"
 STAGE_EXPECT_SHA="$(sha256_of "$STAGE_SRC" 2>/dev/null || true)"
@@ -631,6 +650,25 @@ HAYABUSA_DEST="/usr/local/bin/hayabusa"
 HAYABUSA_RULES_DIR="/etc/wade/hayabusa/rules"
 SIGMA_RULES_DIR="/etc/wade/sigma"
 
+# ---- Plaso / log2timeline ----
+PLASO_ENABLED="1"                           # master toggle for installer
+PLASO_DOCKER_IMAGE="log2timeline/plaso"     # default upstream image
+PLASO_DOCKER_TAG="latest"                   # pin/tag if you want
+PLASO_DOCKER_NAME="wade-plaso"              # container name
+
+# Where raw timelines (storage files) will live
+PLASO_STORAGE_ROOT="/home/${WADE_OWNER_USER:-autopsy}/Cases/plaso"
+
+# Optional bind mount for images if you want a stable path inside the container
+PLASO_IMAGE_ROOT_HOST="/home/${WADE_OWNER_USER:-autopsy}/DataSources/Hosts"
+PLASO_IMAGE_ROOT_CONT="/mnt/hosts"
+
+# Default log2timeline options (used later by workers)
+PLASO_L2T_OPTS="--partition all --vss_stores all --status_view linear"
+
+# Default psort output directory (JSON/CSV for Splunk)
+PLASO_PSORT_JSON_ROOT="/home/${WADE_OWNER_USER:-autopsy}/Cases/plaso/json"
+
 # ---- Mandiant capa (engine + rules) ----
 CAPA_VERSION=""                         # blank = latest from PyPI
 WADE_CAPA_VENV="/opt/wade/venvs/capa"   # dedicated venv for capa
@@ -775,6 +813,12 @@ fi
 # Postgres (Ubuntu)
 if [[ "$PM" == "apt" ]]; then
   pkg_add postgresql
+fi
+# Docker (for Plaso container)
+if [[ "$PM" == "apt" ]]; then
+  pkg_add docker.io
+else
+  pkg_add docker
 fi
 
 # Do the single consolidated install
@@ -1324,6 +1368,67 @@ EOF
   sha256sum /opt/wade/wade_mw_extract.py | awk "{print \$1}" > "'"${STEPS_DIR}/wade-mw-extractor.ver"'"
 ' || fail_note "wade-mw-extractor" "install failed"
 
+
+#####################################
+# Docker and Plaso
+#####################################
+
+if [[ "${PLASO_ENABLED:-1}" == "1" ]]; then
+systemctl enable --now docker
+run_step "plaso-docker" "${PLASO_DOCKER_IMAGE:-log2timeline/plaso}:${PLASO_DOCKER_TAG:-latest}" get_ver_plaso_docker '
+  set -e
+
+  : "${PLASO_DOCKER_IMAGE:=log2timeline/plaso}"
+  : "${PLASO_DOCKER_TAG:=latest}"
+  : "${PLASO_DOCKER_NAME:=wade-plaso}"
+  : "${PLASO_STORAGE_ROOT:=/home/'"${LWADEUSER:-autopsy}"'/Cases/plaso}"
+
+  install -d -m 0755 "${PLASO_STORAGE_ROOT}"
+  chown "'"${LWADEUSER:-autopsy}:${LWADEUSER:-autopsy}"'" "${PLASO_STORAGE_ROOT}" || true
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker not in PATH; cannot setup plaso container"
+    exit 1
+  fi
+
+  # Offline image support: look for a pre-saved tarball
+  IMG_TGZ_LOCAL="${WADE_PKG_DIR:-/var/wade/pkg}/plaso/plaso-image.tar"
+  if [[ -f "$IMG_TGZ_LOCAL" ]]; then
+    echo "[*] Loading plaso image from ${IMG_TGZ_LOCAL}"
+    docker load -i "$IMG_TGZ_LOCAL"
+  elif [[ "${OFFLINE:-0}" == "1" && -f "${OFFLINE_SRC:-}/plaso/plaso-image.tar" ]]; then
+    echo "[*] Loading plaso image from offline media: ${OFFLINE_SRC}/plaso/plaso-image.tar"
+    docker load -i "${OFFLINE_SRC}/plaso/plaso-image.tar"
+  else
+    echo "[*] Pulling ${PLASO_DOCKER_IMAGE}:${PLASO_DOCKER_TAG} from registry (online mode)…"
+    docker pull "${PLASO_DOCKER_IMAGE}:${PLASO_DOCKER_TAG}"
+  fi
+
+  # Optional: create a lightweight wrapper script for interactive use
+  cat >/usr/local/bin/wade-plaso <<'"'"'EOF'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="${PLASO_DOCKER_IMAGE:-log2timeline/plaso}:${PLASO_DOCKER_TAG:-latest}"
+CONTAINER_NAME="${PLASO_DOCKER_NAME:-wade-plaso}"
+STORAGE_ROOT="${PLASO_STORAGE_ROOT:-/home/'"${LWADEUSER:-autopsy}"'/Cases/plaso}"
+HOST_IMAGE_ROOT="${PLASO_IMAGE_ROOT_HOST:-/home/'"${LWADEUSER:-autopsy}"'/DataSources/Hosts}"
+CONT_IMAGE_ROOT="${PLASO_IMAGE_ROOT_CONT:-/mnt/hosts}"
+
+mkdir -p "${STORAGE_ROOT}"
+
+docker run --rm \
+  --name "${CONTAINER_NAME}" \
+  -v "${HOST_IMAGE_ROOT}:${CONT_IMAGE_ROOT}:ro" \
+  -v "${STORAGE_ROOT}:/data" \
+  "${IMAGE}" "$@"
+EOF
+  chmod 0755 /usr/local/bin/wade-plaso
+  systemd_queue_enable docker
+
+' || fail_note "plaso-docker" "image provisioning failed"
+fi
+
 #####################################
 # Helpers for packages & hayabusa arch
 #####################################
@@ -1778,7 +1883,6 @@ EOF
 # Solr (pinned; soft-fail)
 #####################################
 run_step "solr" "${SOLR_VER}" get_ver_solr '
-  sudo apt-get install -y openjdk-11-jre-headless
   set -e
   SOLR_TGZ="solr-${SOLR_VER}.tgz"
   fetch_pkg solr "$SOLR_TGZ" || curl -L "https://archive.apache.org/dist/lucene/solr/${SOLR_VER}/${SOLR_TGZ}" -o "$SOLR_TGZ"
@@ -2211,6 +2315,17 @@ OFFLINE="${OFFLINE}"
 # Queue 
 WADE_QUEUE_DIR=_queue
 
+# Plaso / log2timeline
+PLASO_ENABLED="${PLASO_ENABLED}"
+PLASO_DOCKER_IMAGE="${PLASO_DOCKER_IMAGE}"
+PLASO_DOCKER_TAG="${PLASO_DOCKER_TAG}"
+PLASO_DOCKER_NAME="${PLASO_DOCKER_NAME}"
+PLASO_STORAGE_ROOT="${PLASO_STORAGE_ROOT}"
+PLASO_IMAGE_ROOT_HOST="${PLASO_IMAGE_ROOT_HOST}"
+PLASO_IMAGE_ROOT_CONT="${PLASO_IMAGE_ROOT_CONT}"
+PLASO_L2T_OPTS="${PLASO_L2T_OPTS}"
+PLASO_PSORT_JSON_ROOT="${PLASO_PSORT_JSON_ROOT}"
+
 # WHIFF (non-secret settings)
 WHIFF_ENABLE="${WHIFF_ENABLE_EFF}"
 WHIFF_BIND_ADDR="${WHIFF_BIND_EFF}"
@@ -2264,7 +2379,7 @@ echo "    ActiveMQ  : ${IPV4}:${ACTIVEMQ_OPENWIRE_PORT:-61616} (web console :${A
 echo "    Postgres  : ${IPV4}:${POSTGRES_PORT:-5432}"
 echo "    Barracuda : ${IPV4}:5000"
 echo "    WHIFF     : $( [[ "$WHIFF_ENABLE_EFF" = "1" ]] && echo "http://${WHIFF_BIND_EFF}:${WHIFF_PORT_EFF}" || echo "disabled" )"
-echo "    Tools     : vol3, dissect, bulk_extractor (+ piranha, barracuda, hayabusa, whiff)"
+echo "    Tools     : vol3, dissect, bulk_extractor, plaso (+ piranha, barracuda, hayabusa, whiff)"
 echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
 echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
 UF_PRESENT="no"
