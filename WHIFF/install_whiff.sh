@@ -104,45 +104,43 @@ hf_resilient_download() {  # repo allow_patterns dest_dir
   done
   return 1
 }
+
+# ---- Non-interactive plumbing (args, config, getters) ----
+usage(){ cat <<EOF
+Usage: $0 [--non-interactive|--ni] [--config FILE]
+You can also set env vars to bypass prompts, e.g.:
+  WHIFF_NONINTERACTIVE=1 INSTALL_PG_LOCAL=1 DB_HOST=127.0.0.1 DB_NAME=whiff DB_USER=whiff DB_PASS=secret \ 
+  ONLINE_MODE=1 DL_MODELS_NOW=1 SEED_BASELINE_DOCS=1 RUN_INITIAL_CRAWL=0 ./install_whiff.sh
+EOF
+}
+
+CONFIG_FILE=""
+WHIFF_NONINTERACTIVE="${WHIFF_NONINTERACTIVE:-0}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --non-interactive|--ni) WHIFF_NONINTERACTIVE=1; shift ;;
+    --config) CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1"; usage; exit 1 ;;
+  esac
+done
+
+# Load simple key=value config if provided
+if [[ -n "${CONFIG_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CONFIG_FILE}"
+fi
+
+getv(){ local name="$1" default="$2"; local val="${!name:-}"; [[ -z "$val" ]] && echo "$default" || echo "$val"; }
+getyn(){ local name="$1" default="$2"; local val="${!name:-}"; [[ -z "$val" ]] && val="$default"; [[ "$val" =~ ^(1|y|Y|yes|true)$ ]] && echo 1 || echo 0; }
+getsecret(){
+  local name="$1"; local val="${!name:-}"
+  if [[ -n "$val" ]]; then echo "$val"; return; fi
+  [[ "$WHIFF_NONINTERACTIVE" == "1" ]] && die "Missing required secret: $name"
+  prompt_secret_confirm "$name"
+}
+
 # ----------------------------------------------------------------
-
-#####################################
-# Prompts (all config here)
-#####################################
-INSTALL_PG_LOCAL="$(yn "Install & configure local PostgreSQL + pgvector?" Y)"
-DB_HOST="$(prompt "Postgres host" "127.0.0.1")"
-DB_PORT="$(prompt "Postgres port" "5432")"
-DB_NAME="$(prompt "Database name" "whiff")"
-DB_USER="$(prompt "Database user" "whiff")"
-DB_PASS="$(prompt_secret_confirm "Database password")"
-
-WHIFF_BIND="$(prompt "Whiff bind address" "127.0.0.1")"
-WHIFF_PORT="$(prompt "Whiff port" "8088")"
-WHIFF_THREADS="$(prompt "Model CPU threads" "8")"
-WHIFF_CTX="$(prompt "Model context tokens" "4096")"
-
-ONLINE_MODE="$(yn "Online mode (allow model downloads + crawling now)?" N)"
-DL_MODELS_NOW="0"
-if [[ "$ONLINE_MODE" == "1" ]]; then
-  DL_MODELS_NOW="$(yn "Download models now via HF (resumable)?" Y)"
-fi
-LLM_PATH="$(prompt "Path to LLM .gguf (if already on disk)" "$WHIFF_LLM_PATH_DEFAULT")"
-EMBED_DIR="$(prompt "Path to embeddings model dir" "$WHIFF_EMBED_DIR_DEFAULT")"
-
-RUN_INITIAL_CRAWL="0"
-if [[ "$ONLINE_MODE" == "1" ]]; then
-  RUN_INITIAL_CRAWL="$(yn "Run initial crawl of tuned sites.yaml after install?" Y)"
-fi
-
-SEED_BASELINE_DOCS="0"
-if [[ "$ONLINE_MODE" == "1" ]]; then
-  SEED_BASELINE_DOCS="$(yn "Seed baseline docs (ATT&CK, Vol3, Hayabusa, capa, YARA, Arkime) now?" Y)"
-fi
-HF_TOKEN="$(prompt "Hugging Face token (for Meta gated model) (press Enter to skip)" "")"
-
-ENABLE_NIGHTLY_BACKFILL="$(yn "Install (disabled) nightly backfill service+timer?" Y)"
-PATCH_WADE_ENV="$(yn "Add WHIFF_* toggles to /etc/wade/wade.env if present?" Y)"
-PACKAGE_SPLUNK_ADDON="$(yn "Package Splunk custom command tarball for your Search Head?" Y)"
 
 #####################################
 # Preflight
@@ -151,6 +149,60 @@ PACKAGE_SPLUNK_ADDON="$(yn "Package Splunk custom command tarball for your Searc
 req apt-get; req systemctl; req sed; req awk; req curl; req jq; req git
 command -v psql >/dev/null 2>&1 || true
 [[ -n "$HF_TOKEN" ]] && export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+
+#####################################
+# Config (prompts OR env; supports --non-interactive)
+#####################################
+if [[ "$WHIFF_NONINTERACTIVE" == "1" ]]; then
+  INSTALL_PG_LOCAL="$(getyn INSTALL_PG_LOCAL Y)"
+  DB_HOST="$(getv DB_HOST 127.0.0.1)"
+  DB_PORT="$(getv DB_PORT 5432)"
+  DB_NAME="$(getv DB_NAME whiff)"
+  DB_USER="$(getv DB_USER whiff)"
+  DB_PASS="$(getsecret DB_PASS)"
+
+  WHIFF_BIND="$(getv WHIFF_BIND 127.0.0.1)"
+  WHIFF_PORT="$(getv WHIFF_PORT 8088)"
+  WHIFF_THREADS="$(getv WHIFF_THREADS 8)"
+  WHIFF_CTX="$(getv WHIFF_CTX 4096)"
+
+  ONLINE_MODE="$(getyn ONLINE_MODE N)"
+  DL_MODELS_NOW="$(getyn DL_MODELS_NOW N)"
+  LLM_PATH="$(getv LLM_PATH /opt/whiff/models/whiff-llm.gguf)"
+  EMBED_DIR="$(getv EMBED_DIR /opt/whiff/models/emb/snowflake-m-v2)"
+
+  RUN_INITIAL_CRAWL="$(getyn RUN_INITIAL_CRAWL N)"
+  SEED_BASELINE_DOCS="$(getyn SEED_BASELINE_DOCS N)"
+  HF_TOKEN="$(getv HF_TOKEN "")"
+
+  ENABLE_NIGHTLY_BACKFILL="$(getyn ENABLE_NIGHTLY_BACKFILL Y)"
+  PATCH_WADE_ENV="$(getyn PATCH_WADE_ENV Y)"
+  PACKAGE_SPLUNK_ADDON="$(getyn PACKAGE_SPLUNK_ADDON Y)"
+else
+  INSTALL_PG_LOCAL="$(yn "Install & configure local PostgreSQL + pgvector?" Y)"
+  DB_HOST="$(prompt "Postgres host" "127.0.0.1")"
+  DB_PORT="$(prompt "Postgres port" "5432")"
+  DB_NAME="$(prompt "Database name" "whiff")"
+  DB_USER="$(prompt "Database user" "whiff")"
+  DB_PASS="$(prompt_secret_confirm "Database password")"
+
+  WHIFF_BIND="$(prompt "Whiff bind address" "127.0.0.1")"
+  WHIFF_PORT="$(prompt "Whiff port" "8088")"
+  WHIFF_THREADS="$(prompt "Model CPU threads" "8")"
+  WHIFF_CTX="$(prompt "Model context tokens" "4096")"
+
+  ONLINE_MODE="$(yn "Online mode (allow model downloads + crawling now)?" N)"
+  DL_MODELS_NOW="0"; [[ "$ONLINE_MODE" == "1" ]] && DL_MODELS_NOW="$(yn "Download models now via HF CLI (resumable)?" Y)"
+  LLM_PATH="$(prompt "Path to LLM .gguf (if already on disk)" "/opt/whiff/models/whiff-llm.gguf")"
+  EMBED_DIR="$(prompt "Path to embeddings model dir" "/opt/whiff/models/emb/snowflake-m-v2")"
+  RUN_INITIAL_CRAWL="0"; [[ "$ONLINE_MODE" == "1" ]] && RUN_INITIAL_CRAWL="$(yn "Run initial crawl of tuned sites.yaml after install?" Y)"
+  SEED_BASELINE_DOCS="0"; [[ "$ONLINE_MODE" == "1" ]] && SEED_BASELINE_DOCS="$(yn "Seed baseline docs now?" Y)"
+  HF_TOKEN="$(prompt "Hugging Face token (press Enter to skip)" "")"
+
+  ENABLE_NIGHTLY_BACKFILL="$(yn "Install (disabled) nightly backfill service+timer?" Y)"
+  PATCH_WADE_ENV="$(yn "Add WHIFF_* toggles to /etc/wade/wade.env if present?" Y)"
+  PACKAGE_SPLUNK_ADDON="$(yn "Package Splunk custom command tarball?" Y)"
+fi
 
 #####################################
 # OS packages
@@ -842,6 +894,16 @@ fi
 DB_DSN="host=$DB_HOST port=$DB_PORT dbname=$DB_NAME user=$DB_USER password=$DB_PASS"
 DB_PASS_SQL="$(printf "%s" "$DB_PASS" | sed "s/'/''/g")"  # SQL-safe single quotes
 
+# If DB_HOST is not resolvable and we’re installing local Postgres, fall back.
+if ! getent ahosts "$DB_HOST" >/dev/null 2>&1; then
+  echo "[!] DB host '$DB_HOST' not resolvable."
+  if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
+    echo "[*] Falling back to 127.0.0.1 for DB host."
+    DB_HOST="127.0.0.1"
+    DB_DSN="host=$DB_HOST port=$DB_PORT dbname=$DB_NAME user=$DB_USER password=$DB_PASS"
+  fi
+fi
+
 echo "[*] Bootstrapping database schema…"
 if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
   sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 || \
@@ -929,7 +991,7 @@ if [[ "$ENABLE_NIGHTLY_BACKFILL" == "1" ]]; then
 Description=Whiff nightly annotation backfill
 [Service]
 Type=oneshot
-Environment=WHIFF_API=http://127.0.0.1:8088/annotate
+Environment=WHIFF_API=http://${WHIFF_BIND}:${WHIFF_PORT}/annotate
 ExecStart=/opt/whiff/scripts/whiff-help /var/wade/logs/stage/today.jsonl /var/wade/logs/stage/today.with_help.jsonl
 SVC
   cat > /etc/systemd/system/whiff-nightly.timer <<'TMR'
@@ -978,9 +1040,13 @@ fi
 # Optional: Initial crawl
 #####################################
 if [[ "$RUN_INITIAL_CRAWL" == "1" ]]; then
-  echo "[*] Running initial crawl (this can take a while)…"
-  export WHIFF_DB_DSN="$DB_DSN"
-  /opt/whiff/.venv/bin/python /opt/whiff/whiff_crawl.py /opt/whiff/ingest/sites.yaml || echo "[!] Crawl encountered errors; continue."
+  if psql "$DB_DSN" -Atqc "SELECT 1" >/dev/null 2>&1; then
+    echo "[*] Running initial crawl (this can take a while)…"
+    export WHIFF_DB_DSN="$DB_DSN"
+    /opt/whiff/.venv/bin/python /opt/whiff/whiff_crawl.py /opt/whiff/ingest/sites.yaml || echo "[!] Crawl encountered errors; continue."
+  else
+    echo "[!] Skipping initial crawl (DB not reachable)."
+  fi
 fi
 
 #####################################
