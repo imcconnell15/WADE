@@ -36,14 +36,6 @@ prompt_secret_confirm() {
     echo "Passwords don't match. Try again." >&2
   done
 }
-hf_get_bin() {
-  # Prefer venv 'hf', then 'huggingface-cli'; print path or empty
-  local cand
-  for cand in "/opt/whiff/.venv/bin/hf" "/opt/whiff/.venv/bin/huggingface-cli" "$(command -v hf || true)" "$(command -v huggingface-cli || true)"; do
-    [[ -n "$cand" && -x "$cand" ]] && { echo "$cand"; return 0; }
-  done
-  echo ""
-}
 
 # ---- Resilient model download helpers (resumable + fallback) ----
 : "${HF_HOME:=/opt/whiff/cache}"
