@@ -2142,7 +2142,7 @@ EOF
 ' || fail_note "activemq" "install/config failed"
 
 #####################################
-# PostgreSQL (Ubuntu path; soft-fail)
+# PostgreSQL: tune listen, hba, and base config
 #####################################
 run_step "postgresql" "configured" get_ver_pg '
   set -e
@@ -2152,29 +2152,37 @@ run_step "postgresql" "configured" get_ver_pg '
     PG_DIR="/etc/postgresql/${PG_VER}/main"
 
     # Basic tuning
-    sed -ri "s/^#?fsync\s*=.*/fsync = ${PG_PERF_FSYNC}/" "${PG_DIR}/postgresql.conf"
-    sed -ri "s/^#?synchronous_commit\s*=.*/synchronous_commit = ${PG_PERF_SYNCCOMMIT}/" "${PG_DIR}/postgresql.conf"
-    sed -ri "s/^#?full_page_writes\s*=.*/full_page_writes = ${PG_PERF_FULLPAGE}/" "${PG_DIR}/postgresql.conf"
+    sed -ri "s/^#?fsync\\s*=.*/fsync = ${PG_PERF_FSYNC}/" "${PG_DIR}/postgresql.conf"
+    sed -ri "s/^#?synchronous_commit\\s*=.*/synchronous_commit = ${PG_PERF_SYNCCOMMIT}/" "${PG_DIR}/postgresql.conf"
+    sed -ri "s/^#?full_page_writes\\s*=.*/full_page_writes = ${PG_PERF_FULLPAGE}/" "${PG_DIR}/postgresql.conf"
 
-    grep -q "listen_addresses" "${PG_DIR}/postgresql.conf" && \
-      sed -ri "s/^#?listen_addresses\s*=.*/listen_addresses = '\''${PG_LISTEN_ADDR}'\''/" "${PG_DIR}/postgresql.conf" \
-      || echo "listen_addresses = '\''${PG_LISTEN_ADDR}'\''" >> "${PG_DIR}/postgresql.conf"
+    if grep -q "listen_addresses" "${PG_DIR}/postgresql.conf"; then
+      sed -ri "s/^#?listen_addresses\\s*=.*/listen_addresses = '"'"'${PG_LISTEN_ADDR}'"'"'/" "${PG_DIR}/postgresql.conf"
+    else
+      echo "listen_addresses = '"'"'${PG_LISTEN_ADDR}'"'"'" >> "${PG_DIR}/postgresql.conf"
+    fi
 
-    for net in ${ALLOW_NETS_CSV//,/ }; do
-      grep -qE "^\s*host\s+all\s+all\s+${net}\s+md5" "${PG_DIR}/pg_hba.conf" \
-        || echo "host all all ${net} md5" >> "${PG_DIR}/pg_hba.conf"
-    done
+    # Allow our WADE nets to reach Postgres
+    if [[ -n "${ALLOW_NETS_CSV:-}" ]]; then
+      for net in ${ALLOW_NETS_CSV//,/ }; do
+        grep -qE "^\\s*host\\s+all\\s+all\\s+${net}\\s+md5" "${PG_DIR}/pg_hba.conf" \
+          || echo "host all all ${net} md5" >> "${PG_DIR}/pg_hba.conf"
+      done
+    fi
 
     systemctl restart postgresql || true
 
-    # Create/alter role + database if enabled and we have creds
-    if [[ "${PG_CREATE_AUTOPSY_USER:-1}" == "1" && -n "${PG_DB_USER:-}" && -n "${PG_DB_PASS:-}" ]]; then
-      echo "[*] Ensuring PostgreSQL role '${PG_DB_USER}' and database '${PG_DB_NAME:-$PG_DB_USER}' exist…"
+  fi
+' || fail_note "postgresql" "install/config failed"
 
-      sudo -u postgres psql -v ON_ERROR_STOP=1 \
-        -v dbuser="${PG_DB_USER}" \
-        -v dbpass="${PG_DB_PASS}" \
-        -v dbname="${PG_DB_NAME:-$PG_DB_USER}" <<'"'"'EOSQL'"'"'
+# Ensure PostgreSQL role and database exist (outside run_step to avoid heredoc-in-eval issues)
+if [[ "$PM" == "apt" && "${PG_CREATE_AUTOPSY_USER:-1}" == "1" && -n "${PG_DB_USER:-}" && -n "${PG_DB_PASS:-}" ]]; then
+  echo
+  echo "==> Ensuring PostgreSQL role '${PG_DB_USER}' and database '${PG_DB_NAME:-$PG_DB_USER}' exist…"
+  sudo -u postgres psql -v ON_ERROR_STOP=1 \
+    -v dbuser="${PG_DB_USER}" \
+    -v dbpass="${PG_DB_PASS}" \
+    -v dbname="${PG_DB_NAME:-$PG_DB_USER}" <<'EOSQL'
 DO $$
 DECLARE
   role_exists boolean;
@@ -2194,9 +2202,7 @@ BEGIN
 END
 $$;
 EOSQL
-    fi
-  fi
-' || fail_note "postgresql" "install/config failed"
+fi
 
 #####################################
 # STIG prerequisites (OpenSCAP + SSG)
@@ -2577,7 +2583,7 @@ PLASO_PSORT_JSON_ROOT="${PLASO_PSORT_JSON_ROOT}"
 
 # WHIFF (non-secret settings)
 WHIFF_ENABLE="${WHIFF_ENABLE_EFF}"
-WHIFF_BIND_ADDR="${WHIFF_BIND_EFF}"
+WHIFF_BIND_ADDR="${WHIFF_BIND}"
 WHIFF_PORT="${WHIFF_PORT_EFF}"
 WHIFF_BACKEND="${WHIFF_BACKEND_EFF}"
 WHIFF_MODEL="${WHIFF_MODEL_EFF}"
@@ -2628,7 +2634,7 @@ echo "    Solr (UI) : http://${IPV4}:${SOLR_PORT:-8983}/solr/#/~cloud"
 echo "    ActiveMQ  : ${IPV4}:${ACTIVEMQ_OPENWIRE_PORT:-61616} (web console :${ACTIVEMQ_WEB_CONSOLE_PORT:-8161})"
 echo "    Postgres  : ${IPV4}:${POSTGRES_PORT:-5432}"
 echo "    Barracuda : ${IPV4}:5000"
-echo "    WHIFF     : $( [[ "$WHIFF_ENABLE_EFF" = "1" ]] && echo "http://${WHIFF_BIND_EFF}:${WHIFF_PORT_EFF}" || echo "disabled" )"
+echo "    WHIFF     : $( [[ "$WHIFF_ENABLE_EFF" = "1" ]] && echo "http://${WHIFF_BIND}:${WHIFF_PORT_EFF}" || echo "disabled" )"
 echo "    Tools     : vol3, dissect, bulk_extractor, plaso (+ piranha, barracuda, hayabusa, whiff)"
 echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
 echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
@@ -2655,6 +2661,9 @@ echo "NOTE: New tools default to SPLUNK index: '${SPLUNK_DEFAULT_INDEX:-wade_cus
 # Call The Doctor
 #####################################
 wade_doctor
+
+# One-and-done systemd reload/enables
+systemd_finalize_enable
 
 #####################################
 # Interactive STIG assessment (end; reads from ./stigs)
@@ -2744,25 +2753,28 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
       else
         CHOSEN_PROFILE="$(stig_pick_profile_interactive "$DS_FILE")" || { fail_note "stig-eval" "no profile chosen"; CHOSEN_PROFILE=""; }
         if [[ -n "$CHOSEN_PROFILE" ]]; then
-          echo "[*] Running oscap with profile: ${CHOSEN_PROFILE}"
+        echo "[*] Running oscap with profile: ${CHOSEN_PROFILE}"
           SKIP_ARGS="$(stig_skip_args)"
           TS="$(date +%Y%m%d_%H%M%S)"
           REP_HTML="${STIG_REPORT_DIR}/stig-ubuntu-${OS_VER_ID}-${TS}.html"
           REP_ARF="${STIG_REPORT_DIR}/stig-ubuntu-${OS_VER_ID}-${TS}.arf.xml"
-          if wade_oscap_eval xccdf eval --skip-valid ${SKIP_ARGS} \
+
+          # Run the scan
+          wade_oscap_eval xccdf eval --skip-valid ${SKIP_ARGS} \
                 --profile "${CHOSEN_PROFILE}" \
                 --results-arf "${REP_ARF}" \
-                --report "${REP_HTML}" \; then 
+                --report "${REP_HTML}" \
                 "${DS_FILE}"
-            ec=$?
-            if [[ $ec -eq 0 || $ec -eq 1 ]]; then
-                echo "[+] STIG report: ${REP_HTML}"
-                echo "[+] STIG ARF   : ${REP_ARF}"
-                cp -f "${DS_FILE}" "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || true
-                mark_done "stig-eval" "$(sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || echo run-${TS})"
-            else
-                fail_note "stig-eval" "oscap eval failed (exit ${ec})"
-            fi
+          ec=$?
+
+          # 0 = success, 1 = “some rules failed” (still useful), >1 = actual error
+          if [[ $ec -eq 0 || $ec -eq 1 ]]; then
+            echo "[+] STIG report: ${REP_HTML}"
+            echo "[+] STIG ARF   : ${REP_ARF}"
+            cp -f "${DS_FILE}" "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || true
+            mark_done "stig-eval" "$(sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" 2>/dev/null || echo run-${TS})"
+          else
+            fail_note "stig-eval" "oscap eval failed (exit ${ec})"
           fi
         fi
       fi
@@ -2770,8 +2782,5 @@ if [[ "${MOD_STIG_EVAL_ENABLED:-0}" == "1" && "$OS_ID" == "ubuntu" ]]; then
     fi
   fi
 fi
-
-# One-and-done systemd reload/enables
-systemd_finalize_enable
 
 finish_summary
