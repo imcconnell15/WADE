@@ -581,6 +581,7 @@ chmod +x /opt/whiff/whiff_crawl.py
 # SQL bootstrap
 #####################################
 cat > /opt/whiff/sql/00_bootstrap.sql <<'SQL'
+SET search_path = whiff, public;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS sage_docs (
   id UUID PRIMARY KEY,
@@ -905,6 +906,8 @@ if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
   sudo -u postgres psql -c "ALTER USER \"$DB_USER\" WITH PASSWORD '$DB_PASS_SQL';" >/dev/null
   sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$DB_USER\";" >/dev/null || true
   sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null || true
+  sudo -u postgres psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS whiff AUTHORIZATION \"$DB_USER\";"
+  sudo -u postgres psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER ROLE \"$DB_USER\" IN DATABASE \"$DB_NAME\" SET search_path = whiff, public;"
   PG_HBA="$(ls /etc/postgresql/*/main/pg_hba.conf 2>/dev/null | head -n1 || true)"
   if [[ -n "$PG_HBA" ]]; then
     if ! grep -qE '^host\s+all\s+all\s+127\.0\.0\.1/32\s+(scram-sha-256|md5)\s*$' "$PG_HBA"; then
@@ -915,7 +918,7 @@ if [[ "$INSTALL_PG_LOCAL" == "1" ]]; then
 fi
 
 if psql "$DB_DSN" -Atqc "SELECT 1" >/dev/null 2>&1; then
-  psql "$DB_DSN" -f /opt/whiff/sql/00_bootstrap.sql >/dev/null || \
+  (echo 'SET search_path = whiff, public;'; cat /opt/whiff/sql/00_bootstrap.sql) | psql "$DB_DSN" >/dev/null || \
     echo "[!] Schema applied with warnings; ensure pgvector exists."
 else
   echo "[!] Could not connect to ${DB_HOST}:${DB_PORT}/${DB_NAME} as ${DB_USER}. Re-run schema later with:"
@@ -1032,12 +1035,13 @@ fi
 # Optional: Initial crawl
 #####################################
 if [[ "$RUN_INITIAL_CRAWL" == "1" ]]; then
-  if psql "$DB_DSN" -Atqc "SELECT 1" >/dev/null 2>&1; then
+  if psql "$DB_DSN" -Atqc "SELECT 1" >/dev/null 2>&1 && \
+     psql "$DB_DSN" -Atqc "SELECT to_regclass('whiff.sage_docs') IS NOT NULL;" | grep -q 't'; then
     echo "[*] Running initial crawl (this can take a while)…"
     export WHIFF_DB_DSN="$DB_DSN"
     /opt/whiff/.venv/bin/python /opt/whiff/whiff_crawl.py /opt/whiff/ingest/sites.yaml || echo "[!] Crawl encountered errors; continue."
   else
-    echo "[!] Skipping initial crawl (DB not reachable)."
+    echo "[!] Skipping initial crawl (DB not ready or schema missing)."
   fi
 fi
 
