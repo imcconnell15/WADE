@@ -2,20 +2,6 @@
 # WADE - Wide-Area Data Extraction :: Idempotent Installer (soft-fail + interactive STIG)
 # Author: Ian McConnell
 
-### ---------- Prompt helpers ----------
-prompt_with_default() {
-  local q="$1"; local d="$2"; local ans
-  read -r -p "$q [$d]: " ans
-  ans="${ans:-$d}"
-  printf "%s" "$ans"
-}
-yesno_with_default() {
-  local q="$1"; local d="${2:-Y}"; local ans
-  read -r -p "$q [${d}/$( [[ "$d" =~ ^[Yy]$ ]] && echo n || echo y )]: " ans
-  ans="${ans:-$d}"
-  [[ "$ans" =~ ^[Yy]$ ]]
-}
-
 set -Euo pipefail   # no -e (we soft-fail via step runner); still strict on unset + pipefail
 
 # ---- Debug + transcript logging ----
@@ -365,7 +351,6 @@ get_ver_amq(){ /opt/activemq/bin/activemq --version 2>/dev/null | grep -Eo '[0-9
 get_ver_pg(){ psql -V 2>/dev/null | awk '{print $3}' || true; }
 get_ver_pipx_vol3(){ pipx list 2>/dev/null | awk '/package volatility3 /{print $3}' | tr -d '()' || true; }
 get_ver_pipx_dissect(){ pipx list 2>/dev/null | awk '/package dissect /{print $3}' | tr -d '()' || true; }
-get_ver_stig(){ [[ -f "${STIG_UBU_EXTRACT_DIR:-/var/wade/stigs/ubuntu2404}/ds.xml" ]] && sha256_of "${STIG_UBU_EXTRACT_DIR}/ds.xml" || echo ""; }
 get_ver_qtgl(){ dpkg -s libegl1 >/dev/null 2>&1 && echo present || echo ""; }  # apt branch only
 get_ver_splunkuf(){
   [[ -x /opt/splunkforwarder/bin/splunk ]] || { echo ""; return; }
@@ -375,11 +360,6 @@ get_ver_splunkuf(){
   else
     echo ""
   fi
-}
-get_ver_uf(){
-  [[ -x /opt/splunkforwarder/bin/splunk ]] || { echo ""; return; }
-  /opt/splunkforwarder/bin/splunk version 2>/dev/null \
-    | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) {print $i; exit}}'
 }
 get_ver_capa(){ /usr/local/bin/capa --version 2>/dev/null | sed -nE "s/.* ([0-9]+(\.[0-9]+)+).*/\1/p" | head -1 || echo ""; }
 get_ver_capa_rules(){
@@ -408,14 +388,6 @@ get_ver_wade_mwex(){
   local bin="/opt/wade/wade_mw_extract.py"
   [[ -f "$bin" ]] || { echo ""; return; }
   sha256sum "$bin" 2>/dev/null | awk '{print $1}'
-}
-
-get_ver_docker(){
-  if command -v docker >/dev/null 2>&1; then
-    docker --version 2>/dev/null | awk '{print $3}' | tr -d ','
-  else
-    echo ""
-  fi
 }
 
 get_ver_plaso_docker(){
@@ -2185,8 +2157,8 @@ run_step "postgresql" "configured" get_ver_pg '
     sed -ri "s/^#?full_page_writes\s*=.*/full_page_writes = ${PG_PERF_FULLPAGE}/" "${PG_DIR}/postgresql.conf"
 
     grep -q "listen_addresses" "${PG_DIR}/postgresql.conf" && \
-      sed -ri "s/^#?listen_addresses\s*=.*/listen_addresses = '"'"'${PG_LISTEN_ADDR}'"'"'/" "${PG_DIR}/postgresql.conf" \
-      || echo "listen_addresses = '"'"'${PG_LISTEN_ADDR}'"'"'" >> "${PG_DIR}/postgresql.conf"
+      sed -ri "s/^#?listen_addresses\s*=.*/listen_addresses = '\''${PG_LISTEN_ADDR}'\''/" "${PG_DIR}/postgresql.conf" \
+      || echo "listen_addresses = '\''${PG_LISTEN_ADDR}'\''" >> "${PG_DIR}/postgresql.conf"
 
     for net in ${ALLOW_NETS_CSV//,/ }; do
       grep -qE "^\s*host\s+all\s+all\s+${net}\s+md5" "${PG_DIR}/pg_hba.conf" \
@@ -2204,21 +2176,23 @@ run_step "postgresql" "configured" get_ver_pg '
         -v dbpass="${PG_DB_PASS}" \
         -v dbname="${PG_DB_NAME:-$PG_DB_USER}" <<'"'"'EOSQL'"'"'
 DO $$
+DECLARE
+  role_exists boolean;
+  db_exists boolean;
 BEGIN
-   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'dbuser') THEN
-      EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', :'dbuser', :'dbpass');
-   ELSE
-      EXECUTE format('ALTER ROLE %I LOGIN PASSWORD %L', :'dbuser', :'dbpass');
-   END IF;
+  SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'dbuser') INTO role_exists;
+  IF NOT role_exists THEN
+    EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', :'dbuser', :'dbpass');
+  ELSE
+    EXECUTE format('ALTER ROLE %I LOGIN PASSWORD %L', :'dbuser', :'dbpass');
+  END IF;
+
+  SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'dbname') INTO db_exists;
+  IF NOT db_exists THEN
+    EXECUTE format('CREATE DATABASE %I OWNER %I', :'dbname', :'dbuser');
+  END IF;
 END
 $$;
-
-SELECT
-  'CREATE DATABASE ' || quote_ident(:'dbname')
-  || ' OWNER '       || quote_ident(:'dbuser')
-WHERE NOT EXISTS (
-  SELECT FROM pg_database WHERE datname = :'dbname'
-)\gexec
 EOSQL
     fi
   fi
