@@ -2314,7 +2314,7 @@ EOF
 # WADE Workers
 #####################################
 install -d -m 0755 /opt/wade/wade_workers/bin
-rsync -a "${SCRIPT_DIR}/wade_workers/wade_workers/" /opt/wade/wade_workers/
+rsync -a "${SCRIPT_DIR}/wade_workers/wade_workers/" /opt/wade/wade_workers/wade_workers/
 rsync -a "${SCRIPT_DIR}/wade_workers/bin/" /opt/wade/wade_workers/bin/
 
 # Runner systemd
