@@ -2522,6 +2522,8 @@ UF_SSLN="${UF_SSLN:-${SPLUNK_UF_SSL_COMMON_NAME:-*}}"
 UF_DS="${UF_DS:-${SPLUNK_UF_DEPLOYMENT_SERVER:-}}"
 UF_IDX="${UF_IDX:-${SPLUNK_UF_DEFAULT_INDEX:-${SPLUNK_DEFAULT_INDEX:-wade_custom}}}"
 
+WHIFF_BIND_ADDR=""
+
 if [[ ! -f "$ENV_FILE" ]]; 
   then cat > "$ENV_FILE" <<ENV
 # ===== WADE runtime facts =====
