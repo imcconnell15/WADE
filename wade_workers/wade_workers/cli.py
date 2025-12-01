@@ -2,14 +2,14 @@
 import sys, json, argparse
 from pathlib import Path
 
-from .utils import load_env, read_ticket
-from .noop_worker import NoopWorker
-from .volatility_worker import VolatilityWorker
-from .dissect_worker import DissectWorker
-from .yara_worker import YaraWorker
-from .bulkextractor_worker import BulkExtractorWorker
-from .autopsy_manifest import AutopsyManifestWorker
-from .hayabusa_worker import HayabusaWorker
+from wade_wokers.utils import load_env, read_ticket
+from wade_wokers.noop_worker import NoopWorker
+from wade_wokers.volatility_worker import VolatilityWorker
+from wade_wokers.dissect_worker import DissectWorker
+from wade_wokers.yara_worker import YaraWorker
+from wade_wokers.bulkextractor_worker import BulkExtractorWorker
+from wade_wokers.autopsy_manifest import AutopsyManifestWorker
+from wade_wokers.hayabusa_worker import HayabusaWorker
 
 # Classification mapping from staging → internal plan key
 CLASS_MAP = {
