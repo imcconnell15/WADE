@@ -57,6 +57,7 @@ WADE_BANNER
 #####################################
 # Script location & STIG source dir
 #####################################
+rm /var/lib/man-db/auto-update
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)"
 STIG_SRC_DIR="${SCRIPT_DIR}/stigs"
 SPLUNK_SRC_DIR="${SCRIPT_DIR}"
