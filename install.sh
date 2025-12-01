@@ -2329,9 +2329,11 @@ ConditionPathExists=/opt/wade/wade_workers/bin/wade_queue_runner.py
 Type=simple
 User=%i
 Group=%i
-EnvironmentFile=-/etc/wade/wade.env
 WorkingDirectory=/opt/wade/wade_workers
-ExecStart=/usr/bin/env python3 /opt/wade/wade_workers/bin/wade_queue_runner.py
+EnvironmentFile=-/etc/wade/wade.env
+Environment=PYTHONPATH=/opt/wade/wade_workers
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/autopsy/.venvs/wade/bin/python /opt/wade/wade_workers/bin/wade_queue_runner.py
 Restart=always
 RestartSec=2
 UMask=002
