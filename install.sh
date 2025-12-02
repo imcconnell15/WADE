@@ -866,6 +866,7 @@ fi
 # Postgres (Ubuntu)
 if [[ "$PM" == "apt" ]]; then
   pkg_add postgresql
+  pkg_add gexec
 fi
 # Docker (for Plaso container)
 if [[ "$PM" == "apt" ]]; then
@@ -2180,28 +2181,22 @@ run_step "postgresql" "configured" get_ver_pg '
 if [[ "$PM" == "apt" && "${PG_CREATE_AUTOPSY_USER:-1}" == "1" && -n "${PG_DB_USER:-}" && -n "${PG_DB_PASS:-}" ]]; then
   echo
   echo "==> Ensuring PostgreSQL role '${PG_DB_USER}' and database '${PG_DB_NAME:-$PG_DB_USER}' exist…"
-  sudo -u postgres psql -v ON_ERROR_STOP=1 \
+    sudo -u postgres psql -v ON_ERROR_STOP=1 \
     -v dbuser="${PG_DB_USER}" \
     -v dbpass="${PG_DB_PASS}" \
     -v dbname="${PG_DB_NAME:-$PG_DB_USER}" <<'EOSQL'
-DO $$
-DECLARE
-  role_exists boolean;
-  db_exists boolean;
-BEGIN
-  SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'dbuser') INTO role_exists;
-  IF NOT role_exists THEN
-    EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', :'dbuser', :'dbpass');
-  ELSE
-    EXECUTE format('ALTER ROLE %I LOGIN PASSWORD %L', :'dbuser', :'dbpass');
-  END IF;
+-- Ensure role exists and password is set
+SELECT CASE
+         WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'dbuser')
+         THEN format('ALTER ROLE %I LOGIN PASSWORD %L', :'dbuser', :'dbpass')
+         ELSE format('CREATE ROLE %I LOGIN PASSWORD %L', :'dbuser', :'dbpass')
+       END AS cmd;
+\gexec
 
-  SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'dbname') INTO db_exists;
-  IF NOT db_exists THEN
-    EXECUTE format('CREATE DATABASE %I OWNER %I', :'dbname', :'dbuser');
-  END IF;
-END
-$$;
+-- Ensure database exists owned by the role
+SELECT format('CREATE DATABASE %I OWNER %I', :'dbname', :'dbuser')
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'dbname');
+\gexec
 EOSQL
 fi
 
