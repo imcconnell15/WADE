@@ -1,30 +1,4 @@
 #!/usr/bin/env python3
-"""
-WADE Staging Daemon – v2.3 (stability + dedupe race + env precedence + ops logging)
-
-v2.3 (this build)
-- Optional requests import (Whiff no longer crashes daemon if not installed)
-- Env precedence: environment variables override /etc/wade/wade.env
-- enqueue_work() stray brace removed
-- Content-dedupe race: catch UNIQUE(content_sig) IntegrityError post-move and treat as dup
-- Defrag temp dir: try /var/wade/tmp, fall back to system tmp
-- Unknowns quarantined to DataSources/Unknown to avoid infinite reprocessing
-- quick_content_sig() accepts size_hint to reduce extra stats
-- ETL hostname colocation retained from v2.2
-- Pre-move stat retained to avoid FileNotFoundError on moved src
-- NEW: Human-readable text logging to journald/stdout (toggle via WADE_TEXT_LOGS / WADE_TEXT_LOG_LEVEL)
-
-Kept (v2.2/v2.1):
-- Classifier registry and network-config detectors
-- VM disk & package detection (qcow2, vhdx, vmdk, vdi, vhd; ova/ovf)
-- Mountless OS hints (Linux/Windows/macOS)
-- E01 magic (EVF...) + ewfinfo acquisition date + target-info hostname
-- ETL guard so .etl is never considered memory
-- Inotify CLOSE_WRITE gating + size-stable + optional lsof writer check
-- Optional auto-defrag of fragmented E01 via ewfexport
-- Troubleshooting-friendly logs (file(1) one-liner + hex head)
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -102,6 +76,8 @@ SMALL_FILE_BYTES = int(os.getenv("WADE_STAGE_SMALL_FILE_BYTES", str(2 * 1024 * 1
 SMALL_FILE_STABLE = int(os.getenv("WADE_STAGE_SMALL_FILE_STABLE", "5"))
 
 SIG_SAMPLE_BYTES = int(os.getenv("WADE_SIG_SAMPLE_BYTES", str(4 * 1024 * 1024)))  # 4MiB head+tail
+
+MEM_MIN_BYTES = int(os.getenv("WADE_MEM_MIN_BYTES", str(100 * 1024 * 1024)))  # ~100MiB default
 
 # Text logging toggles
 WADE_TEXT_LOGS = os.getenv("WADE_TEXT_LOGS", "1").lower() in ("1", "true", "yes")
@@ -594,31 +570,62 @@ def classify_e01(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
     }
 
 # -----------------------------
-# Memory & ETL
+# Memory
 # -----------------------------
-def is_etl(p: Path) -> bool:
-    # Use file(1) when available; otherwise rely on extension
-    if FILE_CMD:
-        rc, out, _ = run_cmd([FILE_CMD, "-b", str(p)], timeout=5)
-        if rc == 0 and "Event Trace Log" in out:
-            return True
-    return p.suffix.lower() == ".etl"
 
 def name_looks_memory(p: Path) -> bool:
     n = p.name.lower()
     return any(k in n for k in (".mem", ".vmem", "hiberfil", "hibernat", "winpmem", "rawmem", ".lime"))
 
 def detect_memory_dump(p: Path) -> Optional[Dict[str, str]]:
-    # Never consider ETL as memory
-    if is_etl(p):
-        return None
+    """
+    Decide whether this file is a memory dump.
+
+    Order of operations:
+      1) Header magic (hibernation / LiME) – strongest signal.
+      2) Size gate for "raw" dumps (MEM_MIN_BYTES).
+      3) Volatility probe (preferred when available).
+      4) Filename hints (name_looks_memory) as a fallback for big files.
+    """
+    # 1) Cheap magic checks first (hiberfil / LiME)
     head = read_head_once(p, max(HEAD_SCAN_BYTES, 4096))
     if head[:4] in (b"HIBR", b"Hibr", b"hibr"):
         return {"kind": "hibernation", "evidence": "HIBR magic"}
     if head[:4] == b"LiME":
         return {"kind": "lime", "evidence": "LiME magic"}
-    if name_looks_memory(p):
-        return {"kind": "raw", "evidence": "filename hint"}
+
+    # 2) Size + filename hints
+    try:
+        size = p.stat().st_size
+    except FileNotFoundError:
+        return None
+
+    looks_mem = name_looks_memory(p)
+
+    # Too small for a normal RAM image and no strong magic: bail
+    if size < MEM_MIN_BYTES and not looks_mem:
+        return None
+
+    # 3) If we don't have Volatility, fall back to filename hints for big files
+    if not VOL_PATH:
+        if looks_mem and size >= MEM_MIN_BYTES:
+            return {"kind": "raw", "evidence": "filename hint (no volatility available)"}
+        return None
+
+    # 3a) Try Windows first
+    rc, out, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=60)
+    if rc == 0 and ("Image" in out or "Windows" in out):
+        return {"kind": "raw", "evidence": "volatility windows.info"}
+
+    # 3b) Fallback: quick Linux probe
+    rc2, out2, _ = run_cmd([VOL_PATH, "-f", str(p), "linux.uname.Uname"], timeout=60)
+    if rc2 == 0 and "Linux version" in out2:
+        return {"kind": "raw", "evidence": "volatility linux.uname"}
+
+    # 4) Volatility couldn't parse it, but it looks like memory by name and size
+    if looks_mem and size >= MEM_MIN_BYTES:
+        return {"kind": "raw", "evidence": "filename hint (volatility did not recognize)"}
+
     return None
 
 def best_effort_mem_meta(p: Path) -> Tuple[Optional[str], Optional[str]]:
@@ -873,7 +880,7 @@ def classify_network_cfg(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
     return "", {}
 
 # -----------------------------
-# Misc fallback (+ ETL host colocation)
+# Misc fallback 
 # -----------------------------
 def match_host_from_filename(datasources: Path, p: Path) -> Optional[str]:
     hosts_dir = datasources / "Hosts"
@@ -890,13 +897,6 @@ def classify_misc(p: Path, datasources: Path) -> Tuple[str, Dict[str, Any]]:
     host = match_host_from_filename(datasources, p)
     if host:
         return "misc", {"hostname": host, "date_collected": ymd_from_mtime(p)}
-    # ETL explicit classification (so it has a home) with best-effort host colocation
-    if is_etl(p):
-        details = {"date_collected": ymd_from_mtime(p)}
-        guessed = match_host_from_filename(datasources, p)
-        if guessed:
-            details["hostname"] = guessed
-        return "windows_etl", details
     return "", {}
 
 # -----------------------------
@@ -924,11 +924,6 @@ def build_destination(src: Path, root: Path, classification: str, details: Dict[
     elif classification == "misc":
         dir_ = root / "Hosts" / hostname / "misc"
         name = src.name
-
-    elif classification == "windows_etl":
-        dir_ = root / "Hosts" / hostname / "logs"
-        ext = src.suffix or ".etl"
-        name = f"{hostname}_{date_str}{ext}"
 
     elif classification == "vm_disk":
         fmt = details.get("format") or "disk"
@@ -1147,6 +1142,13 @@ def process_one(
                      src_path=str(src),
                      stable_seconds=stable_secs,
                      size_bytes=pre_st.st_size)
+
+                        # New: log what we’re about to use for dedupe
+            json_log("dedupe_probe",
+                     src_path=str(src),
+                     sig=pre_sig,
+                     content_sig=pre_content_sig)
+
             if LSOF_CMD and VERIFY_NO_WRITERS:
                 rc, out, _ = run_cmd([LSOF_CMD, "-t", "--", str(src)], timeout=5)
                 json_log("writer_check",
@@ -1308,7 +1310,7 @@ def process_one(
                     md["vm_format"] = details.get("format")
                 log_payload["metadata"] = {k: v for k, v in md.items() if v is not None}
 
-            elif classification in ("e01", "mem", "vm_package", "windows_etl"):
+            elif classification in ("e01", "mem", "vm_package"):
                 md = {
                     "hostname": details.get("hostname"),
                     "date_collected": details.get("date_collected"),
@@ -1367,14 +1369,30 @@ def process_one(
 def build_paths() -> Tuple[str, Path, Path, Path, Path]:
     env = load_env()
     owner = env.get("WADE_OWNER_USER", DEFAULT_OWNER)
-    datadir = Path(env.get("WADE_DATADIR", DEFAULT_DATADIR))
-    staging = Path(env.get("WADE_STAGINGDIR", DEFAULT_STAGINGDIR))
+
+    datadir_cfg = env.get("WADE_DATADIR", DEFAULT_DATADIR)
+    staging_cfg = env.get("WADE_STAGINGDIR", DEFAULT_STAGINGDIR)
     home = Path(f"/home/{owner}")
-    staging_root = home / staging
+
+    datadir = Path(datadir_cfg)
+    staging = Path(staging_cfg)
+
+    # Allow absolute overrides; otherwise treat as under /home/<owner>
+    if datadir.is_absolute():
+        datasources = datadir
+    else:
+        datasources = home / datadir
+
+    if staging.is_absolute():
+        staging_root = staging
+    else:
+        staging_root = home / staging
+
     full = staging_root / "full"
     light = staging_root / "light"
-    datasources = home / datadir
-    queue_root = Path(env.get("WADE_QUEUE_DIR", "_queue"))
+
+    queue_root_cfg = env.get("WADE_QUEUE_DIR", "_queue")
+    queue_root = Path(queue_root_cfg)
     if not queue_root.is_absolute():
         queue_root = datasources / queue_root
 
@@ -1390,7 +1408,7 @@ def build_paths() -> Tuple[str, Path, Path, Path, Path]:
 
     # Queue hygiene: delete >7 day old files
     now = time.time()
-    for cls in ("e01", "mem", "disk_raw", "vm_disk", "vm_package", "network_config", "windows_etl", "misc", "unknown"):
+    for cls in ("e01", "mem", "disk_raw", "vm_disk", "vm_package", "network_config", "network_doc", "misc", "unknown"):
         for prof in ("full", "light"):
             qdir = queue_root / cls / prof
             if qdir.exists():
