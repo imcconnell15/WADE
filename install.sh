@@ -2184,7 +2184,7 @@ if [[ "$PM" == "apt" && "${PG_CREATE_AUTOPSY_USER:-1}" == "1" && -n "${PG_DB_USE
     sudo -u postgres psql -v ON_ERROR_STOP=1 \
     -v dbuser="${PG_DB_USER}" \
     -v dbpass="${PG_DB_PASS}" \
-    -v dbname="${PG_DB_NAME:-$PG_DB_USER}" <<'EOSQL'
+    -v dbname="${PG_DB_NAME:-$PG_DB_USER}" >/dev/null <<'EOSQL'
 -- Ensure role exists and password is set
 SELECT CASE
          WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'dbuser')
