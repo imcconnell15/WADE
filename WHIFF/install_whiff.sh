@@ -41,6 +41,7 @@ prompt_secret_confirm() {
 : "${HF_HOME:=/opt/whiff/cache}"
 : "${TRANSFORMERS_CACHE:=/opt/whiff/cache}"
 export HF_HOME TRANSFORMERS_CACHE
+export HF_HUB_ENABLE_HF_TRANSFER=0
 
 # Default repos/paths (override via env before running if desired)
 WHIFF_LLM_REPO="${WHIFF_LLM_REPO:-bartowski/Meta-Llama-3.1-8B-Instruct-GGUF}"
@@ -67,31 +68,45 @@ check_free_gb() {  # usage: check_free_gb /opt 6
   [[ $gb_free -ge $min ]]
 }
 
-hf_snapshot_py() {  # repo allow_patterns dest_dir
-  /opt/whiff/.venv/bin/python - "$1" "$2" "$3" <<'PY'
-import sys
-from huggingface_hub import snapshot_download
-repo, allow, dest = sys.argv[1], sys.argv[2], sys.argv[3]
-allow_patterns = [p.strip() for p in allow.split(',')] if allow else None
-snapshot_download(
-  repo_id=repo,
-  local_dir=dest,
-  allow_patterns=allow_patterns,
-)
-PY
+# Build --allow-patterns args for huggingface-cli from a CSV string
+build_allow_args() {
+  local csv="$1"
+  local out=()
+  IFS=',' read -ra parts <<< "$csv"
+  for p in "${parts[@]}"; do
+    # trim whitespace
+    p="${p//[[:space:]]/}"
+    [[ -n "$p" ]] && out+=( "--allow-patterns" "$p" )
+  done
+  printf '%s\n' "${out[@]}"
 }
 
-hf_resilient_download() {  # repo allow_patterns dest_dir
-  local repo="$1" allow="$2" dest="$3"
+# Minimal HF download helper using huggingface-cli (with retries)
+hf_download() {  # repo pattern_or_empty dest_dir [extra_args...]
+  local repo="$1" pattern="$2" dest="$3"
+  shift 3
+  local extra_args=("$@")
+
   mkdir -p "$dest"
-  # Try with hf_transfer fast path, then without; retry up to 3x each
-  for mode in 1 0; do
-    export HF_HUB_ENABLE_HF_TRANSFER="$mode"
-    for attempt in 1 2 3; do
-      hf_snapshot_py "$repo" "$allow" "$dest" && return 0
-      sleep $((attempt*2))
-    done
+
+  local attempt
+  for attempt in 1 2 3; do
+    if [[ -n "$pattern" ]]; then
+      /opt/whiff/.venv/bin/huggingface-cli download \
+        "$repo" "$pattern" \
+        --local-dir "$dest" \
+        --local-dir-use-symlinks False \
+        "${extra_args[@]}" && return 0
+    else
+      /opt/whiff/.venv/bin/huggingface-cli download \
+        "$repo" \
+        --local-dir "$dest" \
+        --local-dir-use-symlinks False \
+        "${extra_args[@]}" && return 0
+    fi
+    sleep $((attempt*2))
   done
+
   return 1
 }
 
@@ -833,39 +848,52 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 #####################################
-# (Optional) Download models (resilient + lean patterns + fallback)
+# (Optional) Download models (simple helper + patterns + fallback)
 #####################################
 if [[ "$DL_MODELS_NOW" == "1" ]]; then
   echo "[*] Downloading LLM (${WHIFF_LLM_FILE}) …"
   mkdir -p "$WHIFF_LLM_DIR"
-  if hf_resilient_download "$WHIFF_LLM_REPO" "$WHIFF_LLM_FILE" "$WHIFF_LLM_DIR"; then
-    if [[ -f "${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}" ]]; then
-      ln -sf "${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}" "$WHIFF_LLM_PATH_DEFAULT"
-      LLM_PATH="$WHIFF_LLM_PATH_DEFAULT"
-      echo "[+] LLM ready at $LLM_PATH"
+
+  # Only download if not already present
+  if [[ ! -f "${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}" ]]; then
+    if hf_download "$WHIFF_LLM_REPO" "$WHIFF_LLM_FILE" "$WHIFF_LLM_DIR"; then
+      echo "[+] LLM downloaded."
     else
-      echo "[!] LLM file missing after download: ${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}"
+      echo "[!] LLM download failed; place a GGUF later at $LLM_PATH"
     fi
   else
-    echo "[!] LLM download failed; place a GGUF later at $LLM_PATH"
+    echo "[*] LLM already present; skipping download."
+  fi
+
+  # Wire default symlink if file is there
+  if [[ -f "${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}" ]]; then
+    ln -sf "${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}" "$WHIFF_LLM_PATH_DEFAULT"
+    LLM_PATH="$WHIFF_LLM_PATH_DEFAULT"
+    echo "[+] LLM ready at $LLM_PATH"
+  else
+    echo "[!] LLM file missing after download: ${WHIFF_LLM_DIR}/${WHIFF_LLM_FILE}"
   fi
 
   echo "[*] Downloading embeddings (Snowflake Arctic-Embed-M-v2.0, minimal set) …"
   EMBED_DIR="$WHIFF_EMBED_DIR_DEFAULT"
+
   if ! check_free_gb /opt "$WHIFF_MIN_FREE_GB"; then
     echo "[!] Less than ${WHIFF_MIN_FREE_GB} GB free under /opt; using fallback embedder."
-    if hf_resilient_download "$WHIFF_EMBED_FALLBACK_REPO" "" "$WHIFF_EMBED_FALLBACK_DIR"; then
+    if hf_download "$WHIFF_EMBED_FALLBACK_REPO" "" "$WHIFF_EMBED_FALLBACK_DIR"; then
       EMBED_DIR="$WHIFF_EMBED_FALLBACK_DIR"
       echo "[+] Fallback embedder ready at $EMBED_DIR"
     else
       echo "[!] Fallback embedder failed to download; proceed without embeddings."
     fi
   else
-    if hf_resilient_download "$WHIFF_EMBED_REPO" "$WHIFF_EMBED_ALLOW" "$WHIFF_EMBED_DIR_DEFAULT"; then
+    # Primary Snowflake with allow-patterns for minimal download
+    mapfile -t allow_args < <(build_allow_args "$WHIFF_EMBED_ALLOW")
+    if hf_download "$WHIFF_EMBED_REPO" "" "$WHIFF_EMBED_DIR_DEFAULT" "${allow_args[@]}"; then
+      EMBED_DIR="$WHIFF_EMBED_DIR_DEFAULT"
       echo "[+] Snowflake embedder ready at $EMBED_DIR"
     else
       echo "[!] Snowflake download failed; attempting fallback embedder."
-      if hf_resilient_download "$WHIFF_EMBED_FALLBACK_REPO" "" "$WHIFF_EMBED_FALLBACK_DIR"; then
+      if hf_download "$WHIFF_EMBED_FALLBACK_REPO" "" "$WHIFF_EMBED_FALLBACK_DIR"; then
         EMBED_DIR="$WHIFF_EMBED_FALLBACK_DIR"
         echo "[+] Fallback embedder ready at $EMBED_DIR"
       else
