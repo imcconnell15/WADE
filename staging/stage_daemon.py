@@ -1,4 +1,30 @@
 #!/usr/bin/env python3
+"""
+WADE Staging Daemon – v2.3 (stability + dedupe race + env precedence + ops logging)
+
+v2.3 (this build)
+- Optional requests import (Whiff no longer crashes daemon if not installed)
+- Env precedence: environment variables override /etc/wade/wade.env
+- enqueue_work() stray brace removed
+- Content-dedupe race: catch UNIQUE(content_sig) IntegrityError post-move and treat as dup
+- Defrag temp dir: try /var/wade/tmp, fall back to system tmp
+- Unknowns quarantined to DataSources/Unknown to avoid infinite reprocessing
+- quick_content_sig() accepts size_hint to reduce extra stats
+- ETL hostname colocation retained from v2.2
+- Pre-move stat retained to avoid FileNotFoundError on moved src
+- NEW: Human-readable text logging to journald/stdout (toggle via WADE_TEXT_LOGS / WADE_TEXT_LOG_LEVEL)
+
+Kept (v2.2/v2.1):
+- Classifier registry and network-config detectors
+- VM disk & package detection (qcow2, vhdx, vmdk, vdi, vhd; ova/ovf)
+- Mountless OS hints (Linux/Windows/macOS)
+- E01 magic (EVF...) + ewfinfo acquisition date + target-info hostname
+- ETL guard so .etl is never considered memory
+- Inotify CLOSE_WRITE gating + size-stable + optional lsof writer check
+- Optional auto-defrag of fragmented E01 via ewfexport
+- Troubleshooting-friendly logs (file(1) one-liner + hex head)
+"""
+
 from __future__ import annotations
 
 import hashlib
