@@ -66,9 +66,6 @@ WINDOWS_DEFAULT_PLUGINS: List[str] = [
     "startupinfo.startupinfo",
 
     # User activity & artifacts
-    "browser.history",
-    "browser.downloads",
-    "browser.cookies",
     "lnk.lnk",
     "jumplist.automatic_destination",
     "jumplist.custom_destination",
@@ -79,6 +76,156 @@ WINDOWS_DEFAULT_PLUGINS: List[str] = [
     "log.evt.evt",
     "firewall.logs",
     "sru.application_timeline",
+
+    # Anti Virus
+    "mcafee.msc",
+    "sophos.hitmanlogs",
+    "sophos.sophoshomelogs",
+    "symantec.firewall",
+    "symantec.logs",
+    "trendmicro.wffirewall",
+    "trendmicro.wflogs",
+
+    # --- browsers ---
+    "brave.cookies",
+    "brave.downloads",
+    "brave.extensions",
+    "brave.history",
+    "brave.passwords",
+
+    "browser.cookies",
+    "browser.downloads",
+    "browser.extensions",
+    "browser.history",
+    "browser.passwords",
+
+    "chrome.cookies",
+    "chrome.downloads",
+    "chrome.extensions",
+    "chrome.history",
+    "chrome.passwords",
+
+    "chromium.cookies",
+    "chromium.downloads",
+    "chromium.extensions",
+    "chromium.history",
+    "chromium.passwords",
+
+    "edge.cookies",
+    "edge.downloads",
+    "edge.extensions",
+    "edge.history",
+    "edge.passwords",
+
+    "firefox.cookies",
+    "firefox.downloads",
+    "firefox.extensions",
+    "firefox.history",
+    "firefox.passwords",
+
+    "iexplore.downloads",
+    "iexplore.history",
+
+    # --- chat ---
+    "chat.history",
+    "msn.history",
+
+    # --- containers ---
+    "container.containers",
+    "container.images",
+    "container.logs",
+    "docker.containers",
+    "docker.images",
+    "docker.logs",
+    "podman.containers",
+    "podman.images",
+    "podman.logs",
+
+    # --- text editors ---
+    "editor.extensions",   # (appears twice; kept once)
+    "editor.history",
+    "editor.tabs",
+    "windowsnotepad.history",
+    "windowsnotepad.tabs",
+
+    # --- EDR / acquire / velociraptor results ---
+    "acquire.handles",
+    "acquire.hashes",
+    "velociraptor.results",
+
+    # --- misc "other" apps ---
+    "envfile",
+
+    # --- productivity / Office / archivers ---
+    "msoffice.native",
+    "msoffice.startup",
+    "msoffice.web",
+    "7zip",
+    "sevenzip",
+    "winrar",
+
+    # --- remote access / RMM ---
+    "anydesk.filetransfer",
+    "anydesk.logs",
+    "remoteaccess.filetransfer",
+    "remoteaccess.logs",
+    "rustdesk.logs",
+    "splashtop.filetransfer",
+    "splashtop.logs",
+    "teamviewer.logs",
+
+    # --- shells / CLI helpers ---
+    "powershell_history",
+    "wget.hsts",
+
+    # --- SSH / key material / sessions ---
+    "openssh.authorized_keys",
+    "openssh.known_hosts",
+    "openssh.private_keys",
+    "openssh.public_keys",
+
+    "opensshd.config",
+
+    "putty.known_hosts",
+    "putty.sessions",
+
+    "ssh.authorized_keys",
+    "ssh.config",
+    "ssh.known_hosts",
+    "ssh.private_keys",
+    "ssh.public_keys",
+    "ssh.sessions",
+
+    # --- virtualization clients / workstation side ---
+    "vmware.clipboard",
+    "vmware.config",
+    "vmware.draganddrop",
+
+    # --- VPN client configs ---
+    "openvpn.config",
+    "wireguard.config",
+
+    # --- hosting panels ---
+    "cpanel.lastlogin",
+
+    # --- webservers (app layer) ---
+    "apache.access",
+    "apache.error",
+    "apache.hosts",
+
+    "caddy.access",
+
+    "iis.access",
+    "iis.logs",
+
+    "nginx.access",
+    "nginx.error",
+    "nginx.hosts",
+
+    "webserver.access",
+    "webserver.error",
+    "webserver.hosts",
+    "webserver.logs",
 ]
 
 LINUX_DEFAULT_PLUGINS: List[str] = [
