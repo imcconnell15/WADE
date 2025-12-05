@@ -813,6 +813,7 @@ pkg_add inotify-tools
 pkg_add plocate
 pkg_add zip
 pkg_add unzip
+pkg_add ewf-tools
 pkg_add p7zip-full 'p7zip p7zip-plugins'
 # Python/venv/pip
 pkg_add python3-venv 'python3-virtualenv'
@@ -2631,7 +2632,7 @@ echo "    Solr (UI) : http://${IPV4}:${SOLR_PORT:-8983}/solr/#/~cloud"
 echo "    ActiveMQ  : ${IPV4}:${ACTIVEMQ_OPENWIRE_PORT:-61616} (web console :${ACTIVEMQ_WEB_CONSOLE_PORT:-8161})"
 echo "    Postgres  : ${IPV4}:${POSTGRES_PORT:-5432}"
 echo "    Barracuda : ${IPV4}:5000"
-echo "    WHIFF     : $( [[ "$WHIFF_ENABLE_EFF" = "1" ]] && echo "http://${WHIFF_BIND}:${WHIFF_PORT_EFF}" || echo "disabled" )"
+echo "    WHIFF     : $( [[ "$WHIFF_ENABLE_EFF" = "1" ]] && echo "http://${WHIFF_BIND}:${WHIFF_PORT}" || echo "disabled" )"
 echo "    Tools     : vol3, dissect, bulk_extractor, plaso (+ piranha, barracuda, hayabusa, whiff)"
 echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
 echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
