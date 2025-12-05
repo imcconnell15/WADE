@@ -165,9 +165,9 @@ collect_logs() {
     mkdir -p "${BUNDLE_ROOT}/logs/workers"
     cp -p "$WORKER_LOG_DIR"/* "${BUNDLE_ROOT}/logs/workers/" 2>/dev/null || true
   fi
-  if [[ -d "${WADE_VAR}/logs" ]]; then
-    mkdir -p "${BUNDLE_ROOT}/logs/var_wade"
-    cp -p "${WADE_VAR}/logs"/* "${BUNDLE_ROOT}/logs/var_wade/" 2>/dev/null || true
+  if [[ -d "/var/log/wade" ]]; then
+    mkdir -p "${BUNDLE_ROOT}/logs/install"
+    cp -p /var/log/wade/* "${BUNDLE_ROOT}/logs/install" 2>/dev/null || true
   fi
 }
 
@@ -252,19 +252,19 @@ collect_wade_layout() {
 
   {
     echo "## /var/wade"
-    [[ -d "$WADE_VAR" ]] && find "$WADE_VAR" -maxdepth 3 -mindepth 1 -type d || echo "no $WADE_VAR"
+    [[ -d "$WADE_VAR" ]] && find "$WADE_VAR" || echo "no $WADE_VAR"
   } >"${BUNDLE_ROOT}/wade/var_wade_tree.txt" 2>&1 || true
 
   {
     echo "## DataSources root"
     echo "WADE_DATADIR=$WADE_DATADIR"
-    [[ -d "$WADE_DATADIR" ]] && find "$WADE_DATADIR" -maxdepth 3 -mindepth 1 -type d || echo "no $WADE_DATADIR"
+    [[ -d "/home/$WADE_OWNER_USER/$WADE_DATADIR" ]] && find "/home/$WADE_OWNER_USER/$WADE_DATADIR" || echo "no $WADE_DATADIR"
   } >"${BUNDLE_ROOT}/wade/datasources_tree.txt" 2>&1 || true
 
   {
     echo "## Staging root"
     echo "WADE_STAGINGDIR=$WADE_STAGINGDIR"
-    [[ -d "$WADE_STAGINGDIR" ]] && find "$WADE_STAGINGDIR" -maxdepth 2 -mindepth 1 -type d || echo "no $WADE_STAGINGDIR"
+    [[ -d "/home/$WADE_OWNER_USER/$WADE_STAGINGDIR" ]] && find "/home/$WADE_OWNER_USER/$WADE_STAGINGDIR" || echo "no $WADE_STAGINGDIR"
   } >"${BUNDLE_ROOT}/wade/staging_tree.txt" 2>&1 || true
 }
 
