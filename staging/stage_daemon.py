@@ -639,14 +639,14 @@ def detect_memory_dump(p: Path) -> Optional[Dict[str, str]]:
     # 3) Volatility probes
     if VOL_PATH:
         # Windows
-        rc, out, err = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=120)
+        rc, out, err = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=300)
         if rc == 0:
             # Look for core fields that only show up on a valid Windows memory layer
             if ("NtSystemRoot" in out) or ("Kernel Base" in out) or re.search(r"\bwindows\b", out, re.IGNORECASE):
                 return {"kind": "raw", "evidence": "volatility windows.info"}
 
         # Linux
-        rc, out, err = run_cmd([VOL_PATH, "-f", str(p), "linux.banner.Banner"], timeout=120)
+        rc, out, err = run_cmd([VOL_PATH, "-f", str(p), "linux.banner.Banner"], timeout=300)
         if rc == 0 and ("Linux version" in out or "Linux" in out):
             return {"kind": "raw", "evidence": "volatility linux.banner"}
 
