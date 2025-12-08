@@ -2,7 +2,10 @@
 """
 WADE Staging Daemon – v2.3 (stability + dedupe race + env precedence + ops logging)
 
-v2.3 (this build)
+v2.4 (Current):
+- Adjsuted memory image detection
+
+Kept (v2.3):
 - Optional requests import (Whiff no longer crashes daemon if not installed)
 - Env precedence: environment variables override /etc/wade/wade.env
 - enqueue_work() stray brace removed
@@ -612,45 +615,44 @@ def detect_memory_dump(p: Path) -> Optional[Dict[str, str]]:
       2) Size gate for "raw" dumps (MEM_MIN_BYTES).
       3) Volatility probe (preferred when available).
       4) Filename hints (name_looks_memory) as a fallback for big files.
+
+    NOTE: This is intentionally *content-first*. We do not rely on the filename,
+    and we treat a successful Volatility probe as authoritative even when the
+    extension or file(1) string is misleading (e.g. ETL-based captures).
     """
-    # 1) Cheap magic checks first (hiberfil / LiME)
-    head = read_head_once(p, max(HEAD_SCAN_BYTES, 4096))
-    if head[:4] in (b"HIBR", b"Hibr", b"hibr"):
-        return {"kind": "hibernation", "evidence": "HIBR magic"}
-    if head[:4] == b"LiME":
-        return {"kind": "lime", "evidence": "LiME magic"}
+    # 1) Header magic
+    head = read_head_once(p, 4096)
+    size = p.stat().st_size
 
-    # 2) Size + filename hints
-    try:
-        size = p.stat().st_size
-    except FileNotFoundError:
+    # Windows hibernation file
+    if head.startswith(b"HIBR"):
+        return {"kind": "hiber", "evidence": "HIBR magic"}
+
+    # LiME header (Linux Memory Extractor)
+    if b"Lime" in head[:4096]:
+        return {"kind": "lime", "evidence": "LiME header"}
+
+    # 2) Size gate: very small files are almost never full dumps
+    if size < MEM_MIN_BYTES and not name_looks_memory(p):
         return None
 
-    looks_mem = name_looks_memory(p)
+    # 3) Volatility probes
+    if VOL_PATH:
+        # Windows
+        rc, out, err = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=120)
+        if rc == 0:
+            # Look for core fields that only show up on a valid Windows memory layer
+            if ("NtSystemRoot" in out) or ("Kernel Base" in out) or re.search(r"\bwindows\b", out, re.IGNORECASE):
+                return {"kind": "raw", "evidence": "volatility windows.info"}
 
-    # Too small for a normal RAM image and no strong magic: bail
-    if size < MEM_MIN_BYTES and not looks_mem:
-        return None
+        # Linux
+        rc, out, err = run_cmd([VOL_PATH, "-f", str(p), "linux.banner.Banner"], timeout=120)
+        if rc == 0 and ("Linux version" in out or "Linux" in out):
+            return {"kind": "raw", "evidence": "volatility linux.banner"}
 
-    # 3) If we don't have Volatility, fall back to filename hints for big files
-    if not VOL_PATH:
-        if looks_mem and size >= MEM_MIN_BYTES:
-            return {"kind": "raw", "evidence": "filename hint (no volatility available)"}
-        return None
-
-    # 3a) Try Windows first
-    rc, out, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=60)
-    if rc == 0 and ("Image" in out or "Windows" in out):
-        return {"kind": "raw", "evidence": "volatility windows.info"}
-
-    # 3b) Fallback: quick Linux probe
-    rc2, out2, _ = run_cmd([VOL_PATH, "-f", str(p), "linux.uname.Uname"], timeout=60)
-    if rc2 == 0 and "Linux version" in out2:
-        return {"kind": "raw", "evidence": "volatility linux.uname"}
-
-    # 4) Volatility couldn't parse it, but it looks like memory by name and size
-    if looks_mem and size >= MEM_MIN_BYTES:
-        return {"kind": "raw", "evidence": "filename hint (volatility did not recognize)"}
+    # 4) Fallback: big file + name smells like memory
+    if name_looks_memory(p):
+        return {"kind": "raw", "evidence": "filename_hint"}
 
     return None
 
