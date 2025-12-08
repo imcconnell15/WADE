@@ -4,6 +4,8 @@ WADE Staging Daemon – v2.3 (stability + dedupe race + env precedence + ops log
 
 v2.4 (Current):
 - Adjsuted memory image detection
+- recursion logic added
+- profile detection adjusted
 
 Kept (v2.3):
 - Optional requests import (Whiff no longer crashes daemon if not installed)
@@ -1458,6 +1460,81 @@ def iter_files(dir_: Path) -> Iterable[Path]:
                 yield p
         return
 
+def detect_profile(path: Path, full_root: Path, light_root: Path) -> str:
+    """
+    Decide which staging profile to use for a given path based on its location.
+
+    - Any file under <Staging>/full  -> 'full'
+    - Any file under <Staging>/light -> 'light'
+    - Fallback: 'full' as a safe default.
+    """
+    try:
+        path.relative_to(full_root)
+        return "full"
+    except ValueError:
+        pass
+
+    try:
+        path.relative_to(light_root)
+        return "light"
+    except ValueError:
+        pass
+
+    # Defensive default if the path somehow isn't under either tree
+    return "full"
+
+
+def scan_backlog_now(
+    conn: sqlite3.Connection,
+    full_root: Path,
+    light_root: Path,
+    datasources: Path,
+    queue_root: Path,
+    owner: str,
+) -> None:
+    """
+    One-time pass over any files that were present in the staging trees
+    before the daemon started (the 'backlog').
+
+    This honours WADE_STAGE_RECURSIVE via iter_files().
+    """
+    start = time.time()
+    candidates = 0
+
+    json_log(
+        "backlog_scan_start",
+        full_root=str(full_root),
+        light_root=str(light_root),
+        recursive=WADE_STAGE_RECURSIVE,
+    )
+    log.info(
+        "backlog scan starting (recursive=%s)…",
+        "on" if WADE_STAGE_RECURSIVE else "off",
+    )
+
+    for root, prof in ((full_root, "full"), (light_root, "light")):
+        if not root.exists():
+            continue
+        for p in iter_files(root):
+            candidates += 1
+            try:
+                process_one(conn, p, datasources, prof, owner, queue_root)
+            except Exception as exc:
+                # process_one already logs rich details; keep going
+                log.error("backlog processing error for %s: %s", p, exc)
+
+    duration = time.time() - start
+    json_log(
+        "backlog_scan_complete",
+        total_candidates=candidates,
+        duration_seconds=round(duration, 3),
+    )
+    log.info(
+        "backlog scan complete: candidates=%d in %.2fs",
+        candidates,
+        duration,
+    )
+
     # Recursive walk
     for root, dirs, files in os.walk(dir_):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -1478,7 +1555,11 @@ def polling_loop(conn, full, light, datasources, queue_root, owner):
 
 def inotify_loop(conn, full, light, datasources, queue_root, owner):
     inotify = INotify()
-    base_flags = flags.CLOSE_WRITE if REQUIRE_CLOSE_WRITE else (flags.CLOSE_WRITE | flags.MOVED_TO | flags.CREATE)
+    base_flags = (
+        flags.CLOSE_WRITE
+        if REQUIRE_CLOSE_WRITE
+        else (flags.CLOSE_WRITE | flags.MOVED_TO | flags.CREATE)
+    )
     dir_flags = base_flags | flags.MOVED_TO | flags.CREATE  # for new files/dirs
     watch_map: Dict[int, Path] = {}
 
@@ -1523,30 +1604,40 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
                 continue
 
             # Only proceed on files
-            if path.is_file():
-                # extra debounce: ensure stable + no writers
-                if not wait_stable(path, STABLE_SECONDS):
-                    continue
-                if not no_open_writers(path):
-                    continue
+            if not path.is_file():
+                continue
 
-                prof = "full" if parent == full else "light"
-                process_one(conn, path, datasources, prof, owner, queue_root)
+            # Extra debounce: ensure stable + no writers
+            if not wait_stable(path, STABLE_SECONDS):
+                continue
+            if not no_open_writers(path):
+                continue
+
+            # NEW: profile detection based on path location, not just the parent dir
+            prof = detect_profile(path, full, light)
+            process_one(conn, path, datasources, prof, owner, queue_root)
 
 def main() -> None:
     owner, stage_full, stage_light, datasources, queue_root = build_paths()
     # Init ops logging (text)
     setup_logging(os.uname().nodename)
     conn = init_db()
-    def _sig(*_): sys.exit(0)
+
+    def _sig(*_):
+        sys.exit(0)
+
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
     log.info("WADE staging daemon starting…")
+
     try:
         if INOTIFY_AVAILABLE:
+            # One-time pass for anything already sitting in Staging
+            scan_backlog_now(conn, stage_full, stage_light, datasources, queue_root, owner)
             inotify_loop(conn, stage_full, stage_light, datasources, queue_root, owner)
         else:
+            # Polling loop inherently re-scans, so no special backlog pass needed
             polling_loop(conn, stage_full, stage_light, datasources, queue_root, owner)
     finally:
         conn.close()
