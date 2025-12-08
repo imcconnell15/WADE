@@ -4,8 +4,6 @@ WADE Staging Daemon – v2.3 (stability + dedupe race + env precedence + ops log
 
 v2.4 (Current):
 - Adjsuted memory image detection
-- recursion logic added
-- profile detection adjusted
 
 Kept (v2.3):
 - Optional requests import (Whiff no longer crashes daemon if not installed)
@@ -1011,12 +1009,17 @@ def append_fragment_note(details: Dict[str, Any], dest: Path) -> None:
 # -----------------------------
 # Auto-defrag (optional)
 # -----------------------------
+
 def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[Path]:
-    if not EWFEXPORT_PATH or not EWFINFO_PATH:
+    ewfinfo_path, ewfexport_path = resolve_ewf_tools()
+    if not ewfexport_path or not ewfinfo_path:
         json_log("defrag_skip", reason="ewfexport/ewfinfo missing", src=str(src))
         log.info("defrag skip (tools missing): %s", src)
         return None
+
     frag_info = e01_fragmentation(src)
+    base = src.with_suffix("")
+    parts = frag_info.get("parts") or []
     if not frag_info.get("fragmented"):
         return None
 
@@ -1045,7 +1048,7 @@ def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[
     with tempfile.TemporaryDirectory(dir=base_tmpdir) as tmpdir:
         tmp = Path(tmpdir)
         merged_base = tmp / f"{src.stem}_merged"
-        cmd = [EWFEXPORT_PATH, "-t", str(merged_base), "-f", "ewf"] + [str(x) for x in all_parts]
+        cmd = [ewfexport_path, "-t", str(merged_base), "-f", "ewf"] + [str(x) for x in all_parts]
         start = time.time()
         rc, out, err = run_cmd(cmd, timeout=3600)
         merged_e01 = merged_base.with_suffix(".E01")
@@ -1053,7 +1056,7 @@ def defragment_e01_fragments(src: Path, dest_dir: Path, owner: str) -> Optional[
             json_log("defrag_failed", src=str(src), rc=rc, error=err, duration=round(time.time()-start, 2))
             log.error("defrag failed rc=%s src=%s err=%s", rc, src, err.strip() if err else "")
             return None
-        rc2, _, _ = run_cmd([EWFINFO_PATH, str(merged_e01)], timeout=30)
+        rc2, _, _ = run_cmd([ewfinfo_path, str(merged_e01)], timeout=30)
         if rc2 != 0:
             json_log("defrag_verify_failed", src=str(src))
             log.error("defrag verify failed: %s", src)
@@ -1621,6 +1624,12 @@ def main() -> None:
     owner, stage_full, stage_light, datasources, queue_root = build_paths()
     # Init ops logging (text)
     setup_logging(os.uname().nodename)
+    # Resolve and log EWF tool availability once at startup
+    ewfinfo_path, ewfexport_path = resolve_ewf_tools()
+    log.info("EWF tools: ewfinfo=%s ewfexport=%s",
+             ewfinfo_path or "MISSING",
+             ewfexport_path or "MISSING")
+
     conn = init_db()
 
     def _sig(*_):
