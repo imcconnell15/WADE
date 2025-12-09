@@ -258,6 +258,20 @@ def extract_text_snippet(p: Path, max_bytes: int = 512*1024) -> str:
     except Exception:
         return ""
 
+def resolve_ewf_tools() -> Tuple[Optional[str], Optional[str]]:
+    """
+    (Re)discover ewfinfo/ewfexport at runtime.
+
+    We don't want to require a daemon restart if you install ewf-tools
+    after WADE is already running, so this lazily populates the globals.
+    """
+    global EWFINFO_PATH, EWFEXPORT_PATH
+    if not EWFINFO_PATH:
+        EWFINFO_PATH = which("ewfinfo")
+    if not EWFEXPORT_PATH:
+        EWFEXPORT_PATH = which("ewfexport")
+    return EWFINFO_PATH, EWFEXPORT_PATH
+
 # -----------------------------
 # I/O
 # -----------------------------
