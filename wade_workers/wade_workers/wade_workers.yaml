@@ -1,0 +1,12 @@
+# Default WADE worker config (safe, minimal)
+volatility:
+  modules:
+    - windows.info
+    - windows.pslist
+    - windows.pstree
+    - windows.cmdline
+    - windows.netscan
+    - windows.handles
+    - windows.dlllist
+    - windows.services
+    - windows.malfind
