@@ -630,44 +630,116 @@ def detect_memory_dump(p: Path) -> Optional[Dict[str, str]]:
       3) Volatility probe (preferred when available).
       4) Filename hints (name_looks_memory) as a fallback for big files.
 
-    NOTE: This is intentionally *content-first*. We do not rely on the filename,
-    and we treat a successful Volatility probe as authoritative even when the
-    extension or file(1) string is misleading (e.g. ETL-based captures).
+    NOTE: We *want* Volatility to be authoritative here. If it works from the
+    shell but fails here, the json logs should make that obvious.
     """
-    # 1) Header magic
-    head = read_head_once(p, 4096)
-    size = p.stat().st_size
-
-    # Windows hibernation file
-    if head.startswith(b"HIBR"):
-        return {"kind": "hiber", "evidence": "HIBR magic"}
-
-    # LiME header (Linux Memory Extractor)
-    if b"Lime" in head[:4096]:
-        return {"kind": "lime", "evidence": "LiME header"}
-
-    # 2) Size gate: very small files are almost never full dumps
-    if size < MEM_MIN_BYTES and not name_looks_memory(p):
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        json_log("mem_detect_stat_failed", src=str(p), error=str(e))
+        log.debug("mem_detect: stat failed for %s: %s", p, e)
         return None
 
-    # 3) Volatility probes
+    head = read_head_once(p, 4096)
+    json_log("mem_detect_start", src=str(p), size_bytes=size)
+    log.debug("mem_detect_start %s size=%d", p, size)
+
+    # 1) Strong header magic
+    if head.startswith(b"HIBR"):
+        json_log("mem_detect_hiber_magic", src=str(p), evidence="HIBR")
+        log.debug("mem_detect: HIBR magic for %s", p)
+        return {"kind": "hiber", "evidence": "HIBR magic"}
+
+    if head[:64].startswith(b"LIME") or b"Lime" in head[:256]:
+        json_log("mem_detect_lime_magic", src=str(p), evidence="LiME header")
+        log.debug("mem_detect: LiME magic for %s", p)
+        return {"kind": "lime", "evidence": "LiME header"}
+
+    # 2) Size gate: tiny files are almost never full dumps unless name screams "memory"
+    name_hint = name_looks_memory(p)
+    if size < MEM_MIN_BYTES and not name_hint:
+        json_log("mem_detect_too_small", src=str(p),
+                 size_bytes=size, mem_min_bytes=MEM_MIN_BYTES,
+                 name_looks_memory=False)
+        log.debug("mem_detect: too small and no name hint (%s)", p)
+        return None
+
+    # 3) Volatility probe (Windows + Linux). This is our main authoritative check.
     if VOL_PATH:
-        # Windows
-        rc, out, err = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=300)
+        json_log("mem_detect_vol_try_windows",
+                 src=str(p), vol_path=VOL_PATH,
+                 plugin="windows.info.Info")
+        log.debug("mem_detect: running vol for windows.info.Info on %s", p)
+
+        rc, out, err = run_cmd([VOL_PATH, "-q", "-f", str(p), "windows.info.Info"], timeout=300)
+
+        json_log("mem_detect_vol_windows_result",
+                 src=str(p), rc=rc,
+                 stdout_preview=out[:200],
+                 stderr_preview=err[:200])
+        log.debug("mem_detect: windows.info.Info rc=%s len(out)=%d len(err)=%d",
+                  rc, len(out), len(err))
+
+        windows_match = False
         if rc == 0:
             # Look for core fields that only show up on a valid Windows memory layer
             if ("NtSystemRoot" in out) or ("Kernel Base" in out) or re.search(r"\bwindows\b", out, re.IGNORECASE):
-                return {"kind": "raw", "evidence": "volatility windows.info"}
+                windows_match = True
 
-        # Linux
-        rc, out, err = run_cmd([VOL_PATH, "-f", str(p), "linux.banner.Banner"], timeout=300)
-        if rc == 0 and ("Linux version" in out or "Linux" in out):
-            return {"kind": "raw", "evidence": "volatility linux.banner"}
+        json_log("mem_detect_vol_windows_parsed",
+                 src=str(p), rc=rc, windows_match=windows_match)
+
+        if rc == 0 and windows_match:
+            return {"kind": "raw", "evidence": "volatility windows.info.Info"}
+
+        if rc != 0:
+            json_log("mem_detect_vol_windows_failed",
+                     src=str(p), rc=rc, stderr_preview=err[:500])
+            log.debug("mem_detect: windows.info.Info failed rc=%s on %s", rc, p)
+
+        # Try Linux as a fallback
+        json_log("mem_detect_vol_try_linux",
+                 src=str(p), vol_path=VOL_PATH,
+                 plugin="linux.banner.Banner")
+        log.debug("mem_detect: running vol for linux.banner.Banner on %s", p)
+
+        rc2, out2, err2 = run_cmd([VOL_PATH, "-q", "-f", str(p), "linux.banner.Banner"], timeout=300)
+
+        json_log("mem_detect_vol_linux_result",
+                 src=str(p), rc=rc2,
+                 stdout_preview=out2[:200],
+                 stderr_preview=err2[:200])
+        log.debug("mem_detect: linux.banner.Banner rc=%s len(out)=%d len(err)=%d",
+                  rc2, len(out2), len(err2))
+
+        linux_match = False
+        if rc2 == 0 and ("Linux version" in out2 or "Linux" in out2):
+            linux_match = True
+
+        json_log("mem_detect_vol_linux_parsed",
+                 src=str(p), rc=rc2, linux_match=linux_match)
+
+        if rc2 == 0 and linux_match:
+            return {"kind": "raw", "evidence": "volatility linux.banner.Banner"}
+
+        if rc2 != 0:
+            json_log("mem_detect_vol_linux_failed",
+                     src=str(p), rc=rc2, stderr_preview=err2[:500])
+            log.debug("mem_detect: linux.banner.Banner failed rc=%s on %s", rc2, p)
+    else:
+        json_log("mem_detect_no_vol_path", src=str(p))
+        log.debug("mem_detect: VOL_PATH not set; skipping vol probe for %s", p)
 
     # 4) Fallback: big file + name smells like memory
-    if name_looks_memory(p):
+    if name_hint:
+        json_log("mem_detect_name_fallback", src=str(p),
+                 reason="name_looks_memory", filename=p.name)
+        log.debug("mem_detect: name-based fallback for %s", p)
         return {"kind": "raw", "evidence": "filename_hint"}
 
+    # Nothing matched
+    json_log("mem_detect_no_match", src=str(p))
+    log.debug("mem_detect: no match for %s", p)
     return None
 
 def best_effort_mem_meta(p: Path) -> Tuple[Optional[str], Optional[str]]:
@@ -689,7 +761,7 @@ def best_effort_mem_meta(p: Path) -> Tuple[Optional[str], Optional[str]]:
                         host = m.group(1)
                 break
     # Date (very rough)
-    rc3, out3, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=60)
+    rc3, out3, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.info"], timeout=60)
     date = None
     if rc3 == 0:
         m = re.search(r"(\d{4}-\d{2}-\d{2})", out3)
@@ -699,23 +771,45 @@ def best_effort_mem_meta(p: Path) -> Tuple[Optional[str], Optional[str]]:
 
 @register_classifier
 def classify_memory(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
+    json_log("mem_classify_start", src=str(p))
+    log.debug("mem_classify_start %s", p)
+
     sig = detect_memory_dump(p)
     if not sig:
+        json_log("mem_classify_not_memory", src=str(p))
+        log.debug("mem_classify: detect_memory_dump says 'not memory' for %s", p)
         return "", {}
+
+    json_log("mem_classify_sig", src=str(p), mem_signature=sig)
+    log.debug("mem_classify: signature %s for %s", sig, p)
 
     hostname = p.stem
     date_col = ymd_from_mtime(p)
-    meta = {
+    meta: Dict[str, Any] = {
         "hostname": hostname,
         "date_collected": date_col,
         "mem_signature": sig,
     }
 
     if not VOL_PATH:
+        json_log("mem_classify_no_vol_path", src=str(p))
+        log.debug("mem_classify: VOL_PATH not set; returning basic mem meta for %s", p)
+        meta["confidence"] = 0
         return "mem", meta
 
     # Try Windows first
-    rc, out, _ = run_cmd([VOL_PATH, "-f", str(p), "windows.info.Info"], timeout=90)
+    json_log("mem_classify_vol_windows_try", src=str(p), vol_path=VOL_PATH,
+             plugin="windows.info.Info")
+    log.debug("mem_classify: running vol windows.info.Info for %s", p)
+
+    rc, out, err = run_cmd([VOL_PATH, "-q", "-f", str(p), "windows.info.Info"], timeout=90)
+    json_log("mem_classify_vol_windows_result",
+             src=str(p), rc=rc,
+             stdout_preview=out[:200],
+             stderr_preview=err[:200])
+    log.debug("mem_classify: windows.info.Info rc=%s len(out)=%d len(err)=%d",
+              rc, len(out), len(err))
+
     score = 0
     if rc == 0:
         m_ver = re.search(r"Image\s+version:\s+([\d.]+)", out)
@@ -724,28 +818,84 @@ def classify_memory(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
         m_arch = re.search(r"Architecture:\s+(\w+)", out)
 
         if m_ver:
-            meta["os"] = "Windows"; meta["version"] = m_ver.group(1); score += 30
+            meta["os"] = "Windows"
+            meta["version"] = m_ver.group(1)
+            score += 30
         if m_build:
-            meta["build"] = m_build.group(1); score += 25
+            meta["build"] = m_build.group(1)
+            score += 25
         if m_ed:
             edition = m_ed.group(1).lower()
-            meta["edition"] = "Server" if "server" in edition else "Workstation"; score += 20
+            meta["edition"] = "Server" if "server" in edition else "Workstation"
+            score += 20
         if m_arch:
-            meta["arch"] = m_arch.group(1); score += 15
+            meta["arch"] = m_arch.group(1)
+            score += 15
 
+        json_log("mem_classify_vol_windows_parsed",
+                 src=str(p),
+                 parsed_os=meta.get("os"),
+                 version=meta.get("version"),
+                 build=meta.get("build"),
+                 edition=meta.get("edition"),
+                 arch=meta.get("arch"),
+                 score_increment=score)
+
+        # Try to refine hostname + date
         h, d = best_effort_mem_meta(p)
-        if h: meta["hostname"] = h; score += 10
-        if d: meta["date_collected"] = d
+        if h:
+            meta["hostname"] = h
+            score += 10
+        if d:
+            meta["date_collected"] = d
+
+        json_log("mem_classify_vol_windows_enriched",
+                 src=str(p),
+                 hostname=meta.get("hostname"),
+                 date_collected=meta.get("date_collected"),
+                 score=score)
+        log.debug("mem_classify: windows info meta=%s score=%d for %s", meta, score, p)
     else:
-        # Try Linux
-        rc2, out2, _ = run_cmd([VOL_PATH, "-f", str(p), "linux.uname.Uname"], timeout=60)
+        # Windows failed – try Linux
+        json_log("mem_classify_vol_linux_try", src=str(p), vol_path=VOL_PATH,
+                 plugin="linux.uname.Uname", previous_rc=rc)
+        log.debug("mem_classify: windows.info.Info failed rc=%s; trying linux.uname.Uname for %s", rc, p)
+
+        rc2, out2, err2 = run_cmd([VOL_PATH, "-q", "-f", str(p), "linux.uname.Uname"], timeout=60)
+        json_log("mem_classify_vol_linux_result",
+                 src=str(p), rc=rc2,
+                 stdout_preview=out2[:200],
+                 stderr_preview=err2[:200])
+        log.debug("mem_classify: linux.uname.Uname rc=%s len(out)=%d len(err)=%d",
+                  rc2, len(out2), len(err2))
+
         if rc2 == 0 and "Linux version" in out2:
-            meta["os"] = "Linux"; score += 30
+            meta["os"] = "Linux"
+            score += 30
             m_kern = re.search(r"Linux version ([^\s]+)", out2)
             if m_kern:
-                meta["kernel"] = m_kern.group(1); score += 25
+                meta["kernel"] = m_kern.group(1)
+                score += 25
+
+            json_log("mem_classify_vol_linux_parsed",
+                     src=str(p),
+                     parsed_os=meta.get("os"),
+                     kernel=meta.get("kernel"),
+                     score=score)
+            log.debug("mem_classify: linux uname meta=%s score=%d for %s", meta, score, p)
+        else:
+            json_log("mem_classify_vol_linux_failed",
+                     src=str(p), rc=rc2, stderr_preview=err2[:500])
+            log.debug("mem_classify: linux uname failed rc=%s for %s", rc2, p)
 
     meta["confidence"] = min(100, score)
+    json_log("mem_classify_done",
+             src=str(p),
+             classification="mem",
+             confidence=meta.get("confidence", 0),
+             os=meta.get("os"))
+    log.debug("mem_classify_done %s meta=%s", p, meta)
+
     return "mem", meta
 
 # -----------------------------
@@ -1471,11 +1621,24 @@ def build_paths() -> Tuple[str, Path, Path, Path, Path]:
 def iter_files(dir_: Path) -> Iterable[Path]:
     """Yield candidate files (skip temp-ish) from dir_. Recursive when enabled."""
     skip_suffixes = (".part", ".tmp", ".crdownload")
+
+    # Non-recursive: just list immediate children
     if not WADE_STAGE_RECURSIVE:
         for p in dir_.iterdir():
             if p.is_file() and not p.name.lower().endswith(skip_suffixes):
                 yield p
         return
+
+    # Recursive walk
+    for root, dirs, files in os.walk(dir_):
+        # Skip hidden directories like .git, .DS_Store, etc.
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.lower().endswith(skip_suffixes):
+                continue
+            p = Path(root) / name
+            if p.is_file():
+                yield p
 
 def detect_profile(path: Path, full_root: Path, light_root: Path) -> str:
     """
@@ -1552,22 +1715,23 @@ def scan_backlog_now(
         duration,
     )
 
-    # Recursive walk
-    for root, dirs, files in os.walk(dir_):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        for name in files:
-            if name.lower().endswith(skip_suffixes):
-                continue
-            p = Path(root) / name
-            if p.is_file():
-                yield p
-
 def polling_loop(conn, full, light, datasources, queue_root, owner):
-    log.info("polling mode – scanning every %ss", SCAN_INTERVAL_SEC)
+    log.info(
+        "polling mode – scanning every %ss (recursive=%s)",
+        SCAN_INTERVAL_SEC,
+        WADE_STAGE_RECURSIVE,
+    )
     while True:
+        log.debug("poll tick: scanning staging roots")
         for directory, prof in ((full, "full"), (light, "light")):
+            if not directory.exists():
+                continue
             for p in iter_files(directory):
-                process_one(conn, p, datasources, prof, owner, queue_root)
+                try:
+                    process_one(conn, p, datasources, prof, owner, queue_root)
+                except Exception as exc:
+                    # process_one already logs details; keep the loop alive
+                    log.error("polling loop error for %s: %s", p, exc)
         time.sleep(SCAN_INTERVAL_SEC)
 
 def inotify_loop(conn, full, light, datasources, queue_root, owner):
@@ -1585,6 +1749,7 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
             return None
         wd = inotify.add_watch(str(d), dir_flags)
         watch_map[wd] = d
+        log.debug("inotify: watching %s (wd=%s)", d, wd)
         return wd
 
     def add_tree(root: Path):
@@ -1597,7 +1762,12 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
     add_tree(full)
     add_tree(light)
 
-    log.info("inotify mode – recursive=%s", "on" if WADE_STAGE_RECURSIVE else "off")
+    log.info(
+        "inotify mode – recursive=%s (require_close_write=%s, verify_no_writers=%s)",
+        "on" if WADE_STAGE_RECURSIVE else "off",
+        REQUIRE_CLOSE_WRITE,
+        VERIFY_NO_WRITERS,
+    )
 
     while True:
         for ev in inotify.read(timeout=1000):
@@ -1608,6 +1778,8 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
             if not name:
                 continue
             path = parent / name
+
+            log.debug("inotify event: mask=%s path=%s", ev.mask, path)
 
             # If a directory appears and recursion is enabled, start watching it
             if WADE_STAGE_RECURSIVE and (ev.mask & flags.ISDIR):
@@ -1632,7 +1804,10 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
 
             # NEW: profile detection based on path location, not just the parent dir
             prof = detect_profile(path, full, light)
-            process_one(conn, path, datasources, prof, owner, queue_root)
+            try:
+                process_one(conn, path, datasources, prof, owner, queue_root)
+            except Exception as exc:
+                log.error("inotify loop error for %s: %s", path, exc)
 
 def main() -> None:
     owner, stage_full, stage_light, datasources, queue_root = build_paths()
