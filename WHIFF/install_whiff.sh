@@ -478,7 +478,7 @@ def main(root="docs_ingest"):
     for f in glob.glob(f"{root}/**/*", recursive=True):
         p=Path(f)
         if not p.is_file(): continue
-        text=load_text(p).strip()
+        text=load_text(p).replace("\\x00","").strip()
         if not text or len(text) < 200:
             continue
         tool, version, license_ = infer_meta(p)
@@ -606,7 +606,7 @@ CREATE TABLE IF NOT EXISTS sage_docs (
   chunk TEXT NOT NULL,
   chunk_hash TEXT NOT NULL,
   meta JSONB,
-  embedding VECTOR(768)
+  embedding VECTOR(384)
 );
 CREATE INDEX IF NOT EXISTS ix_docs_vec ON sage_docs
 USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
@@ -1055,6 +1055,7 @@ fi
 #####################################
 if [[ "$SEED_BASELINE_DOCS" == "1" ]]; then
   /opt/whiff/scripts/whiff-seed-docs.sh || echo "[!] Seed encountered errors; continuing."
+  WHIFF_DB_DSN="${DB_DSN}" /opt/whiff/.venv/bin/python /opt/whiff/whiff_index.py /opt/whiff/docs_ingest
 fi
 
 #####################################
