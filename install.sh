@@ -54,10 +54,12 @@ ________          __           ___________         __                        __ 
         \/     \/          \/          \/      \/                  \/     \/                    \/ ]
 WADE_BANNER
 
+#Speed hack: disable man-db auto-update (can add ~1hr on some installs)
+rm -f /var/lib/man-db/auto-update 2>/dev/null || true
+
 #####################################
 # Script location & STIG source dir
 #####################################
-rm /var/lib/man-db/auto-update
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)"
 STIG_SRC_DIR="${SCRIPT_DIR}/stigs"
 SPLUNK_SRC_DIR="${SCRIPT_DIR}"
@@ -338,6 +340,12 @@ run_step(){
 # Version detectors (best-effort)
 #####################################
 get_ver_be(){ /usr/local/bin/bulk_extractor -V 2>&1 | grep -Eo '[0-9]+(\.[0-9]+)*' | head -1 || true; }
+get_ver_bulk_extractor_step(){
+  # Prefer WADE's step marker (repo vs git ref). Fall back to binary version if needed.
+  local m; m="$(get_mark_ver bulk_extractor)"
+  [[ -n "$m" ]] && { echo "$m"; return; }
+  get_ver_be
+}
 get_ver_hayabusa(){
   local bin="${HAYABUSA_DEST:-/usr/local/bin/hayabusa}"
   [[ -x "$bin" ]] || { echo ""; return; }
@@ -349,7 +357,34 @@ get_ver_hayabusa(){
 get_ver_solr(){ /opt/solr/bin/solr -version 2>/dev/null | awk '{print $2}' || true; }
 get_ver_zk(){ [[ -x /opt/zookeeper/bin/zkServer.sh ]] && ls /opt/zookeeper/lib/* 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo ""; }
 get_ver_amq(){ /opt/activemq/bin/activemq --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9.]+' | head -1 || true; }
-get_ver_pg(){ psql -V 2>/dev/null | awk '{print $3}' || true; }
+get_ver_pg(){
+  # This step is about "configured", not "installed version".
+  command -v psql >/dev/null 2>&1 || { echo ""; return; }
+
+  # On RPM-based distros we don't currently tune the conf here; treat "psql exists" as configured.
+  if [[ "${PM:-}" != "apt" ]]; then
+    echo "configured"
+    return
+  fi
+
+  local pgver pgdir conf
+  pgver="$(psql -V 2>/dev/null | awk '{print $3}' | cut -d. -f1)"
+  pgdir="/etc/postgresql/${pgver}/main"
+  conf="${pgdir}/postgresql.conf"
+  [[ -f "$conf" ]] || { echo ""; return; }
+
+  : "${PG_LISTEN_ADDR:=0.0.0.0}"
+  : "${PG_PERF_FSYNC:=off}"
+  : "${PG_PERF_SYNCCOMMIT:=off}"
+  : "${PG_PERF_FULLPAGE:=off}"
+
+  grep -Eq "^\s*listen_addresses\s*=\s*'${PG_LISTEN_ADDR}'\s*$" "$conf" || { echo ""; return; }
+  grep -Eq "^\s*fsync\s*=\s*${PG_PERF_FSYNC}\s*$" "$conf" || { echo ""; return; }
+  grep -Eq "^\s*synchronous_commit\s*=\s*${PG_PERF_SYNCCOMMIT}\s*$" "$conf" || { echo ""; return; }
+  grep -Eq "^\s*full_page_writes\s*=\s*${PG_PERF_FULLPAGE}\s*$" "$conf" || { echo ""; return; }
+
+  echo "configured"
+}
 get_ver_pipx_vol3(){ pipx list 2>/dev/null | awk '/package volatility3 /{print $3}' | tr -d '()' || true; }
 get_ver_pipx_dissect(){ pipx list 2>/dev/null | awk '/package dissect /{print $3}' | tr -d '()' || true; }
 get_ver_qtgl(){ dpkg -s libegl1 >/dev/null 2>&1 && echo present || echo ""; }  # apt branch only
@@ -703,7 +738,7 @@ DB_HOST=127.0.0.1
 DB_PORT=5432
 DB_NAME=whiff
 DB_USER=whiff
-DB_PASS=CHANGE_ME
+DB_PASS=
 
 # Whiff API
 WHIFF_BIND=127.0.0.1
@@ -1456,8 +1491,10 @@ exec vol \
   "$@"
 EOF
   chmod 0755 /usr/local/bin/vol3
+  cp /var/wade/vol3/symbols/* /opt/pipx/venvs/volatility3/lib/python3.12/site-packages/volatility3/symbols/
 
-  echo "$(date -Iseconds)" > "${STEPS_DIR}/vol3-runtime.ver"
+
+  echo "ready" > "${STEPS_DIR}/vol3-runtime.ver"
 ' || fail_note "vol3-runtime" "wrapper/setup failed"
 
 #####################################
@@ -1665,7 +1702,7 @@ run_step "vol3-symbols" "current" 'get_mark_ver vol3-symbols' '
   done
 
   chown -R "${LWADEUSER}:${LWADEUSER}" "${VOL3_SYMBOLS_DIR}" || true
-  echo "$(date -Iseconds)" > "${STEPS_DIR}/vol3-symbols.ver"
+  echo "current" > "${STEPS_DIR}/vol3-symbols.ver"
 ' || fail_note "volatility_symbols" "download/verify failed"
 fi
 
@@ -1674,7 +1711,7 @@ fi
 #####################################
 if [[ "${MOD_BULK_EXTRACTOR_ENABLED:-1}" == "1" ]]; then
 if [[ "${BULK_EXTRACTOR_MODE:-source}" == "repo" ]]; then
-run_step "bulk_extractor" "repo" get_ver_be '
+run_step "bulk_extractor" "repo" get_ver_bulk_extractor_step '
   set -e
   if [[ "$PM" == "apt" ]]; then
     bash -lc "$PKG_INSTALL bulk-extractor" || true
@@ -1685,9 +1722,11 @@ run_step "bulk_extractor" "repo" get_ver_be '
     command -v bulk_extractor >/dev/null 2>&1 || { echo "bulk_extractor not found"; exit 1; }
     ln -sf "$(command -v bulk_extractor)" /usr/local/bin/bulk_extractor || true
   fi
+
+  echo "repo" > "${STEPS_DIR}/bulk_extractor.ver"
 ' || fail_note "bulk_extractor" "repo install failed"
 else
-run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_be '
+run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_bulk_extractor_step '
   set -e
   echo "[*] Installing bulk_extractor from source…"
   BE_PREFIX="${WADE_TOOLS_DIR:-/opt/wade/tools.d}/bulk_extractor"
@@ -1735,6 +1774,8 @@ run_step "bulk_extractor" "${BE_GIT_REF:-master}" get_ver_be '
 
   popd >/dev/null
   rm -rf "$BUILD_DIR"
+
+  echo "$BE_GIT_REF" > "${STEPS_DIR}/bulk_extractor.ver" 
 ' || fail_note "bulk_extractor" "build/install failed (see ${LOG_FILE})"
 fi
 fi
