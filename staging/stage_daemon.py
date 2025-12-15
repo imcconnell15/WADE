@@ -108,6 +108,27 @@ SIG_SAMPLE_BYTES = int(os.getenv("WADE_SIG_SAMPLE_BYTES", str(4 * 1024 * 1024)))
 
 MEM_MIN_BYTES = int(os.getenv("WADE_MEM_MIN_BYTES", str(100 * 1024 * 1024)))  # ~100MiB default
 
+# -----------------------------
+# Tool routing matrix (staging → workers)
+# -----------------------------
+# Keyed by (classification, profile). Values are simple tool names.
+TOOL_MATRIX: Dict[Tuple[str, str], List[str]] = {
+    ("e01",       "full"):  ["dissect", "hayabusa", "autopsy", "bulk_extractor"],
+    ("e01",       "light"): ["dissect", "hayabusa"],
+
+    ("disk_raw",  "full"):  ["dissect", "hayabusa", "autopsy", "bulk_extractor"],
+    ("disk_raw",  "light"): ["dissect"],
+
+    ("mem",       "full"):  ["volatility", "yara_mem", "autopsy"],
+    ("mem",       "light"): ["volatility"],
+
+    ("vm_disk",   "full"):  ["dissect"],
+    ("vm_package","full"):  ["dissect"],
+
+    ("network_config", "full"): ["netcfg"],
+    ("network_doc",   "full"): ["netdoc"],
+}
+
 # Text logging toggles
 WADE_TEXT_LOGS = os.getenv("WADE_TEXT_LOGS", "1").lower() in ("1", "true", "yes")
 WADE_TEXT_LOG_LEVEL = os.getenv("WADE_TEXT_LOG_LEVEL", "INFO").upper()
@@ -584,10 +605,23 @@ def _parse_ewfinfo_acq_date(txt: str) -> Optional[str]:
 def classify_e01(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
     if not is_e01(p):
         return "", {}
-    hostname = p.stem
+
+    # --- Derive collection date from filename/mtime ---
+    base = p.stem
     date_col = ymd_from_mtime(p)
 
-    # Prefer ewfinfo acquisition date
+    # Example filename: CGCC-DESKTOP-KSNQGVL_2025-05-16_2025-05-15.E01
+    # If it ends in _YYYY-MM-DD, treat that as collection date
+    m_date = re.search(r"(\d{4}-\d{2}-\d{2})$", base)
+    host_base = base
+    if m_date:
+        date_from_name = m_date.group(1)
+        prefix_idx = base.rfind("_" + date_from_name)
+        if prefix_idx > 0:
+            host_base = base[:prefix_idx]
+        date_col = date_from_name
+
+    # Prefer ewfinfo acquisition date over filename/mtime
     if EWFINFO_PATH:
         rc, out, _ = run_cmd([EWFINFO_PATH, str(p)], timeout=30)
         if rc == 0:
@@ -595,22 +629,41 @@ def classify_e01(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
             if maybe:
                 date_col = maybe
 
-    # Prefer target-info hostname
+    os_hostname: Optional[str] = None
+    os_family: Optional[str] = None
+
+    # Prefer target-info hostname for OS-level hostname
     if TARGET_INFO_PATH:
         rc, out, _ = run_cmd([TARGET_INFO_PATH, "-j", str(p)], timeout=30)
         if rc == 0:
             try:
                 j = json.loads(out)
                 if j.get("hostname"):
-                    hostname = j["hostname"]
+                    # This is the real OS hostname, e.g. DESKTOP-KSNQGVL
+                    os_hostname = j["hostname"]
+                os_family = j.get("os_family") or j.get("os") or None
             except Exception:
                 pass
 
-    return "e01", {
+    # Choose hostname for layout:
+    #   1) OS hostname (preferred)
+    #   2) host_base (filename prefix without trailing date)
+    #   3) full filename stem
+    hostname = os_hostname or host_base or base
+
+    details: Dict[str, Any] = {
+        # Align host_id with hostname so DataSources/Hosts/<hostname>/...
+        "host_id": hostname,
         "hostname": hostname,
+        # when this image was acquired (best effort)
         "date_collected": date_col,
+        # fragmentation info (E01 parts)
         "fragmentation": e01_fragmentation(p),
     }
+    if os_family:
+        details["os_family"] = os_family
+
+    return "e01", details
 
 # -----------------------------
 # Memory
@@ -783,10 +836,11 @@ def classify_memory(p: Path, _: Path) -> Tuple[str, Dict[str, Any]]:
     json_log("mem_classify_sig", src=str(p), mem_signature=sig)
     log.debug("mem_classify: signature %s for %s", sig, p)
 
-    hostname = p.stem
+    host_guess = p.stem
     date_col = ymd_from_mtime(p)
     meta: Dict[str, Any] = {
-        "hostname": hostname,
+        # hostname is our directory key; start with filename and refine later
+        "hostname": host_guess,
         "date_collected": date_col,
         "mem_signature": sig,
     }
@@ -1088,7 +1142,12 @@ def match_host_from_filename(datasources: Path, p: Path) -> Optional[str]:
 def classify_misc(p: Path, datasources: Path) -> Tuple[str, Dict[str, Any]]:
     host = match_host_from_filename(datasources, p)
     if host:
-        return "misc", {"hostname": host, "date_collected": ymd_from_mtime(p)}
+        # host is a directory under DataSources/Hosts – treat it as host_id
+        return "misc", {
+            "host_id": host,
+            "hostname": host,
+            "date_collected": ymd_from_mtime(p),
+        }
     return "", {}
 
 # -----------------------------
@@ -1106,14 +1165,19 @@ def classify_file(p: Path, datasources: Path) -> Tuple[str, Dict[str, Any]]:
 # -----------------------------
 def build_destination(src: Path, root: Path, classification: str, details: Dict[str, Any]) -> Path:
     date_str = details.get("date_collected", ymd_from_mtime(src))
-    hostname = details.get("hostname") or src.stem
+
+    # Primary identity is hostname; fall back to host_id, then filename stem
+    hostname = details.get("hostname") or details.get("host_id") or src.stem
+    host_id = details.get("host_id") or hostname  # kept for tickets/reporting
 
     if classification == "network_config":
+        # Network configs grouped under DataSources/Network/<hostname>/
         dir_ = root / "Network" / hostname
         ext = src.suffix or ".cfg"
         name = f"cfg_{hostname}_{date_str}{ext}"
 
     elif classification == "misc":
+        # Misc files associated with a host under Hosts/<hostname>/misc/
         dir_ = root / "Hosts" / hostname / "misc"
         name = src.name
 
@@ -1121,13 +1185,13 @@ def build_destination(src: Path, root: Path, classification: str, details: Dict[
         fmt = details.get("format") or "disk"
         dir_ = root / "VM" / fmt
         ext = src.suffix or f".{fmt}"
-        name = f"{hostname}_{date_str}{ext}"
+        name = f"{host_id}_{date_str}{ext}"
 
     elif classification == "vm_package":
         pkg = details.get("package") or "pkg"
         dir_ = root / "VM" / "packages"
         ext = src.suffix or f".{pkg}"
-        name = f"{hostname}_{date_str}{ext}"
+        name = f"{host_id}_{date_str}{ext}"
 
     elif classification == "network_doc":
         dir_ = root / "Network" / "docs"
@@ -1137,7 +1201,13 @@ def build_destination(src: Path, root: Path, classification: str, details: Dict[
     else:
         # e01, mem, disk_raw, etc. → Hosts/<hostname>
         dir_ = root / "Hosts" / hostname
-        ext = ".E01" if classification == "e01" else (src.suffix or (".mem" if classification == "mem" else ""))
+        if classification == "e01":
+            ext = ".E01"
+        elif classification == "mem":
+            ext = src.suffix or ".mem"
+        else:
+            ext = src.suffix or ""
+        # File name: <hostname>_<date>.ext (per your requirement)
         name = f"{hostname}_{date_str}{ext}"
 
     ensure_dirs(dir_)
@@ -1145,7 +1215,8 @@ def build_destination(src: Path, root: Path, classification: str, details: Dict[
     i = 1
     while dest.exists():
         stem, suf = os.path.splitext(name)
-        dest = dest.with_name(f"{stem}__{i}{suf}"); i += 1
+        dest = dest.with_name(f"{stem}__{i}{suf}")
+        i += 1
     return dest
 
 def move_atomic(src: Path, dest: Path) -> None:
@@ -1312,6 +1383,7 @@ def process_one(
     profile: str,
     owner: str,
     queue_root: Path,
+    location: Optional[str] = None,
 ) -> None:
     try:
         with acquire_lock(src):
@@ -1450,28 +1522,99 @@ def process_one(
             final_content_sig = quick_content_sig(final_path, size_hint=final_st.st_size)
             final_sig = f"{final_st.st_dev}:{final_st.st_ino}:{final_st.st_size}:{int(final_st.st_mtime_ns)}"
 
-            work = {
+            # -----------------------------
+            # Derive sourcetype, host_id, hostname, image_type, os_family, tool_plan
+            # -----------------------------
+            # Where in DataSources are we?
+            try:
+                rel = final_path.relative_to(datasources)
+                parts = rel.parts  # e.g. ("Hosts", "CGCC-DESKTOP-KSNQGVL_2025-05-16", "file.E01")
+            except Exception:
+                parts = ()
+            sourcetype = parts[0] if parts else "Unknown"
+
+            # host_id: directory-level grouping under DataSources/<sourcetype>/<host_id>/...
+            host_id = details.get("host_id")
+            if not host_id:
+                if sourcetype in ("Hosts", "Network") and len(parts) >= 2:
+                    host_id = parts[1]
+                else:
+                    host_id = details.get("hostname") or src.stem
+
+            # OS-level hostname seen by tools (may differ from host_id)
+            os_hostname = details.get("hostname") or host_id
+
+            # Friendly image_type for workers
+            image_type = None
+            if classification == "e01":
+                image_type = "disk_e01"
+            elif classification == "disk_raw":
+                image_type = "disk_raw"
+            elif classification == "mem":
+                image_type = "mem_raw"
+            elif classification == "vm_disk":
+                fmt = details.get("format") or "disk"
+                image_type = f"vm_disk_{fmt}"
+            elif classification == "vm_package":
+                image_type = "vm_package"
+            elif classification == "network_config":
+                image_type = "network_cfg"
+            elif classification == "network_doc":
+                image_type = "network_doc"
+
+            # Normalize OS family hint if present
+            os_family = None
+            if details.get("os"):
+                os_family = str(details["os"]).lower()
+            elif details.get("os_family"):
+                os_family = str(details["os_family"]).lower()
+
+            # Decide which tools should run on this ticket
+            tool_plan = TOOL_MATRIX.get((classification, profile), [])
+
+                        work = {
                 "schema": "wade.queue.workorder",
-                "version": 1,
+                "version": 1,  # keep as 1 for now; we just enriched the shape
                 "id": str(uuid.uuid4()),
                 "created_utc": utc_now_iso(),
+
+                # Routing
                 "profile": profile,
                 "classification": classification,
+                "sourcetype": sourcetype,
+                "host_id": host_id,
+                "hostname": os_hostname,
+
+                # File identity
+                "src_path": str(final_path),
+                "dest_path": str(final_path),  # alias for existing workers
                 "original_name": src.name,
                 "source_host": os.uname().nodename,
-                "dest_path": str(final_path),
                 "size_bytes": final_st.st_size,
                 "sig": final_sig,
                 "content_sig": final_content_sig,
             }
-            if classification in ("e01", "mem"):
-                work.update(hostname=hostname, date_collected=details.get("date_collected"))
+
+            if image_type:
+                work["image_type"] = image_type
+            if os_family:
+                work["os_family"] = os_family
+            if details.get("date_collected"):
+                work["date_collected"] = details["date_collected"]
+            if tool_plan:
+                work["tool_plan"] = tool_plan
+            if location:
+                work["location"] = location
+
+            # Classification-specific extras (backwards-compat)
             if classification == "network_config":
-                work.update(vendor=details.get("vendor"),
-                            os_version=details.get("os_version"),
-                            hostname=hostname)
+                work.update(
+                    vendor=details.get("vendor"),
+                    os_version=details.get("os_version"),
+                    platform=details.get("platform"),
+                )
             if classification == "vm_disk":
-                work.update(vm_format=details.get("format"))
+                work["vm_format"] = details.get("format")
 
             queue_path = enqueue_work(queue_root, work)
 
@@ -1480,6 +1623,13 @@ def process_one(
                 "event": "staged",
                 "profile": profile,
                 "classification": classification,
+                "sourcetype": sourcetype,
+                "host_id": host_id,
+                "hostname": os_hostname,
+                "image_type": image_type,
+                "os_family": os_family,
+                "tool_plan": tool_plan,
+
                 "original_name": src.name,
                 "src_path": str(src),
                 "dest_path": str(final_path),
@@ -1491,6 +1641,8 @@ def process_one(
                 "duration_seconds": round(time.time() - start_ts, 3),
                 "queue_path": str(queue_path),
             }
+            if location:
+                log_payload["location"] = location
 
             if classification in ("disk_raw", "vm_disk"):
                 md = {
@@ -1618,51 +1770,88 @@ def build_paths() -> Tuple[str, Path, Path, Path, Path]:
 # -----------------------------
 # Main Loop
 # -----------------------------
+
 def iter_files(dir_: Path) -> Iterable[Path]:
     """Yield candidate files (skip temp-ish) from dir_. Recursive when enabled."""
     skip_suffixes = (".part", ".tmp", ".crdownload")
 
-    # Non-recursive: just list immediate children
+    # Simple non-recursive mode (old behavior)
     if not WADE_STAGE_RECURSIVE:
         for p in dir_.iterdir():
             if p.is_file() and not p.name.lower().endswith(skip_suffixes):
                 yield p
         return
 
-    # Recursive walk
-    for root, dirs, files in os.walk(dir_):
-        # Skip hidden directories like .git, .DS_Store, etc.
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+    # Recursive mode: walk the tree under dir_
+    for root, _, files in os.walk(dir_):
+        root_path = Path(root)
         for name in files:
             if name.lower().endswith(skip_suffixes):
                 continue
-            p = Path(root) / name
-            if p.is_file():
-                yield p
+            yield root_path / name
 
-def detect_profile(path: Path, full_root: Path, light_root: Path) -> str:
+def iter_profile_roots(full_root: Path, light_root: Path) -> Iterable[Tuple[Path, str, Optional[str]]]:
+    """Yield (directory, profile, location) triples for all staging 'full'/'light' roots.
+
+    Supports:
+      - <Staging>/full
+      - <Staging>/light
+      - <Staging>/<location>/full
+      - <Staging>/<location>/light
     """
-    Decide which staging profile to use for a given path based on its location.
+    # Top-level roots (no location)
+    yield full_root, "full", None
+    yield light_root, "light", None
 
-    - Any file under <Staging>/full  -> 'full'
-    - Any file under <Staging>/light -> 'light'
-    - Fallback: 'full' as a safe default.
+    # Optional per-location subtrees under STAGING_ROOT
+    root = STAGING_ROOT or full_root.parent
+    try:
+        children = list(root.iterdir())
+    except Exception:
+        children = []
+
+    for child in children:
+        if not child.is_dir():
+            continue
+        if child.name in ("full", "light", "ignored"):
+            continue
+        loc = child.name
+        loc_full = child / "full"
+        loc_light = child / "light"
+        if loc_full.exists():
+            yield loc_full, "full", loc
+        if loc_light.exists():
+            yield loc_light, "light", loc
+
+def detect_profile(path: Path, staging_root: Path) -> Tuple[str, Optional[str]]:
+    """
+    Decide which staging profile ('full' or 'light') to use for a given path,
+    and derive an optional location name based on its relative position.
+
+    Supported layouts:
+      - <Staging>/full/<file>
+      - <Staging>/light/<file>
+      - <Staging>/<location>/full/<file>
+      - <Staging>/<location>/light/<file>
     """
     try:
-        path.relative_to(full_root)
-        return "full"
+        rel = path.relative_to(staging_root)
     except ValueError:
-        pass
+        # Not under staging_root; defensive default
+        return "full", None
 
-    try:
-        path.relative_to(light_root)
-        return "light"
-    except ValueError:
-        pass
+    parts = rel.parts
+    location: Optional[str] = None
+    if parts and parts[0] not in ("full", "light", "ignored"):
+        location = parts[0]
 
-    # Defensive default if the path somehow isn't under either tree
-    return "full"
+    profile = "full"
+    if "light" in parts:
+        profile = "light"
+    elif "full" in parts:
+        profile = "full"
 
+    return profile, location
 
 def scan_backlog_now(
     conn: sqlite3.Connection,
@@ -1692,16 +1881,16 @@ def scan_backlog_now(
         "on" if WADE_STAGE_RECURSIVE else "off",
     )
 
-    for root, prof in ((full_root, "full"), (light_root, "light")):
+    for root, prof, location in iter_profile_roots(full_root, light_root):
         if not root.exists():
             continue
         for p in iter_files(root):
             candidates += 1
             try:
-                process_one(conn, p, datasources, prof, owner, queue_root)
+                process_one(conn, p, datasources, prof, owner, queue_root, location=location)
             except Exception as exc:
                 # process_one already logs rich details; keep going
-                log.error("backlog processing error for %s: %s", p, exc)
+                log.error("backlog processing error for %s (location=%s): %s", p, location, exc)
 
     duration = time.time() - start
     json_log(
@@ -1722,16 +1911,16 @@ def polling_loop(conn, full, light, datasources, queue_root, owner):
         WADE_STAGE_RECURSIVE,
     )
     while True:
-        log.debug("poll tick: scanning staging roots")
-        for directory, prof in ((full, "full"), (light, "light")):
+        log.debug("poll tick: scanning staging roots (with per-location support)")
+        for directory, prof, location in iter_profile_roots(full, light):
             if not directory.exists():
                 continue
             for p in iter_files(directory):
                 try:
-                    process_one(conn, p, datasources, prof, owner, queue_root)
+                    process_one(conn, p, datasources, prof, owner, queue_root, location=location)
                 except Exception as exc:
                     # process_one already logs details; keep the loop alive
-                    log.error("polling loop error for %s: %s", p, exc)
+                    log.error("polling loop error for %s (location=%s): %s", p, location, exc)
         time.sleep(SCAN_INTERVAL_SEC)
 
 def inotify_loop(conn, full, light, datasources, queue_root, owner):
@@ -1752,15 +1941,34 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
         log.debug("inotify: watching %s (wd=%s)", d, wd)
         return wd
 
-    def add_tree(root: Path):
+        def add_tree(root: Path):
         add_watch_dir(root)
         if WADE_STAGE_RECURSIVE:
             for r, dirs, _ in os.walk(root):
                 for d in dirs:
                     add_watch_dir(Path(r) / d)
 
+    # Watch the default full/light roots
     add_tree(full)
     add_tree(light)
+
+    # Also watch any optional per-location full/light trees under the staging root
+    root = STAGING_ROOT or full.parent
+    try:
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name in ("full", "light", "ignored"):
+                continue
+            loc_full = child / "full"
+            loc_light = child / "light"
+            if loc_full.exists():
+                add_tree(loc_full)
+            if loc_light.exists():
+                add_tree(loc_light)
+    except Exception:
+        # Best-effort only; staging still works without per-location watches
+        pass
 
     log.info(
         "inotify mode – recursive=%s (require_close_write=%s, verify_no_writers=%s)",
@@ -1802,12 +2010,12 @@ def inotify_loop(conn, full, light, datasources, queue_root, owner):
             if not no_open_writers(path):
                 continue
 
-            # NEW: profile detection based on path location, not just the parent dir
-            prof = detect_profile(path, full, light)
+            # Profile + location detection based on full staging tree
+            profile, location = detect_profile(path, STAGING_ROOT or full.parent)
             try:
-                process_one(conn, path, datasources, prof, owner, queue_root)
+                process_one(conn, path, datasources, profile, owner, queue_root, location=location)
             except Exception as exc:
-                log.error("inotify loop error for %s: %s", path, exc)
+                log.error("inotify loop error for %s (location=%s): %s", path, location, exc)
 
 def main() -> None:
     owner, stage_full, stage_light, datasources, queue_root = build_paths()
