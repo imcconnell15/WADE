@@ -51,7 +51,7 @@ WHIFF_LLM_PATH_DEFAULT="${WHIFF_LLM_PATH_DEFAULT:-/opt/whiff/models/whiff-llm.gg
 
 WHIFF_EMBED_REPO="${WHIFF_EMBED_REPO:-Snowflake/snowflake-arctic-embed-m-v2.0}"
 # Minimal files for SentenceTransformers CPU path (skip big ONNX files)
-WHIFF_EMBED_ALLOW="${WHIFF_EMBED_ALLOW:-model.safetensors,*.json,modules.json,1_Pooling/*,configuration_hf_alibaba_nlp_gte.py,modeling_hf_alibaba_nlp_gte.py}"
+WHIFF_EMBED_ALLOW="${WHIFF_EMBED_ALLOW:-*.json,*.safetensors,modules.json,sentence_bert_config.json,config.json,tokenizer*,vocab*,merges*,special_tokens_map.json,*.txt,*.model,*.py,0_Transformer/*,1_Pooling/*}"
 WHIFF_EMBED_DIR_DEFAULT="${WHIFF_EMBED_DIR_DEFAULT:-/opt/whiff/models/emb/snowflake-m-v2}"
 
 # Small fallback embedder (~90MB)
@@ -88,6 +88,33 @@ hf_download() {  # repo pattern_or_empty dest_dir [extra_args...]
   local extra_args=("$@")
 
   mkdir -p "$dest"
+
+  # Detect whether this huggingface-cli supports --allow-patterns (varies by version)
+  # Cache the result so we don't spam help output.
+  if [[ -z "${_HF_ALLOW_PATTERNS_OK:-}" ]]; then
+    if /opt/whiff/.venv/bin/huggingface-cli download -h 2>&1 | grep -q -- '--allow-patterns'; then
+      _HF_ALLOW_PATTERNS_OK=1
+    else
+      _HF_ALLOW_PATTERNS_OK=0
+    fi
+  fi
+  # If allow-patterns isn't supported, strip those args (otherwise the download hard-fails)
+  if [[ "${_HF_ALLOW_PATTERNS_OK}" == "0" ]]; then
+    local cleaned=()
+    local i=0
+    while (( i < ${#extra_args[@]} )); do
+      if [[ "${extra_args[$i]}" == "--allow-patterns" ]]; then
+        i=$((i+2))   # skip flag + its value
+        continue
+      fi
+      cleaned+=("${extra_args[$i]}")
+      i=$((i+1))
+    done
+    if (( ${#cleaned[@]} != ${#extra_args[@]} )); then
+      echo "[!] huggingface-cli does not support --allow-patterns; downloading without filters (larger download)."
+    fi
+    extra_args=("${cleaned[@]}")
+  fi
 
   local attempt
   for attempt in 1 2 3; do
@@ -263,6 +290,12 @@ REQ
 #####################################
 cat > /opt/whiff/whiff_utils.py <<'PY'
 import hashlib, json, re
+
+def stable_chunk_hash(text: str) -> str:
+    """Deterministic chunk id (Python's built-in hash() is randomized per process)."""
+    norm = re.sub(r"\s+", " ", (text or "").replace("\r\n", "\n").replace("\r", "\n")).strip()
+    return hashlib.sha1(norm.encode("utf-8", "ignore")).hexdigest()
+
 VOLATILE_FIELDS = {"_time","_raw","_indextime","linecount"}
 def stable_event_hash(ev: dict) -> str:
     cleaned = {k: v for k, v in ev.items() if k not in VOLATILE_FIELDS}
@@ -409,7 +442,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from docx import Document as DocxDoc
 from whiff_models import embed_texts
-from whiff_utils import simple_chunks
+from whiff_utils import simple_chunks, stable_chunk_hash
 import chardet
 
 DB_DSN=os.environ.get("WHIFF_DB_DSN","host=127.0.0.1 port=5432 dbname=whiff user=whiff password=whiff")
@@ -486,7 +519,7 @@ def main(root="docs_ingest"):
         chunks=list(simple_chunks(text, max_words=400))
         if not chunks: continue
         embs=embed_texts(chunks)
-        rows=[(str(uuid.uuid4()), p.stem[:512], None, tool, version, license_, c, str(hash(c)), json.dumps(meta), e.tolist())
+        rows=[(str(uuid.uuid4()), p.stem[:512], None, tool, version, license_, c, stable_chunk_hash(c), json.dumps(meta), e.tolist())
               for c,e in zip(chunks, embs)]
         insert_docs(conn, rows)
     conn.close()
@@ -503,7 +536,7 @@ import requests, psycopg2, yaml
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from whiff_models import embed_texts
-from whiff_utils import simple_chunks
+from whiff_utils import simple_chunks, stable_chunk_hash
 
 DB_DSN=os.getenv("WHIFF_DB_DSN","host=127.0.0.1 port=5432 dbname=whiff user=whiff password=whiff")
 UA="WhiffCrawler/0.1 (+local DFIR KB builder)"
@@ -531,7 +564,7 @@ def index_chunks(conn,title,url,tool,version,license_,chunks,embs):
     rows=[]
     import uuid, json as _json
     for c,e in zip(chunks,embs):
-        rows.append((str(uuid.uuid4()), title[:512], url, tool, version, license_, c, str(hash(c)), _json.dumps({"source_url":url}), e.tolist()))
+        rows.append((str(uuid.uuid4()), title[:512], url, tool, version, license_, c, stable_chunk_hash(c), _json.dumps({"source_url":url}), e.tolist()))
     cur=conn.cursor()
     cur.executemany("""
       INSERT INTO sage_docs (id,title,source_url,tool,version,license,chunk,chunk_hash,meta,embedding)
@@ -606,7 +639,7 @@ CREATE TABLE IF NOT EXISTS sage_docs (
   chunk TEXT NOT NULL,
   chunk_hash TEXT NOT NULL,
   meta JSONB,
-  embedding VECTOR(384)
+  embedding VECTOR(768)
 );
 CREATE INDEX IF NOT EXISTS ix_docs_vec ON sage_docs
 USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
@@ -1055,7 +1088,10 @@ fi
 #####################################
 if [[ "$SEED_BASELINE_DOCS" == "1" ]]; then
   /opt/whiff/scripts/whiff-seed-docs.sh || echo "[!] Seed encountered errors; continuing."
-  WHIFF_DB_DSN="${DB_DSN}" /opt/whiff/.venv/bin/python /opt/whiff/whiff_index.py /opt/whiff/docs_ingest
+  WHIFF_DB_DSN="${DB_DSN}" \
+  WHIFF_EMBED_PATH="${EMBED_DIR}" \
+    /opt/whiff/.venv/bin/python /opt/whiff/whiff_index.py /opt/whiff/docs_ingest \
+    || echo "[!] Indexing encountered errors; continuing."
 fi
 
 #####################################
@@ -1093,7 +1129,8 @@ DB (masked DSN):
   Schema file: /opt/whiff/sql/00_bootstrap.sql
 
 Indexer:
-  WHIFF_DB_DSN="${SAFE_DSN}" /opt/whiff/.venv/bin/python /opt/whiff/whiff_index.py /opt/whiff/docs_ingest
+  WHIFF_DB_DSN="${SAFE_DSN}" WHIFF_EMBED_PATH="${EMBED_DIR}" \
+    /opt/whiff/.venv/bin/python /opt/whiff/whiff_index.py /opt/whiff/docs_ingest
 
 Crawler:
   WHIFF_DB_DSN="${SAFE_DSN}" /opt/whiff/.venv/bin/python /opt/whiff/whiff_crawl.py /opt/whiff/ingest/sites.yaml
