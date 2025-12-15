@@ -1491,8 +1491,11 @@ exec vol \
   "$@"
 EOF
   chmod 0755 /usr/local/bin/vol3
-  cp /var/wade/vol3/symbols/* /opt/pipx/venvs/volatility3/lib/python3.12/site-packages/volatility3/symbols/
-
+  VOL_VENV="/opt/pipx/venvs/volatility3"
+  VOL_PYTHON_VER=$("$VOL_VENV/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+  VOL_SITE_PACKAGES="$VOL_VENV/lib/python${VOL_PYTHON_VER}/site-packages/volatility3/symbols"
+  mkdir -p "$VOL_SITE_PACKAGES"
+  cp /var/wade/vol3/symbols/* "$VOL_SITE_PACKAGES/"
 
   echo "ready" > "${STEPS_DIR}/vol3-runtime.ver"
 ' || fail_note "vol3-runtime" "wrapper/setup failed"
