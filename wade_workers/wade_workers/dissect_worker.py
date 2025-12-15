@@ -290,10 +290,11 @@ class DissectWorker(BaseWorker):
     # ------------------------------------------------------------------
 
     def _host_and_img(self, ticket: dict) -> Tuple[str, Path]:
-        host = ticket.get("host") or self.env.get("WADE_HOSTNAME", "host")
+        # Resolve image path from ticket
         p = Path(ticket.get("dest_path") or ticket.get("path") or "")
         if not p.exists():
             raise FileNotFoundError(f"target not found: {p}")
+        host = ticket.get("host") or p.parent.name or self.env.get("WADE_HOSTNAME", "host")
         return host, p
 
     def _append_log(self, host: str, text: str) -> None:
@@ -309,24 +310,26 @@ class DissectWorker(BaseWorker):
     # ------------------------------------------------------------------
 
     def _get_target_info(
-        self,
-        host: str,
-        img: Path,
-        errors: List[str],
-    ) -> Tuple[Optional[Dict], int]:
-        """
-        Run `target-info -J` and store a single JSON record via run_records.
 
-        Returns (info_dict or None, record_count).
-        """
-        cmd = _cmd_target_info(self.env)
-        args = [cmd, "-J", str(img)]
-        self._append_log(host, f"{now_iso()} running: {' '.join(args)}")
+        stdout = cp.stdout.strip()
+        if not stdout:
+            errors.append("target-info produced no output")
+            return None, 0
 
-        try:
-            cp = subprocess.run(args, capture_output=True, text=True, check=False)
-        except Exception as e:
-            errors.append(f"target-info spawn: {e!r}")
+        info = None
+        for ln in stdout.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                info = json.loads(ln)
+                break
+            except Exception:
+                # Not JSON; likely a log line. Keep going.
+                continue
+
+        if info is None:
+            errors.append("target-info JSON parse error: no JSON object found in stdout")
             return None, 0
 
         if cp.returncode != 0:
