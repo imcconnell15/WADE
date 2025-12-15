@@ -1102,6 +1102,7 @@ if [[ "$RUN_INITIAL_CRAWL" == "1" ]]; then
      psql "$DB_DSN" -Atqc "SELECT to_regclass('whiff.sage_docs') IS NOT NULL;" | grep -q 't'; then
     echo "[*] Running initial crawl (this can take a while)…"
     export WHIFF_DB_DSN="$DB_DSN"
+    export WHIFF_EMBED_PATH="${EMBED_DIR}"
     /opt/whiff/.venv/bin/python /opt/whiff/whiff_crawl.py /opt/whiff/ingest/sites.yaml || echo "[!] Crawl encountered errors; continue."
   else
     echo "[!] Skipping initial crawl (DB not ready or schema missing)."
