@@ -254,59 +254,48 @@ class EventLogger:
         return cls(log_dir, source)
 
 
-def finalize_worker_records(
+def finalize_worker_records_with_ticket(
     records: List[Dict[str, Any]],
     output_path: Path,
+    ticket: WorkerTicket,
     tool: str,
     module: str,
-    host: str,
-    metadata: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """Write worker output records to JSONL file with consistent envelope.
+    """Write worker output with ticket metadata envelope.
     
-    This replaces the old finalize_records_to_json() function.
-    Each record is wrapped with standard WADE metadata for downstream ingestion.
+    This replaces finalize_worker_records() for v2.0 tickets.
+    Each record gets the full ticket metadata for Splunk searchability.
     
     Args:
-        records: List of record dictionaries from tool output
-        output_path: Where to write JSONL file
-        tool: Tool name (e.g., "volatility3")
-        module: Module/plugin name
-        host: Host/system name
-        metadata: Additional metadata to include in each record
+        records: List of record dicts
+        output_path: Output JSONL file
+        ticket: WorkerTicket with metadata
+        tool: Tool name
+        module: Module name
     
     Returns:
         Number of records written
     
     Example:
-        processes = parse_volatility_output(result.stdout)
-        count = finalize_worker_records(
-            processes,
-            output_path=Path("/data/output/processes.jsonl"),
-            tool="volatility3",
+        records = parse_tool_output(result.stdout)
+        count = finalize_worker_records_with_ticket(
+            records,
+            output_path=Path("/data/output/pslist.jsonl"),
+            ticket=ticket,
+            tool="volatility",
             module="windows.pslist",
-            host="DESKTOP-ABC",
-            metadata={"image_path": "/data/mem.raw"},
         )
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    envelope_metadata = {
-        "tool": tool,
-        "module": module,
-        "host": host,
-        **(metadata or {}),
-    }
+    # Get envelope from ticket
+    envelope = ticket.get_artifact_envelope(tool, module)
     
     with open(output_path, "w", encoding="utf-8") as f:
         for record in records:
-            # Wrap record with envelope
-            envelope = {
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                **envelope_metadata,
-                "record": record,
-            }
-            json.dump(envelope, f, ensure_ascii=False, default=str)
+            # Merge envelope with record (envelope fields don't override record fields)
+            artifact = {**envelope, **record}
+            json.dump(artifact, f, ensure_ascii=False, default=str)
             f.write("\n")
     
     return len(records)
