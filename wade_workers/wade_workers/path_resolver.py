@@ -10,17 +10,17 @@ from .ticket_schema import WorkerTicket
 
 # Map staging classifications to $sourcetype directory names
 CLASSIFICATION_TO_SOURCETYPE = {
-    "memory": "Hosts",
-    "e01": "Hosts",
-    "disk_raw": "Hosts",
-    "vm_disk": "VM",
-    "vm_package": "VM",
-    "network_config": "Network",
-    "network_doc": "Network",
-    "malware": "Malware",
-    "misc": "Misc",
-    "unknown": "Misc",
-    "e01_fragment": "Hosts",  # normally skipped; here for completeness
+    "memory": "memory",
+    "e01": "disk",
+    "disk_raw": "disk",
+    "vm_disk": "vm",
+    "vm_package": "vm",
+    "network_config": "network",
+    "network_doc": "network-docs",
+    "malware": "malware",
+    "misc": "misc",
+    "unknown": "misc",
+    "e01_fragment": "disk",  # normally skipped; here for completeness
 }
 
 def _sanitize(s: str) -> str:
