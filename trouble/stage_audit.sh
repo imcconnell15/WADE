@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# WADE reset + diagnostics helper (v2.0)
+# WADE reset + diagnostics + code audit helper (v3.0)
 # - Soft/Hard reset of staging + queue
 # - Optional service restart
 # - Builds a diagnostics bundle for handoff
-# - Auto-escalates to root, safe env sourcing under set -u
+# - Optional code audit/sync against GitHub (stage_daemon, wade_workers, etc.)
 
 set -Eeuo pipefail
 umask 022
@@ -24,11 +24,37 @@ TAIL=1
 ASSUME_YES=0
 BUNDLE_ONLY=0
 
+CODE_AUDIT=0     # default: no code audit
+CODE_SYNC=0      # default: no code sync
+
 LINES=400        # journal lines per service
+
+# --- Git / code audit defaults ---
+WADE_REPO_URL="${WADE_REPO_URL:-https://github.com/imcconnell15/WADE.git}"
+WADE_REPO_BRANCH="${WADE_REPO_BRANCH:-main}"
+
+# Each entry: kind|label|local_path|repo_rel_path
+# - kind: "file" or "dir"
+# - label: friendly name used in logs/report
+# - local_path: where WADE-installed script(s) live
+# - repo_rel_path: path inside the cloned repo
+#
+# *** TUNE THESE TO MATCH YOUR LAYOUT ***
+CODE_TARGETS=(
+  # Single file example: staging daemon
+  "file|stage_daemon|/opt/wade/stage_daemon.py|stage_daemon.py"
+
+  # Directory example: all wade_workers under /opt/wade/wade_workers
+  "dir|wade_workers|/opt/wade/wade_workers|wade_workers"
+)
+
+# Populated during audit; list of "local|repo" pairs to sync
+CODE_DIFFS=()
 
 usage() {
   cat <<USAGE
 Usage: $0 [--soft|--hard] [--no-restart] [--no-tail] [--yes] [--bundle-only]
+          [--code-audit] [--code-sync]
 
   --soft         Soft reset (default): clear queue + optionally staging state
   --hard         Hard reset: soft reset + purge staging dedupe DB
@@ -37,22 +63,30 @@ Usage: $0 [--soft|--hard] [--no-restart] [--no-tail] [--yes] [--bundle-only]
   --yes          Assume yes to any destructive prompts
   --bundle-only  Do not reset anything; just build a diagnostics bundle
 
+  --code-audit   Clone WADE repo and audit tracked scripts (no changes)
+  --code-sync    Audit + sync: replace local scripts with repo versions if different
+
 Examples:
-  $0                   # soft reset, restart services, tail logs
-  $0 --hard --yes      # hard reset with no prompts, restart, tail
-  $0 --bundle-only     # collect diags only, no changes
+  $0                         # soft reset, restart services, tail logs
+  $0 --hard --yes            # hard reset with no prompts, restart, tail
+  $0 --bundle-only           # collect diags only, no changes
+  $0 --code-audit            # only build bundle + code audit (no reset)
+  $0 --code-sync --yes       # bundle + code audit + auto-sync updated scripts
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --soft)  SOFT=1 HARD=0 ;;
-    --hard)  SOFT=0 HARD=1 ;;
-    --no-restart) RESTART=0 ;;
-    --no-tail)    TAIL=0 ;;
-    --yes|-y)     ASSUME_YES=1 ;;
+    --soft)        SOFT=1 HARD=0 ;;
+    --hard)        SOFT=0 HARD=1 ;;
+    --no-restart)  RESTART=0 ;;
+    --no-tail)     TAIL=0 ;;
+    --yes|-y)      ASSUME_YES=1 ;;
     --bundle-only) BUNDLE_ONLY=1 SOFT=0 HARD=0 RESTART=0 ;;
-    -h|--help) usage; exit 0 ;;
+
+    --code-audit)  CODE_AUDIT=1 ;;
+    --code-sync)   CODE_AUDIT=1 CODE_SYNC=1 ;;
+    -h|--help)     usage; exit 0 ;;
     *)
       echo "Unknown option: $1" >&2
       usage
@@ -167,7 +201,7 @@ collect_diags() {
   {
     echo "# uname -a"; uname -a
     echo
-    echo "# lsb_release / os-release"; 
+    echo "# lsb_release / os-release"
     if command -v lsb_release >/dev/null 2>&1; then
       lsb_release -a || true
     fi
@@ -249,6 +283,159 @@ tail_logs() {
   journalctl -u "${SERVICE_STAGE}" -u "${QUEUE_SERVICE}" -f --no-pager
 }
 
+# -------- Code audit helpers --------
+
+GIT_CLONE_DIR=""
+
+code_clone_repo() {
+  if ! command -v git >/dev/null 2>&1; then
+    log "git not found in PATH; skipping code audit."
+    return 1
+  fi
+
+  local tmp_base="${WADE_VAR}/git_audit"
+  mkdir -p "$tmp_base"
+  local stamp
+  stamp="$(date +%Y%m%d_%H%M%S)"
+  GIT_CLONE_DIR="${tmp_base}/WADE_${stamp}"
+
+  log "Cloning ${WADE_REPO_URL} (branch: ${WADE_REPO_BRANCH}) into ${GIT_CLONE_DIR}…"
+  if ! git clone --depth 1 --branch "${WADE_REPO_BRANCH}" "${WADE_REPO_URL}" "${GIT_CLONE_DIR}" \
+       >"${BUNDLE_ROOT}/system/git_clone.log" 2>&1; then
+    log "git clone failed; see ${BUNDLE_ROOT}/system/git_clone.log"
+    return 1
+  fi
+
+  return 0
+}
+
+code_audit() {
+  CODE_DIFFS=()  # reset
+
+  if ! code_clone_repo; then
+    return 1
+  fi
+
+  local report="${BUNDLE_ROOT}/system/code_audit.txt"
+  {
+    echo "# WADE code audit - $(date -Iseconds)"
+    echo "# Repo:   ${WADE_REPO_URL} (branch ${WADE_REPO_BRANCH})"
+    echo "# Clone:  ${GIT_CLONE_DIR}"
+    echo
+  } >"$report"
+
+  log "Auditing tracked scripts against repo…"
+
+  for spec in "${CODE_TARGETS[@]}"; do
+    IFS='|' read -r kind label local_path repo_rel <<<"$spec"
+
+    echo "## Target: ${label}" >>"$report"
+    echo "# kind=${kind} local=${local_path} repo_rel=${repo_rel}" >>"$report"
+
+    if [[ "$kind" == "file" ]]; then
+      local repo_file="${GIT_CLONE_DIR}/${repo_rel}"
+      if [[ ! -f "$repo_file" ]]; then
+        echo "  [WARN] Repo file missing: ${repo_file}" >>"$report"
+        continue
+      fi
+
+      if [[ ! -f "$local_path" ]]; then
+        echo "  [MISSING] Local file missing: ${local_path}" >>"$report"
+        CODE_DIFFS+=("${local_path}|${repo_file}")
+        continue
+      fi
+
+      local_hash="$(sha256sum "$local_path" 2>/dev/null | awk '{print $1}')"
+      repo_hash="$(sha256sum "$repo_file" 2>/dev/null | awk '{print $1}')"
+
+      if [[ "$local_hash" == "$repo_hash" ]]; then
+        echo "  [OK] ${local_path}" >>"$report"
+      else
+        echo "  [DIFF] ${local_path}" >>"$report"
+        echo "    local: ${local_hash}" >>"$report"
+        echo "    repo : ${repo_hash}" >>"$report"
+        CODE_DIFFS+=("${local_path}|${repo_file}")
+      fi
+
+    elif [[ "$kind" == "dir" ]]; then
+      local repo_dir="${GIT_CLONE_DIR}/${repo_rel}"
+      local local_dir="${local_path}"
+
+      if [[ ! -d "$repo_dir" ]]; then
+        echo "  [WARN] Repo dir missing: ${repo_dir}" >>"$report"
+        continue
+      fi
+
+      if [[ ! -d "$local_dir" ]]; then
+        echo "  [MISSING_DIR] Local dir missing: ${local_dir}" >>"$report"
+        # We still audit to show what's expected
+      fi
+
+      while IFS= read -r rf; do
+        rel="${rf#${repo_dir}/}"
+        lf="${local_dir}/${rel}"
+
+        if [[ ! -f "$lf" ]]; then
+          echo "  [MISSING] ${lf}" >>"$report"
+          CODE_DIFFS+=("${lf}|${rf}")
+          continue
+        fi
+
+        local_hash="$(sha256sum "$lf" 2>/dev/null | awk '{print $1}')"
+        repo_hash="$(sha256sum "$rf" 2>/dev/null | awk '{print $1}')"
+
+        if [[ "$local_hash" == "$repo_hash" ]]; then
+          echo "  [OK] ${lf}" >>"$report"
+        else
+          echo "  [DIFF] ${lf}" >>"$report"
+          echo "    local: ${local_hash}" >>"$report"
+          echo "    repo : ${repo_hash}" >>"$report"
+          CODE_DIFFS+=("${lf}|${rf}")
+        fi
+      done < <(find "$repo_dir" -type f ! -path '*/.git/*' | sort)
+
+    else
+      echo "  [WARN] Unknown CODE_TARGET kind: ${kind}" >>"$report"
+    fi
+
+    echo >>"$report"
+  done
+
+  local diff_count="${#CODE_DIFFS[@]}"
+  if [[ "$diff_count" -eq 0 ]]; then
+    log "Code audit complete: no differences found."
+    echo "# Summary: no differences found." >>"$report"
+  else
+    log "Code audit complete: ${diff_count} file(s) differ or are missing."
+    echo "# Summary: ${diff_count} file(s) differ or are missing." >>"$report"
+  fi
+
+  return 0
+}
+
+code_sync() {
+  local diff_count="${#CODE_DIFFS[@]}"
+  if [[ "$diff_count" -eq 0 ]]; then
+    log "No code differences to sync."
+    return 0
+  fi
+
+  log "Preparing to sync ${diff_count} file(s) from repo to local…"
+  if ! confirm "Replace local files with versions from ${WADE_REPO_URL}?"; then
+    log "Code sync aborted by user."
+    return 1
+  fi
+
+  for pair in "${CODE_DIFFS[@]}"; do
+    IFS='|' read -r lf rf <<<"$pair"
+    mkdir -p "$(dirname "$lf")"
+    cp -p "$rf" "$lf"
+    log "Updated ${lf} from repo."
+  done
+
+  return 0
+}
+
 # -------- Main flow --------
 
 if [[ "$BUNDLE_ONLY" -eq 0 ]]; then
@@ -260,6 +447,14 @@ if [[ "$BUNDLE_ONLY" -eq 0 ]]; then
 fi
 
 collect_diags
+
+# Optional code audit / sync
+if [[ "$CODE_AUDIT" -eq 1 ]]; then
+  code_audit || log "Code audit encountered errors (see bundle)."
+  if [[ "$CODE_SYNC" -eq 1 ]]; then
+    code_sync || log "Code sync encountered errors."
+  fi
+fi
 
 if [[ "$RESTART" -eq 1 && "$BUNDLE_ONLY" -eq 0 ]]; then
   start_services
