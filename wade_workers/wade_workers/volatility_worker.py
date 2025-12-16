@@ -1,42 +1,38 @@
 """
-WADE Volatility3 Worker
+WADE Volatility3 Worker (Updated with error handling)
 
-Runs Volatility3 memory analysis modules against memory images.
-Supports configurable module lists via YAML config and environment overrides.
-
-Configuration:
-  YAML (wade_config.yaml):
-    volatility:
-      modules:
-        - windows.pslist
-        - windows.netscan
-      disabled_modules:
-        - windows.malfind
-  
-  Environment:
-    WADE_VOLATILITY_MODULES="windows.pslist,windows.netscan,windows.cmdline"
-    WADE_VOLATILITY_MODULES="+windows.registry.hivelist,-windows.malfind"
+Demonstrates proper exception handling, retry logic, and exit codes.
 """
 import json
+import subprocess
 from pathlib import Path
 from typing import List, Tuple
 
 from .base import BaseWorker, WorkerResult
-from .subprocess_utils import run_tool, get_default_registry, ToolNotFoundError
-from .logging import EventLogger, finalize_worker_records
+from .subprocess_utils import run_tool, get_default_registry
+from .logging import EventLogger, finalize_worker_records_with_ticket
 from .module_config import get_global_config
+from .ticket_schema import WorkerTicket
+
+# New imports for error handling
+from .exceptions import (
+    ToolNotFoundError,
+    ToolExecutionError,
+    ToolTimeoutError,
+    ParseError,
+    TicketValidationError,
+    FileAccessError,
+)
+from .retry import RetryConfig
+from .exit_codes import ExitCode
 
 
-# Default modules if not configured
 DEFAULT_MODULES = [
     "windows.info",
     "windows.pslist",
-    "windows.pstree", 
+    "windows.pstree",
     "windows.cmdline",
     "windows.netscan",
-    "windows.handles",
-    "windows.dlllist",
-    "windows.services",
 ]
 
 
@@ -52,56 +48,67 @@ class VolatilityWorker(BaseWorker):
         self.logger = EventLogger.get_logger("volatility_worker")
         self.module_config = get_global_config()
         
-        # Verify volatility3 is available
+        # Verify tool availability at init (fail fast)
         try:
-            get_default_registry().require_tool("volatility3")
+            self.vol_path = get_default_registry().require_tool("volatility3")
         except ToolNotFoundError:
-            # Also try vol.py as fallback
+            # Try fallback
             try:
-                get_default_registry().require_tool("vol.py")
-            except ToolNotFoundError:
-                self.logger.log_event(
-                    "worker.volatility.tool_missing",
-                    status="error",
-                    error="Neither 'volatility3' nor 'vol.py' found in PATH or WADE_VOLATILITY3_PATH"
+                self.vol_path = get_default_registry().require_tool("vol.py")
+            except ToolNotFoundError as e:
+                self.logger.log_worker_error(
+                    "volatility",
+                    "Tool not found - install volatility3 or set WADE_VOLATILITY3_PATH",
                 )
+                raise  # Re-raise for proper handling
 
-    def _resolve_host_and_image(self, ticket: dict) -> Tuple[str, Path]:
-        """Extract host and image path from ticket.
+    def _validate_ticket(self, ticket_dict: dict) -> WorkerTicket:
+        """Validate and parse ticket.
         
         Args:
-            ticket: Worker ticket dict
+            ticket_dict: Raw ticket dictionary
         
         Returns:
-            Tuple of (hostname, image_path)
+            Validated WorkerTicket
         
         Raises:
-            FileNotFoundError: If image doesn't exist
+            TicketValidationError: If ticket is invalid
         """
-        host = ticket.get("host") or self.env.get("WADE_HOSTNAME", "unknown_host")
+        try:
+            ticket = WorkerTicket.from_dict(ticket_dict)
+        except Exception as e:
+            raise TicketValidationError(
+                "Failed to parse ticket",
+                details={"error": str(e)},
+                suggestion="Check ticket schema version and format"
+            )
         
-        # Try various path keys
-        path_str = ticket.get("dest_path") or ticket.get("path") or ticket.get("image_path")
-        if not path_str:
-            raise ValueError("No image path specified in ticket (need 'dest_path', 'path', or 'image_path')")
+        # Validate required fields
+        if not ticket.metadata.dest_path:
+            raise TicketValidationError(
+                "Missing dest_path in ticket",
+                suggestion="Ensure staging daemon populates dest_path"
+            )
         
-        img_path = Path(path_str)
+        # Validate file exists
+        img_path = Path(ticket.metadata.dest_path)
         if not img_path.exists():
-            raise FileNotFoundError(f"Memory image not found: {img_path}")
+            raise FileAccessError(
+                f"Memory image not found: {img_path}",
+                details={"path": str(img_path)},
+                suggestion="Check if file was moved or deleted"
+            )
         
-        return host, img_path
+        if not img_path.is_file():
+            raise FileAccessError(
+                f"Path is not a file: {img_path}",
+                details={"path": str(img_path)}
+            )
+        
+        return ticket
 
     def _get_modules(self) -> List[str]:
-        """Get list of Volatility modules to run.
-        
-        Priority:
-          1. WADE_VOLATILITY_MODULES env var
-          2. YAML config volatility.modules
-          3. DEFAULT_MODULES constant
-        
-        Returns:
-            List of module names to execute
-        """
+        """Get list of Volatility modules to run."""
         return self.module_config.get_modules(
             tool="volatility",
             key="modules",
@@ -113,17 +120,23 @@ class VolatilityWorker(BaseWorker):
         module_name: str,
         image_path: Path,
         host: str,
+        retry_decorator,
     ) -> Tuple[List[dict], str]:
-        """Run a single Volatility module.
+        """Run a single Volatility module with retry logic.
         
         Args:
-            module_name: Module to run (e.g., "windows.pslist")
+            module_name: Module to run
             image_path: Path to memory image
             host: Hostname for logging
+            retry_decorator: Retry decorator for this tool
         
         Returns:
             Tuple of (parsed_records, error_message)
-            error_message is empty string on success
+        
+        Raises:
+            ToolExecutionError: If tool fails after retries
+            ToolTimeoutError: If tool times out
+            ParseError: If output parsing fails
         """
         self.logger.log_event(
             "worker.volatility.module_start",
@@ -132,45 +145,76 @@ class VolatilityWorker(BaseWorker):
             image_path=str(image_path),
         )
         
-        # Try volatility3 first, fallback to vol.py
-        tool_name = "volatility3"
-        try:
-            get_default_registry().require_tool(tool_name)
-        except ToolNotFoundError:
-            tool_name = "vol.py"
-        
-        args = ["-f", str(image_path), module_name, "-r", "json"]
-        
-        try:
+        # Apply retry decorator to execution
+        @retry_decorator
+        def execute_module():
+            args = ["-f", str(image_path), module_name, "-r", "json"]
+            
             result = run_tool(
-                tool_name,
+                "volatility3",
                 args,
                 timeout=300,  # 5 minutes per module
                 check=False,
             )
-        except Exception as e:
-            error = f"Failed to spawn {tool_name}: {e}"
-            self.logger.log_worker_error("volatility", error, module=module_name, host=host)
-            return [], error
+            
+            # Check for timeout
+            if result.timed_out:
+                raise ToolTimeoutError(
+                    f"Volatility module {module_name} timed out",
+                    tool="volatility3",
+                    timeout_sec=300,
+                )
+            
+            # Check for execution failure
+            if not result.success:
+                stderr = result.truncated_stderr()
+                
+                # Classify error
+                if "not found" in stderr.lower() or "no module named" in stderr.lower():
+                    raise ToolExecutionError(
+                        f"Module {module_name} not found or unsupported",
+                        tool="volatility3",
+                        returncode=result.rc,
+                        stderr=stderr,
+                        suggestion="Check module name or volatility version"
+                    )
+                else:
+                    raise ToolExecutionError(
+                        f"Volatility module {module_name} failed",
+                        tool="volatility3",
+                        returncode=result.rc,
+                        stderr=stderr,
+                    )
+            
+            return result
         
-        if not result.success:
-            error = f"rc={result.rc}, stderr={result.truncated_stderr()}"
+        # Execute with retry
+        try:
+            result = execute_module()
+        except (ToolExecutionError, ToolTimeoutError) as e:
+            # Log error
             self.logger.log_worker_error(
                 "volatility",
-                error,
+                str(e),
                 module=module_name,
                 host=host,
-                returncode=result.rc,
             )
-            # Return minimal error record for visibility
+            # Return error record for visibility
             return [{
                 "module": module_name,
-                "error": error,
-                "rc": result.rc,
-            }], error
+                "error": e.message,
+                "error_type": e.__class__.__name__,
+            }], str(e)
         
-        # Parse Volatility3 JSON output
-        records = self._parse_volatility_json(module_name, result.stdout)
+        # Parse output
+        try:
+            records = self._parse_volatility_json(module_name, result.stdout)
+        except Exception as e:
+            raise ParseError(
+                f"Failed to parse {module_name} output",
+                details={"module": module_name, "error": str(e)},
+                suggestion="Check volatility3 output format"
+            )
         
         self.logger.log_event(
             "worker.volatility.module_complete",
@@ -184,26 +228,19 @@ class VolatilityWorker(BaseWorker):
         return records, ""
 
     def _parse_volatility_json(self, module_name: str, stdout: str) -> List[dict]:
-        """Parse Volatility3 JSON output format.
-        
-        Volatility3 outputs JSON with "columns" and "rows" arrays.
-        Convert to list of dicts for easier downstream processing.
-        
-        Args:
-            module_name: Module that generated output
-            stdout: Raw stdout from volatility
-        
-        Returns:
-            List of record dicts
-        """
+        """Parse Volatility3 JSON output format."""
         if not stdout.strip():
             return []
         
         try:
             data = json.loads(stdout)
-        except json.JSONDecodeError:
-            # Malformed JSON - store as raw
-            return [{"module": module_name, "raw_output": stdout}]
+        except json.JSONDecodeError as e:
+            # Not valid JSON - wrap as raw
+            return [{
+                "module": module_name,
+                "raw_output": stdout,
+                "parse_error": str(e)
+            }]
         
         # Handle columns/rows format
         if isinstance(data, dict) and "columns" in data and "rows" in data:
@@ -213,14 +250,12 @@ class VolatilityWorker(BaseWorker):
             records = []
             for row in rows:
                 try:
-                    # Zip columns and row values
                     record = {
                         "module": module_name,
                         **{columns[i]: row[i] for i in range(min(len(columns), len(row)))}
                     }
                     records.append(record)
                 except Exception:
-                    # Malformed row - include as-is
                     records.append({"module": module_name, "row": row})
             
             return records
@@ -236,51 +271,76 @@ class VolatilityWorker(BaseWorker):
         # Unknown format
         return [{"module": module_name, "data": data}]
 
-    def run(self, ticket: dict) -> WorkerResult:
-        """Execute Volatility worker.
+    def run(self, ticket_dict: dict) -> WorkerResult:
+        """Execute Volatility worker with proper error handling.
         
         Args:
-            ticket: Worker ticket with image path and host info
+            ticket_dict: Worker ticket
         
         Returns:
             WorkerResult with execution summary
-        """
-        errors: List[str] = []
         
-        try:
-            host, img_path = self._resolve_host_and_image(ticket)
-        except (ValueError, FileNotFoundError) as e:
-            errors.append(str(e))
-            return WorkerResult(path=None, count=0, errors=errors)
+        Raises:
+            TicketValidationError: If ticket is invalid
+            ToolNotFoundError: If volatility not found
+            FileAccessError: If memory image inaccessible
+        """
+        # Validate ticket (raises on error)
+        ticket = self._validate_ticket(ticket_dict)
+        
+        host = ticket.metadata.hostname
+        img_path = Path(ticket.metadata.dest_path)
         
         self.logger.log_worker_start("volatility", host=host, image_path=str(img_path))
         
+        # Get modules
         modules = self._get_modules()
         if not modules:
-            errors.append("No modules configured - check YAML config or WADE_VOLATILITY_MODULES")
-            return WorkerResult(path=None, count=0, errors=errors)
+            raise TicketValidationError(
+                "No modules configured",
+                suggestion="Set WADE_VOLATILITY_MODULES or check config.yaml"
+            )
         
+        # Get retry decorator for this tool
+        retry_decorator = RetryConfig.get_retry_decorator("volatility")
+        
+        # Run modules
         total_records = 0
+        errors = []
         output_dir, _ = self._get_output_paths(host)
         
         for module_name in modules:
-            records, error = self._run_module(module_name, img_path, host)
+            try:
+                records, error = self._run_module(
+                    module_name,
+                    img_path,
+                    host,
+                    retry_decorator,
+                )
+                
+                if error:
+                    errors.append(f"{module_name}: {error}")
+                
+                if records:
+                    output_file = output_dir / f"{module_name.replace('.', '_')}.jsonl"
+                    count = finalize_worker_records_with_ticket(
+                        records,
+                        output_path=output_file,
+                        ticket=ticket,
+                        tool="volatility",
+                        module=module_name,
+                    )
+                    total_records += count
             
-            if error:
-                errors.append(f"{module_name}: {error}")
-            
-            if records:
-                # Write records to JSONL
-                output_file = output_dir / f"{module_name.replace('.', '_')}.jsonl"
-                count = finalize_worker_records(
-                    records,
-                    output_path=output_file,
-                    tool="volatility",
+            except ParseError as e:
+                # Parse errors are non-fatal; log and continue
+                errors.append(f"{module_name}: {e.message}")
+                self.logger.log_worker_error(
+                    "volatility",
+                    e.message,
                     module=module_name,
                     host=host,
-                    metadata={"image_path": str(img_path)},
                 )
-                total_records += count
         
         self.logger.log_worker_complete(
             "volatility",
@@ -292,13 +352,6 @@ class VolatilityWorker(BaseWorker):
         return WorkerResult(path=output_dir, count=total_records, errors=errors)
     
     def _get_output_paths(self, host: str) -> Tuple[Path, Path]:
-        """Get output and log directories for this host.
-        
-        Args:
-            host: Hostname
-        
-        Returns:
-            Tuple of (output_dir, log_dir)
-        """
+        """Get output and log directories."""
         from .utils import wade_paths
         return wade_paths(self.env, host, self.tool, self.module)
