@@ -1,81 +1,72 @@
-#!/usr/bin/env python3
-import os, sys, time, signal, subprocess
-from pathlib import Path
+import importlib
+from wade_workers.ticket_schema import WorkerTicket
+from staging.tool_routing import ToolRouting  # if runner can import; else duplicate tiny shim
+from wade_workers.logging import EventLogger
 
-try:
-    from wade_workers.utils import load_env
-except Exception:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from wade_workers.utils import load_env  # type: ignore
+WORKER_MAP = {
+    "volatility": ("wade_workers.volatility_worker", "VolatilityWorker"),
+    "dissect": ("wade_workers.dissect_worker", "DissectWorker"),
+    "plaso": ("wade_workers.plaso_worker", "PlasoWorker"),
+    "hayabusa": ("wade_workers.hayabusa_worker", "HayabusaWorker"),
+    "bulk_extractor": ("wade_workers.bulk_extractor_worker", "BulkExtractorWorker"),
+    "yara": ("wade_workers.yara_worker", "YaraWorker"),
+    # Optional/placeholder workers:
+    "autopsy": ("wade_workers.autopsy_manifest_worker", "AutopsyManifestWorker"),
+    "netcfg": ("wade_workers.netcfg_worker", "NetworkConfigWorker"),
+    "netdoc": ("wade_workers.netdoc_worker", "NetworkDocWorker"),
+}
 
-RUNNING = True
-def _stop(*_):
-    global RUNNING
-    RUNNING = False
-
-def _queue_root(env: dict) -> Path:
-    owner   = env.get("WADE_OWNER_USER","autopsy")
-    datadir = env.get("WADE_DATADIR","DataSources")
-    qdir    = env.get("WADE_QUEUE_DIR","_queue")
-    base = Path(f"/home/{owner}")/datadir
-    q = Path(qdir)
-    return q if q.is_absolute() else (base/q)
-
-def _tickets(qroot: Path):
-    for p in qroot.glob("*/*/*.json"):
-        if any(s in p.suffixes for s in (".work",".done",".dead",".tmp")):
-            continue
-        yield p
-
-def _lock(p: Path) -> Path | None:
-    locked = p.with_name(p.stem + f".work-{os.getpid()}" + "".join(p.suffixes))
+def _load_worker(module_name: str, class_name: str):
     try:
-        p.rename(locked)
-        return locked
+        mod = importlib.import_module(module_name)
+        return getattr(mod, class_name)
     except Exception:
         return None
 
-def main():
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
+def _resolve_worker(tool: str):
+    # alias handling
+    if tool == "yara_mem":
+        return WORKER_MAP.get("yara"), {"mode": "memory"}
+    return WORKER_MAP.get(tool), {}
 
-    env = load_env()
-    qroot = _queue_root(env)
-    cli = Path(__file__).resolve().parents[1] / "wade_workers" / "cli.py"
+def dispatch_ticket(ticket_path: Path, env: Optional[dict] = None) -> int:
+    logger = EventLogger.get_logger("queue_runner")
+    ticket = WorkerTicket.load(ticket_path)
 
-    print(f"[*] WADE queue runner watching {qroot}", flush=True)
-    qroot.mkdir(parents=True, exist_ok=True)
+    requested = (ticket.worker_config or {}).get("requested_tools") or []
+    if not requested:
+        # Fallback: compute on the fly (back-compat)
+        router = ToolRouting()
+        requested = router.select_tools(
+            classification=ticket.metadata.classification,
+            profile=(ticket.worker_config or {}).get("profile", "full"),
+            details={"os_family": ticket.metadata.os_family, **(ticket.metadata.custom or {})},
+            location=(ticket.worker_config or {}).get("location"),
+        )
 
-    while RUNNING:
-        worked = 0
-        for t in list(_tickets(qroot)):
-            l = _lock(t)
-            if not l:
-                continue
-            worked += 1
-            print(f"[*] lock {l.name} -> dispatching {cli.name}", flush=True)
-            try:
-                rc = subprocess.call([sys.executable, str(cli), str(l)])
-                base = l.with_suffix("")
-                if rc == 0:
-                    dst = base.with_suffix(".done.json")
-                    print(f"[+] {t.name} -> DONE", flush=True)
-                else:
-                    dst = base.with_suffix(".dead.json")
-                    print(f"[!] {t.name} -> DEAD (rc={rc})", flush=True)
-                dst.write_bytes(l.read_bytes())
-                l.unlink(missing_ok=True)
-            except Exception as e:
-                try:
-                    base = l.with_suffix("")
-                    base.with_suffix(".dead.json").write_bytes(l.read_bytes())
-                    print(f"[!] {t.name} -> DEAD (exception: {e})", flush=True)
-                    l.unlink(missing_ok=True)
-                except Exception:
-                    pass
+    exit_codes = []
+    for tool in requested:
+        entry, overrides = _resolve_worker(tool)
+        if not entry:
+            logger.log_event("queue.worker_skip", status="warning", tool=tool, reason="unknown_worker")
+            continue
+        mod_name, cls_name = entry
+        WorkerClass = _load_worker(mod_name, cls_name)
+        if not WorkerClass:
+            logger.log_event("queue.worker_skip", status="warning", tool=tool, reason="import_failed", module=mod_name, class_name=cls_name)
+            continue
 
-        if worked == 0:
-            time.sleep(2)
+        # Merge per-tool overrides into ticket.worker_config[tool]
+        wc = ticket.worker_config or {}
+        per_tool = wc.get(tool, {})
+        per_tool.update(overrides)
+        wc[tool] = per_tool
+        ticket.worker_config = wc
 
-if __name__ == "__main__":
-    main()
+        # Run worker
+        worker = WorkerClass(env=env)
+        result = worker.run(ticket.to_dict())
+        logger.log_event("queue.worker_done", status="info", tool=tool, records=result.count, errors=len(result.errors))
+        exit_codes.append(0 if not result.errors else 1)
+
+    return 0 if all(code == 0 for code in exit_codes) else 1
