@@ -2,6 +2,45 @@
 # Place this file at: /etc/wade/config.yaml or ./wade_config.yaml
 # Or set WADE_CONFIG_PATH environment variable
 
+# --- Routing (tool assignment) ---
+routing:
+  defaults:
+    e01:
+      full:  [dissect, hayabusa, autopsy, bulk_extractor]
+      light: [dissect, hayabusa]
+    disk_raw:
+      full:  [dissect, hayabusa, autopsy, bulk_extractor]
+      light: [dissect]
+    memory:
+      full:  [volatility, yara_mem]
+      light: [volatility]
+    vm_disk:
+      full:  [dissect]
+    vm_package:
+      full:  [dissect]
+    network_config:
+      full:  [netcfg]
+    network_doc:
+      full:  [netdoc]
+
+  # Optional: globally disable noisy/heavy tools
+  disabled_tools:
+    - autopsy   # enable later when Autopsy node is ready
+
+  # Optional: OS-specific adjustments
+  os_overrides:
+    windows:
+      add:
+        memory.full: [hayabusa]
+      remove:
+        memory.full: [autopsy]
+
+  # Optional: location-specific adjustments (from detect_profile location)
+  location_overrides:
+    datacenterA:
+      add:
+        e01.full: [yara_mem]
+
 # ============================================================================
 # Volatility3 Configuration
 # ============================================================================
