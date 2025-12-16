@@ -37,98 +37,50 @@ def ymd_from_mtime(p: Path) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
 
+def _sanitize(s: str) -> str:
+    s = re.sub(r'[<>:"|?*]', "_", s)
+    return s.strip().strip(". ")
+
+CLASSIFICATION_TO_SOURCETYPE = {
+    "memory": "memory",
+    "e01": "disk",
+    "disk_raw": "disk",
+    "vm_disk": "vm",
+    "vm_package": "vm",
+    "network_config": "network",
+    "network_doc": "network-docs",
+    "malware": "malware",
+    "misc": "misc",
+    "unknown": "misc",
+}
+
+def sourcetype_for(classification: str) -> str:
+    return CLASSIFICATION_TO_SOURCETYPE.get(str(classification).lower(), "misc")
+
 def build_destination(
     src: Path,
     root: Path,
     classification: str,
     details: Dict[str, Any],
 ) -> Path:
-    """Build destination path based on classification and metadata.
-    
-    Routing logic:
-      - network_config → Network/{hostname}/{filename}
-      - memory → Hosts/{hostname}{filename}
-      - e01 → Hosts/{hostname}/{filename}
-      - disk_raw, vm_disk → Hosts/{hostname}/{filename}
-      - vm_package → VM/{hostname}/{filename}
-      - malware → Malware/{filename}/
-      - misc → Hosts/{host_id}/{filename}
-      - unknown → Misc/{filename}
-    
-    Args:
-        src: Source file path
-        root: DataSources root directory
-        classification: File classification
-        details: Metadata dict from classifier
-    
-    Returns:
-        Destination path (may not exist yet)
     """
-    date_str = details.get("date_collected", ymd_from_mtime(src))
-    
-    # Primary identity is hostname; fall back to host_id or filename
+    New routing:
+      Raw evidence -> DataSources/$sourcetype/$hostname/<original_filename>
+    """
     hostname = details.get("hostname") or details.get("host_id") or src.stem
-    
-    # Sanitize hostname for filesystem
-    hostname = re.sub(r'[<>:"|?*]', "_", hostname)
-    hostname = hostname.strip(". ")
-    
-    # Choose directory structure based on classification
-    if classification == "network_config":
-        # Network configs grouped under DataSources/Network/<hostname>/
-        dir_ = root / "Network" / hostname
-        name = src.name
-    
-    elif classification == "memory":
-        # Memory dumps under Hosts/<hostname>
-        dir_ = root / "Hosts" / hostname 
-        name = src.name
-    
-    elif classification in ("e01", "disk_raw", "vm_disk"):
-        # Disk images under Hosts/<hostname>/<date>/
-        dir_ = root / "Hosts" / hostname 
-        name = src.name
-    
-    elif classification == "vm_package":
-        # VM packages (OVA/OVF) under VM/<hostname>/
-        dir_ = root / "VM" / hostname
-        name = src.name
-    
-    elif classification == "malware":
-        # Malware samples get own directory
-        dir_ = root / "Malware" / src.stem
-        name = src.name
-    
-    elif classification == "misc":
-        # Misc files under identified host
-        host_id = details.get("host_id", hostname)
-        dir_ = root / "Misc" / host_id
-        name = src.name
-    
-    elif classification == "network_doc":
-        # Network documentation
-        dir_ = root / "Network" / host_id
-        name = src.name
-    
-    else:
-        # Unknown classification → Misc/<date>/
-        dir_ = root / "Misc" / date_str
-        name = src.name
-    
-    # Ensure directory exists
+    hostname = _sanitize(hostname)
+    sourcetype = sourcetype_for(classification)
+
+    dir_ = root / sourcetype / hostname
     dir_.mkdir(parents=True, exist_ok=True)
-    
-    # Handle filename collisions
-    dest = dir_ / name
+
+    dest = dir_ / src.name
     counter = 1
     while dest.exists():
-        stem = src.stem
-        suffix = src.suffix
-        dest = dir_ / f"{stem}__{counter}{suffix}"
+        stem, suf = src.stem, src.suffix
+        dest = dir_ / f"{stem}__{counter}{suf}"
         counter += 1
-    
     return dest
-
 
 def detect_profile(path: Path, staging_root: Path) -> Tuple[str, Optional[str]]:
     """Detect staging profile from path structure.
