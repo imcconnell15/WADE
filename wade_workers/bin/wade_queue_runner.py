@@ -11,7 +11,7 @@ WORKER_MAP = {
     "bulk_extractor": ("wade_workers.bulk_extractor_worker", "BulkExtractorWorker"),
     "yara": ("wade_workers.yara_worker", "YaraWorker"),
     # Optional/placeholder workers:
-    "autopsy": ("wade_workers.autopsy_manifest_worker", "AutopsyManifestWorker"),
+    "autopsy": ("wade_workers.autopsy_manifest", "AutopsyManifestWorker"),
     "netcfg": ("wade_workers.netcfg_worker", "NetworkConfigWorker"),
     "netdoc": ("wade_workers.netdoc_worker", "NetworkDocWorker"),
 }
