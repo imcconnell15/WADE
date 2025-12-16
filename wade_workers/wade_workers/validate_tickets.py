@@ -18,10 +18,20 @@ from wade_workers.utils import load_env
 
 
 def validate_queue(queue_root: Path, verbose: bool = False) -> Dict[str, List]:
-    """Validate all tickets in queue.
+    """
+    Validate all WADE ticket JSON files under the given queue root and categorize results.
+    
+    Iterates ticket files beneath `queue_root`, skipping backup/temp filenames, validates each ticket, and groups outcomes into valid entries, warnings, and errors.
+    
+    Parameters:
+        queue_root (Path): Root directory containing the queue subdirectories with ticket JSON files.
+        verbose (bool): If True, print OK lines for valid tickets and warning details; errors are always printed.
     
     Returns:
-        Dict with 'valid', 'warnings', 'errors' lists
+        results (Dict[str, List]): Dictionary with three keys:
+            - "valid": list of ticket file paths (str) that passed validation.
+            - "warnings": list of {"path": str, "issues": [str, ...]} entries for tickets with non-critical issues.
+            - "errors": list of {"path": str, "issues": [str, ...]} entries for tickets with critical issues or load failures (load failures use an issue string starting with "Load failed:").
     """
     results = {
         "valid": [],
@@ -76,6 +86,18 @@ def validate_queue(queue_root: Path, verbose: bool = False) -> Dict[str, List]:
 
 
 def main():
+    """
+    Parse CLI arguments, validate WADE tickets in a queue directory, and print a summary or JSON report.
+    
+    When a positional queue_root is provided, it is used; otherwise the queue root is derived from environment variables
+    (WADE_OWNER_USER, WADE_DATADIR, WADE_QUEUE_DIR) under /home/{owner}. Exits immediately if the queue root does not exist.
+    Runs validate_queue on the resolved path, prints progress and a human-readable summary to stderr unless --json is
+    specified (which prints the raw JSON results to stdout). The --verbose flag causes per-ticket valid messages and
+    warnings to be printed.
+    
+    Returns:
+        exit_code (int): 1 if the queue root was missing or any tickets produced errors, 0 otherwise.
+    """
     parser = argparse.ArgumentParser(description="Validate WADE tickets")
     parser.add_argument("queue_root", nargs="?", help="Queue root directory")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show all tickets including valid")

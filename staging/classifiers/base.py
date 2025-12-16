@@ -25,12 +25,21 @@ class ClassificationResult:
     
     @property
     def success(self) -> bool:
-        """True if classification succeeded."""
+        """
+        Indicates whether the classification represents a successful, non-error result.
+        
+        @returns `true` if the classification is not "unknown" and `error` is None, `false` otherwise.
+        """
         return self.classification != "unknown" and self.error is None
     
     @property
     def is_unknown(self) -> bool:
-        """True if classification is unknown."""
+        """
+        Indicates whether the classification equals "unknown".
+        
+        Returns:
+            True if classification equals "unknown", False otherwise.
+        """
         return self.classification == "unknown"
 
 
@@ -44,24 +53,25 @@ class Classifier(Protocol):
     priority: int
     
     def can_classify(self, path: Path, head_bytes: bytes) -> bool:
-        """Quick check if this classifier applies.
+        """
+        Determine whether this classifier should attempt to classify the given file.
         
-        Args:
-            path: File path
-            head_bytes: First N bytes of file
+        Parameters:
+            path (Path): Path to the file to inspect.
+            head_bytes (bytes): Leading bytes of the file (first N bytes) used for quick applicability checks.
         
         Returns:
-            True if classifier should attempt classification
+            bool: `True` if the classifier should attempt classification, `False` otherwise.
         """
         ...
     
     def classify(self, path: Path) -> ClassificationResult:
-        """Classify file and extract metadata.
+        """
+        Determine the file's classification and extract relevant metadata.
         
-        Args:
-            path: File path
+        May set `error` on the returned result if classification fails; `confidence` is in the range 0.0–1.0 and `details` contains classifier-specific metadata.
         
         Returns:
-            ClassificationResult
+            ClassificationResult: Object containing the classification label, confidence, details, and optional error message.
         """
         ...

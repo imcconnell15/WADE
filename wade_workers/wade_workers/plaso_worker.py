@@ -18,14 +18,39 @@ class PlasoWorker(BaseWorker):
     help_text = "Run log2timeline + psort; export JSONL wrapped with ticket envelope."
 
     def __init__(self, env=None, config=None):
+        """
+        Initialize the PlasoWorker by invoking the base initializer, setting up the worker logger, and loading global configuration.
+        
+        Parameters:
+            env: Optional environment overrides for the worker.
+            config: Optional configuration fragment for the worker.
+        """
         super().__init__(env, config)
         self.logger = EventLogger.get_logger("plaso_worker")
         self.cfg = get_global_config()
 
     def _get_psort_modules(self) -> List[str]:
+        """
+        Retrieve the configured psort output modules for the "plaso" tool.
+        
+        Returns:
+            List[str]: A list of psort output module names; if none are configured, returns DEFAULT_OUTPUT_MODULES.
+        """
         return self.cfg.get_modules("plaso", key="output_modules", default=DEFAULT_OUTPUT_MODULES)
 
     def run(self, ticket_dict: dict) -> WorkerResult:
+        """
+        Process an input image with log2timeline and psort modules, wrap each psort record with the ticket's artifact envelope, and write per-module JSONL outputs.
+        
+        Parameters:
+            ticket_dict (dict): Dictionary representation of a WorkerTicket containing metadata (including `dest_path` and optional `hostname`) and artifact envelope information.
+        
+        Returns:
+            WorkerResult: Result containing:
+                - path: parent directory of the processed image, or None if processing failed before output creation.
+                - count: total number of records written across all processed psort modules.
+                - errors: list of error messages encountered (e.g., "Input not found: <path>", "log2timeline failed: <msg>", or "psort <module> failed: <msg>").
+        """
         ticket = WorkerTicket.from_dict(ticket_dict)
         host = ticket.metadata.hostname or "unknown_host"
         img_path = Path(ticket.metadata.dest_path)

@@ -17,6 +17,16 @@ WORKER_MAP = {
 }
 
 def _load_worker(module_name: str, class_name: str):
+    """
+    Dynamically load a worker class by module import path and class name.
+    
+    Parameters:
+        module_name (str): Module import path (e.g., "package.module").
+        class_name (str): Name of the class or attribute to retrieve from the module.
+    
+    Returns:
+        type | None: The class object if successfully imported and found, `None` if the module cannot be imported or the attribute is missing.
+    """
     try:
         mod = importlib.import_module(module_name)
         return getattr(mod, class_name)
@@ -25,11 +35,32 @@ def _load_worker(module_name: str, class_name: str):
 
 def _resolve_worker(tool: str):
     # alias handling
+    """
+    Resolve a tool name to its worker mapping and any per-tool configuration overrides.
+    
+    Parameters:
+        tool (str): Tool identifier requested for dispatch.
+    
+    Returns:
+        tuple: A pair (worker_entry, overrides) where `worker_entry` is the (module_name, class_name) tuple from WORKER_MAP or `None` if unknown, and `overrides` is a dict of per-tool configuration overrides (empty when there are none).
+    """
     if tool == "yara_mem":
         return WORKER_MAP.get("yara"), {"mode": "memory"}
     return WORKER_MAP.get(tool), {}
 
 def dispatch_ticket(ticket_path: Path, env: Optional[dict] = None) -> int:
+    """
+    Dispatch a worker ticket to the appropriate worker implementations and return a composite exit status.
+    
+    Loads a WorkerTicket from ticket_path, determines the list of requested tools (from the ticket or via ToolRouting fallback), resolves and dynamically loads worker classes for each tool, merges any per-tool configuration overrides into the ticket, invokes each worker with the ticket data, logs per-tool outcomes, and treats unknown tools or import failures as skipped. Each worker's result contributes a success (0) if it produced no errors or a failure (1) if it produced any errors; the function returns 0 only when every dispatched worker reported no errors.
+    
+    Parameters:
+        ticket_path (Path): Path to the worker ticket file to load and dispatch.
+        env (Optional[dict]): Optional environment dictionary passed to each worker instance (may be None).
+    
+    Returns:
+        int: 0 if every dispatched worker completed with no errors, 1 otherwise.
+    """
     logger = EventLogger.get_logger("queue_runner")
     ticket = WorkerTicket.load(ticket_path)
 

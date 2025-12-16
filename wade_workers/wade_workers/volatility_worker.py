@@ -44,6 +44,18 @@ class VolatilityWorker(BaseWorker):
     help_text = "Run Volatility3 modules against a memory image. Outputs JSONL per module."
 
     def __init__(self, env=None, config=None):
+        """
+        Initialize the VolatilityWorker, configure logging and module settings, and verify that a Volatility3 executable is available.
+        
+        Initializes the base worker, obtains an EventLogger named "volatility_worker", loads global module configuration, and attempts to locate the Volatility3 tool on construction. If "volatility3" is not found, attempts a fallback to "vol.py"; if neither is available, logs a worker error and re-raises the underlying ToolNotFoundError.
+        
+        Parameters:
+            env: Optional environment or runtime context used by the base worker.
+            config: Optional configuration overrides for this worker.
+        
+        Raises:
+            ToolNotFoundError: If neither "volatility3" nor "vol.py" can be located in the tool registry.
+        """
         super().__init__(env, config)
         self.logger = EventLogger.get_logger("volatility_worker")
         self.module_config = get_global_config()
@@ -63,16 +75,18 @@ class VolatilityWorker(BaseWorker):
                 raise  # Re-raise for proper handling
 
     def _validate_ticket(self, ticket_dict: dict) -> WorkerTicket:
-        """Validate and parse ticket.
+        """
+        Validate and convert a raw ticket dictionary into a WorkerTicket, ensuring the ticket contains a destination path that exists and is a file.
         
-        Args:
-            ticket_dict: Raw ticket dictionary
+        Parameters:
+            ticket_dict (dict): Raw ticket dictionary to validate and parse.
         
         Returns:
-            Validated WorkerTicket
+            WorkerTicket: The parsed and validated ticket.
         
         Raises:
-            TicketValidationError: If ticket is invalid
+            TicketValidationError: If the ticket cannot be parsed or required fields (such as dest_path) are missing.
+            FileAccessError: If the destination path does not exist or is not a file.
         """
         try:
             ticket = WorkerTicket.from_dict(ticket_dict)
@@ -122,21 +136,17 @@ class VolatilityWorker(BaseWorker):
         host: str,
         retry_decorator,
     ) -> Tuple[List[dict], str]:
-        """Run a single Volatility module with retry logic.
+        """
+        Run a Volatility3 module against a memory image and return parsed JSON records.
         
-        Args:
-            module_name: Module to run
-            image_path: Path to memory image
-            host: Hostname for logging
-            retry_decorator: Retry decorator for this tool
+        Parameters:
+            retry_decorator: A decorator that applies retry logic to the module execution.
         
         Returns:
-            Tuple of (parsed_records, error_message)
+            (records, error): `records` is a list of parsed result dictionaries produced from the module's JSON output; `error` is an error message string when execution failed or an empty string on success.
         
         Raises:
-            ToolExecutionError: If tool fails after retries
-            ToolTimeoutError: If tool times out
-            ParseError: If output parsing fails
+            ParseError: If the module's stdout cannot be parsed into records.
         """
         self.logger.log_event(
             "worker.volatility.module_start",
@@ -148,6 +158,16 @@ class VolatilityWorker(BaseWorker):
         # Apply retry decorator to execution
         @retry_decorator
         def execute_module():
+            """
+            Run the specified Volatility module against the given image and return the tool result.
+            
+            Returns:
+                result: The completed tool run result from run_tool containing stdout/stderr, return code, and timing.
+            
+            Raises:
+                ToolTimeoutError: If the tool does not finish within 300 seconds.
+                ToolExecutionError: If the tool exits with a non-zero status; message indicates whether the module appears missing/unsupported or a general failure.
+            """
             args = ["-f", str(image_path), module_name, "-r", "json"]
             
             result = run_tool(
@@ -228,7 +248,23 @@ class VolatilityWorker(BaseWorker):
         return records, ""
 
     def _parse_volatility_json(self, module_name: str, stdout: str) -> List[dict]:
-        """Parse Volatility3 JSON output format."""
+        """
+        Convert Volatility3 JSON stdout into a list of record dictionaries.
+        
+        Parses the tool stdout (expected JSON) and normalizes several Volatility3 output shapes into a list of records. Behavior:
+        - If stdout is empty or whitespace, returns an empty list.
+        - If stdout is not valid JSON, returns a single record with `module`, `raw_output`, and `parse_error`.
+        - If JSON is an object with `columns` and `rows`, maps each row to a record using column names; on mapping failure a record with the raw `row` is returned.
+        - If JSON is a list, each item is emitted as a record; dict items are merged into the record, non-dict items are placed under the `data` key.
+        - For any other JSON value, returns a single record with the parsed value under `data`.
+        
+        Parameters:
+            module_name (str): Name of the Volatility module that produced the output.
+            stdout (str): Raw stdout from the Volatility tool.
+        
+        Returns:
+            List[dict]: A list of normalized records representing the parsed output.
+        """
         if not stdout.strip():
             return []
         
@@ -272,18 +308,19 @@ class VolatilityWorker(BaseWorker):
         return [{"module": module_name, "data": data}]
 
     def run(self, ticket_dict: dict) -> WorkerResult:
-        """Execute Volatility worker with proper error handling.
+        """
+        Run configured Volatility3 modules against the memory image referenced by ticket_dict and write per-module JSONL outputs.
         
-        Args:
-            ticket_dict: Worker ticket
+        Parameters:
+            ticket_dict (dict): Worker ticket dictionary containing required metadata (e.g., dest_path and hostname).
         
         Returns:
-            WorkerResult with execution summary
+            WorkerResult: Aggregated result containing the output directory path, total record count, and any error messages.
         
         Raises:
-            TicketValidationError: If ticket is invalid
-            ToolNotFoundError: If volatility not found
-            FileAccessError: If memory image inaccessible
+            TicketValidationError: If the provided ticket_dict is invalid or missing required fields.
+            ToolNotFoundError: If the Volatility tool cannot be located.
+            FileAccessError: If the referenced memory image does not exist or is not accessible.
         """
         # Validate ticket (raises on error)
         ticket = self._validate_ticket(ticket_dict)
@@ -352,6 +389,14 @@ class VolatilityWorker(BaseWorker):
         return WorkerResult(path=output_dir, count=total_records, errors=errors)
     
     def _get_output_paths(self, host: str) -> Tuple[Path, Path]:
-        """Get output and log directories."""
+        """
+        Return the output and log directory paths for a worker run on the given host.
+        
+        Parameters:
+            host (str): Host identifier used to determine per-run output and log locations.
+        
+        Returns:
+            (Path, Path): A tuple (output_dir, log_dir) containing the filesystem paths for storing worker output and logs.
+        """
         from .utils import wade_paths
         return wade_paths(self.env, host, self.tool, self.module)

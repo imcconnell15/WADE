@@ -90,6 +90,13 @@ class DissectWorker(BaseWorker):
     help_text = "Run Dissect target-info and OS-specific target-query plugins."
 
     def __init__(self, env=None, config=None):
+        """
+        Initialize the DissectWorker: set up logging, load global module configuration, and verify required external tools.
+        
+        Parameters:
+            env: Optional environment/configuration context passed to the base worker.
+            config: Optional runtime configuration overrides.
+        """
         super().__init__(env, config)
         self.logger = EventLogger.get_logger("dissect_worker")
         self.module_config = get_global_config()
@@ -107,7 +114,24 @@ class DissectWorker(BaseWorker):
                 )
 
     def _resolve_host_and_image(self, ticket: dict) -> Tuple[str, Path]:
-        """Extract host and image path from ticket."""
+        """
+        Resolve and return the target host name and image Path extracted from a ticket.
+        
+        Parameters:
+            ticket (dict): Ticket data where the image path is looked up from the keys
+                "dest_path", "path", or "image_path". May optionally contain "host" to
+                explicitly specify the host name.
+        
+        Returns:
+            Tuple[str, Path]: A tuple (host, image_path) where `host` is taken from
+                ticket["host"] if present, otherwise derived from the image parent
+                directory name or the WADE_HOSTNAME environment value, and `image_path`
+                is a Path object pointing to the existing image file.
+        
+        Raises:
+            ValueError: If no image path is present in the ticket.
+            FileNotFoundError: If the resolved image path does not exist.
+        """
         path_str = ticket.get("dest_path") or ticket.get("path") or ticket.get("image_path")
         if not path_str:
             raise ValueError("No image path specified in ticket")
@@ -126,15 +150,13 @@ class DissectWorker(BaseWorker):
         return host, img_path
 
     def _get_target_info(self, image_path: Path, host: str) -> Tuple[Dict, str]:
-        """Run target-info to get OS and metadata.
+        """
+        Obtain target metadata and determine the OS family by running the external `target-info` tool against the given image.
         
-        Args:
-            image_path: Path to target image
-            host: Hostname for logging
+        Parses the first JSON object produced by `target-info` as the metadata dictionary and derives `os_family` from common schema keys; `os_family` is returned as a lowercase string.
         
         Returns:
-            Tuple of (info_dict, os_family)
-            Returns ({}, "") on error
+            tuple: `(info_dict, os_family)` where `info_dict` is the parsed metadata dictionary and `os_family` is the detected OS family in lowercase. Returns `({}, "")` if the tool is missing, fails, or JSON cannot be parsed.
         """
         self.logger.log_event(
             "worker.dissect.target_info_start",
@@ -199,20 +221,17 @@ class DissectWorker(BaseWorker):
         return info, os_family
 
     def _get_plugins(self, os_family: str, ticket: dict) -> List[str]:
-        """Get plugin list based on OS family.
+        """
+        Determine the list of Dissect plugins to run for a target.
         
-        Priority:
-          1. ticket["plugins"] (explicit override)
-          2. Environment variable
-          3. YAML config
-          4. Default plugin bundles
+        Selection order: explicit ticket override, environment/YAML configuration, then built-in defaults for the detected OS family.
         
-        Args:
-            os_family: OS family from target-info ("windows", "linux", etc.)
-            ticket: Worker ticket (may contain plugins override)
+        Parameters:
+            os_family (str): OS family string produced by target-info (e.g., "windows", "linux").
+            ticket (dict): Worker ticket which may include a "plugins" override (string of comma-separated names or a list/tuple).
         
         Returns:
-            List of plugin names
+            List[str]: Ordered list of plugin names to execute.
         """
         # Explicit ticket override
         if "plugins" in ticket:
@@ -253,16 +272,17 @@ class DissectWorker(BaseWorker):
         host: str,
         os_family: str,
     ) -> Tuple[List[dict], str]:
-        """Run a single target-query plugin.
+        """
+        Execute a single target-query plugin against an image, convert its output to JSON records, and annotate each record with plugin and OS metadata.
         
-        Args:
-            plugin: Plugin name (e.g., "prefetch")
-            image_path: Path to target image
-            host: Hostname for logging
-            os_family: OS family for metadata
+        Parameters:
+            plugin (str): Plugin identifier (for example, "prefetch").
+            image_path (Path): Filesystem path to the target image to examine.
+            host (str): Hostname used for logging and event context.
+            os_family (str): Operating system family value to attach to each record (e.g., "windows", "linux").
         
         Returns:
-            Tuple of (parsed_records, error_message)
+            Tuple[List[dict], str]: A pair where the first element is a list of parsed JSON objects produced by the plugin (each annotated with `_plugin` and `_os_family`), and the second element is an error message string (empty on success).
         """
         self.logger.log_event(
             "worker.dissect.plugin_start",
@@ -343,19 +363,14 @@ class DissectWorker(BaseWorker):
             return [], f"{plugin}: {e}"
 
     def run(self, ticket: dict) -> WorkerResult:
-        """Execute Dissect worker.
+        """
+        Run Dissect analysis for a ticket: discover OS, select plugins, execute each plugin, and write JSONL records.
         
-        Workflow:
-          1. Run target-info to get OS
-          2. Select plugin bundle for OS
-          3. Run each plugin via target-query | rdump
-          4. Write JSONL records
-        
-        Args:
-            ticket: Worker ticket
+        Parameters:
+            ticket (dict): Worker ticket containing image path and optional overrides (e.g., "host", "plugins").
         
         Returns:
-            WorkerResult with execution summary
+            WorkerResult: Summary of execution including output path (or None on failure), total record count, and a list of errors encountered.
         """
         errors: List[str] = []
         
@@ -413,6 +428,14 @@ class DissectWorker(BaseWorker):
         return WorkerResult(path=output_dir, count=total_records, errors=errors)
     
     def _get_output_paths(self, host: str) -> Tuple[Path, Path]:
-        """Get output and log directories."""
+        """
+        Compute the worker's output and log directory paths for a given host.
+        
+        Parameters:
+            host (str): Host identifier used to derive workspace paths.
+        
+        Returns:
+            Tuple[Path, Path]: A pair (output_dir, log_dir) representing the output directory and the log directory.
+        """
         from .utils import wade_paths
         return wade_paths(self.env, host, self.tool, self.module)

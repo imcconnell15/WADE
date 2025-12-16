@@ -14,11 +14,29 @@ class YaraWorker(BaseWorker):
     module = "scan"
 
     def __init__(self, env=None, config=None):
+        """
+        Initialize the YaraWorker, configure its per-worker logger, and load global configuration.
+        
+        Parameters:
+            env (optional): Execution environment identifier or context used by the worker.
+            config (optional): Worker-specific configuration overrides.
+        """
         super().__init__(env, config)
         self.logger = EventLogger.get_logger("yara_worker")
         self.cfg = get_global_config()
 
     def run(self, ticket_dict: dict) -> WorkerResult:
+        """
+        Run YARA on the ticket's destination path and write one JSON-line artifact per match.
+        
+        Processes the provided ticket dictionary to locate the target file or directory, reads YARA configuration (ruleset and optional timeout), executes the YARA tool against the target, and writes each non-empty match line as a JSON object (merged with the ticket's artifact envelope) to the worker output file. On success returns the output directory and the number of match records written; on failure returns a WorkerResult with no path, a count of 0, and an error message.
+        
+        Parameters:
+            ticket_dict (dict): Serialized WorkerTicket dictionary containing metadata (including `dest_path` and `hostname`) and artifact envelope data.
+        
+        Returns:
+            WorkerResult: On success, `path` is the worker output directory and `count` is the number of match records written. On failure, `path` is None, `count` is 0, and `errors` contains one descriptive error message.
+        """
         ticket = WorkerTicket.from_dict(ticket_dict)
         host = ticket.metadata.hostname or "unknown_host"
         target = Path(ticket.metadata.dest_path)

@@ -55,12 +55,13 @@ class EventLogger:
         source: str,
         rotate_daily: bool = True,
     ):
-        """Initialize event logger.
+        """
+        Create an EventLogger configured to write JSONL events for a given source.
         
-        Args:
-            log_dir: Directory for log files
-            source: Source identifier (e.g., "volatility_worker", "stage_daemon")
-            rotate_daily: Create new file each day (YYYY-MM-DD.jsonl)
+        Parameters:
+            log_dir (Path): Directory where log files will be stored; the directory is created if it does not exist.
+            source (str): Identifier for the event source (used in filenames and the event `source` field).
+            rotate_daily (bool): If True, use daily-rotated files named "{source}_{YYYY-MM-DD}.jsonl"; if False, use a single "{source}.jsonl" file.
         """
         self.log_dir = Path(log_dir)
         self.source = source
@@ -71,7 +72,12 @@ class EventLogger:
         self._logger = logging.getLogger(f"wade.{source}")
     
     def _get_log_path(self) -> Path:
-        """Get current log file path."""
+        """
+        Compute the file path used for writing the current log.
+        
+        Returns:
+            Path: Path to the JSONL log file. If `rotate_daily` is True the filename is "{source}_{YYYY-MM-DD}.jsonl" using the current UTC date; otherwise the filename is "{source}.jsonl".
+        """
         if self.rotate_daily:
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             return self.log_dir / f"{self.source}_{date_str}.jsonl"
@@ -131,13 +137,17 @@ class EventLogger:
         host: Optional[str] = None,
         **extra_fields: Any,
     ) -> Path:
-        """Log worker start event with standard fields.
+        """
+        Emit a "worker.<tool>.start" event containing standard identifying fields.
         
-        Args:
-            tool: Tool name (e.g., "volatility3")
-            module: Module/plugin name (e.g., "windows.pslist")
-            host: Host/system name
-            **extra_fields: Additional fields
+        Parameters:
+            tool (str): Tool name (e.g., "volatility3").
+            module (Optional[str]): Module or plugin name (e.g., "windows.pslist").
+            host (Optional[str]): Host or system name where the worker runs.
+            **extra_fields: Additional event fields to include.
+        
+        Returns:
+            Path: Path to the log file the event was written to.
         """
         return self.log_event(
             f"worker.{tool}.start",
@@ -158,16 +168,20 @@ class EventLogger:
         output_path: Optional[Path] = None,
         **extra_fields: Any,
     ) -> Path:
-        """Log worker completion with results.
+        """
+        Record a successful worker completion event with optional metadata.
         
-        Args:
-            tool: Tool name
-            module: Module/plugin name
-            host: Host/system name
-            record_count: Number of records/artifacts found
-            duration_sec: Execution time
-            output_path: Path to output file
-            **extra_fields: Additional fields
+        Parameters:
+            tool: Name of the tool or worker that completed.
+            module: Optional module or plugin name associated with the run.
+            host: Optional host or system identifier where the work ran.
+            record_count: Optional number of records or artifacts produced.
+            duration_sec: Optional execution duration in seconds.
+            output_path: Optional path to the worker's output; included in the event as a string if provided.
+            **extra_fields: Additional event fields to include.
+        
+        Returns:
+            Path to the log file that the event was written to.
         """
         return self.log_event(
             f"worker.{tool}.complete",
@@ -189,14 +203,18 @@ class EventLogger:
         host: Optional[str] = None,
         **extra_fields: Any,
     ) -> Path:
-        """Log worker error.
+        """
+        Record an error event for a worker tool.
         
-        Args:
-            tool: Tool name
-            error_msg: Error description
-            module: Module/plugin name
-            host: Host/system name
-            **extra_fields: Additional fields
+        Parameters:
+            tool (str): The tool name associated with the worker.
+            error_msg (str): Human-readable error description.
+            module (Optional[str]): Optional module or plugin name that ran the tool.
+            host (Optional[str]): Optional host or system identifier where the worker ran.
+            **extra_fields: Any additional event fields to include in the logged record.
+        
+        Returns:
+            Path: Path to the JSONL log file that the event was appended to.
         """
         return self.log_event(
             f"worker.{tool}.error",
@@ -215,13 +233,17 @@ class EventLogger:
         confidence: Optional[float] = None,
         **extra_fields: Any,
     ) -> Path:
-        """Log file classification event.
+        """
+        Log a staging classification event for a file.
         
-        Args:
-            file_path: File that was classified
-            classification: Classification result (e.g., "e01", "memory_dump")
-            confidence: Classification confidence (0.0-1.0)
-            **extra_fields: Additional fields
+        Parameters:
+            file_path (Path): Path of the file that was classified.
+            classification (str): Classification label (e.g., "e01", "memory_dump").
+            confidence (Optional[float]): Confidence score from 0.0 to 1.0.
+            **extra_fields: Any additional event fields to include.
+        
+        Returns:
+            log_path (Path): Path to the JSONL log file the event was written to.
         """
         return self.log_event(
             "staging.classification",
@@ -238,14 +260,15 @@ class EventLogger:
         source: str,
         log_dir: Optional[Path] = None,
     ) -> EventLogger:
-        """Get or create logger for a source.
+        """
+        Obtain an EventLogger configured for the given source and log directory.
         
-        Args:
-            source: Source identifier
-            log_dir: Log directory (default: /data/logs or $WADE_LOG_DIR)
+        Parameters:
+            source (str): Identifier for the event source (e.g., worker name).
+            log_dir (Optional[Path]): Directory to store logs. If omitted, resolved from the WADE_LOG_DIR environment variable or defaults to /data/logs.
         
         Returns:
-            EventLogger instance
+            EventLogger: An EventLogger instance configured with the resolved log directory and provided source.
         """
         if log_dir is None:
             import os
@@ -261,30 +284,18 @@ def finalize_worker_records_with_ticket(
     tool: str,
     module: str,
 ) -> int:
-    """Write worker output with ticket metadata envelope.
+    """
+    Write records to a JSONL file, merging each record with an artifact envelope obtained from the provided ticket.
     
-    This replaces finalize_worker_records() for v2.0 tickets.
-    Each record gets the full ticket metadata for Splunk searchability.
-    
-    Args:
-        records: List of record dicts
-        output_path: Output JSONL file
-        ticket: WorkerTicket with metadata
-        tool: Tool name
-        module: Module name
+    Parameters:
+        records (List[Dict[str, Any]]): Records to write; each becomes one JSON object line after merging with the envelope.
+        output_path (Path): Destination JSONL file path; parent directories will be created if missing.
+        ticket (WorkerTicket): Ticket used to obtain the artifact envelope via ticket.get_artifact_envelope(tool, module).
+        tool (str): Tool name used to request the envelope.
+        module (str): Module name used to request the envelope.
     
     Returns:
-        Number of records written
-    
-    Example:
-        records = parse_tool_output(result.stdout)
-        count = finalize_worker_records_with_ticket(
-            records,
-            output_path=Path("/data/output/pslist.jsonl"),
-            ticket=ticket,
-            tool="volatility",
-            module="windows.pslist",
-        )
+        int: Number of records written.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     

@@ -19,17 +19,17 @@ from .config import (
 
 
 def read_head(p: Path, max_bytes: int = HEAD_SCAN_BYTES) -> bytes:
-    """Read head and tail of file for magic byte detection.
+    """
+    Read initial and trailing bytes from a file to sample content for detection.
     
-    For small files, reads entire content.
-    For large files, reads first 256KB + last 256KB.
+    If the file size cannot be obtained or a read error occurs, returns empty bytes. If the file size is less than or equal to max_bytes, returns the entire file. If the file is larger, returns the concatenation of the first max_bytes//2 bytes and the last max_bytes//2 bytes.
     
-    Args:
-        p: File path
-        max_bytes: Maximum bytes to read (default: 512KB)
+    Parameters:
+        p (Path): Path to the file to sample.
+        max_bytes (int): Maximum total bytes to return (default 512KB); when the file is larger, the returned bytes consist of a head and tail chunk of size max_bytes//2 each.
     
     Returns:
-        Bytes from file head+tail
+        bytes: Sampled bytes from the file, or empty bytes on error.
     """
     try:
         size = p.stat().st_size
@@ -55,14 +55,15 @@ def read_head(p: Path, max_bytes: int = HEAD_SCAN_BYTES) -> bytes:
 
 
 def is_probably_text(p: Path, sample_bytes: int = TEXT_SNIFF_BYTES) -> Tuple[bool, str]:
-    """Check if file is text and return sample.
+    """
+    Determine whether a file is likely text and provide a decoded sample.
     
-    Args:
-        p: File path
-        sample_bytes: Bytes to sample (default: 4KB)
+    Parameters:
+        p (Path): Path to the file to inspect.
+        sample_bytes (int): Maximum number of bytes to read from the file for analysis.
     
     Returns:
-        Tuple of (is_text: bool, text_sample: str)
+        (bool, str): `True` and a decoded text sample if the file is likely text; `False` and an empty string otherwise.
     """
     try:
         sample = p.read_bytes()[:sample_bytes]
@@ -94,16 +95,17 @@ def is_probably_text(p: Path, sample_bytes: int = TEXT_SNIFF_BYTES) -> Tuple[boo
 
 
 def extract_text_snippet(p: Path, max_bytes: int = 1024 * 1024) -> str:
-    """Extract text snippet from file for OS detection.
+    """
+    Extract a decoded text snippet from the start of a file for OS detection.
     
-    Reads up to max_bytes from file and attempts text decode.
+    Reads up to `max_bytes` from the file and returns a decoded string. Prefers UTF-8 decoding and falls back to Latin-1; returns an empty string on read or decode failure.
     
-    Args:
-        p: File path
-        max_bytes: Maximum bytes to read (default: 1MB)
+    Parameters:
+        p (Path): Path of the file to read.
+        max_bytes (int): Maximum number of bytes to read from the file (default: 1_048_576).
     
     Returns:
-        Decoded text (empty string on failure)
+        str: Decoded text snippet, or an empty string on failure.
     """
     try:
         data = p.read_bytes()[:max_bytes]
@@ -124,13 +126,14 @@ def extract_text_snippet(p: Path, max_bytes: int = 1024 * 1024) -> str:
 
 
 def calculate_entropy(data: bytes) -> float:
-    """Calculate Shannon entropy of byte sequence.
+    """
+    Compute the Shannon entropy of a byte sequence.
     
-    Args:
-        data: Byte sequence
+    Parameters:
+        data (bytes): Bytes to analyze; if empty, the function returns 0.0.
     
     Returns:
-        Entropy value (0.0 - 8.0)
+        float: Shannon entropy in bits per byte, between 0.0 and 8.0.
     """
     if not data:
         return 0.0
@@ -150,13 +153,14 @@ def calculate_entropy(data: bytes) -> float:
 
 
 def no_open_writers(p: Path) -> bool:
-    """Check if file has open writers using lsof.
+    """
+    Determine whether no processes have the file open for writing by probing lsof.
     
-    Args:
-        p: File path
+    Parameters:
+        p (Path): Path to the file to check.
     
     Returns:
-        True if no writers detected, False otherwise
+        bool: `True` if no writers are detected. Also returns `True` when verification is disabled or lsof fails; returns `False` if lsof reports one or more processes holding the file open.
     """
     if not VERIFY_NO_WRITERS:
         return True
@@ -178,17 +182,17 @@ def no_open_writers(p: Path) -> bool:
 
 
 def wait_stable(p: Path, seconds: int = WAIT_STABLE_SEC) -> bool:
-    """Wait for file size to stabilize.
+    """
+    Wait until the file's size remains unchanged for a continuous period.
     
-    Polls file size every second until it remains constant
-    for the specified duration.
+    If the file does not exist or a stat error occurs, returns False. Any change in file size resets the stability timer; if the size stays identical for `seconds` consecutive seconds the function returns True.
     
-    Args:
-        p: File path
-        seconds: Seconds to wait for stability
+    Parameters:
+        p (Path): Path to the file to monitor.
+        seconds (int): Number of consecutive seconds the size must remain unchanged.
     
     Returns:
-        True if stable, False if file disappeared
+        True if the file remained stable for the full duration, False if the file disappeared or a stat error occurred.
     """
     if not p.exists():
         return False
@@ -221,21 +225,28 @@ def wait_stable(p: Path, seconds: int = WAIT_STABLE_SEC) -> bool:
 
 
 def ensure_dirs(*paths: Path) -> None:
-    """Create directories if they don't exist.
+    """
+    Create each provided directory path, including any missing parent directories.
     
-    Args:
-        *paths: Directory paths to create
+    Parameters:
+        *paths (Path): One or more directory paths to create. Existing directories are left unchanged.
     """
     for path in paths:
         path.mkdir(parents=True, exist_ok=True)
 
 
 def move_atomic(src: Path, dest: Path) -> None:
-    """Move file atomically, falling back to copy+delete.
+    """
+    Move a file to a destination atomically when possible, falling back to copy-and-delete if an atomic rename is not available.
     
-    Args:
-        src: Source file
-        dest: Destination file
+    If src and dest are on the same filesystem, an atomic rename is attempted. If that fails (for example, across filesystems), the file is copied with metadata preserved using shutil.copy2 and the source file is removed.
+    
+    Parameters:
+        src (Path): Source file path.
+        dest (Path): Destination file path.
+    
+    Raises:
+        Exceptions from shutil.copy2 or Path.unlink may propagate if the fallback copy or delete fails.
     """
     import shutil
     

@@ -27,7 +27,12 @@ logger = logging.getLogger("wade.cli")
 
 
 def setup_logging(verbose: bool = False) -> None:
-    """Configure logging."""
+    """
+    Configure the root logger used by the CLI and set a consistent message and timestamp format.
+    
+    Parameters:
+        verbose (bool): If True, set the logging level to DEBUG; otherwise set it to INFO.
+    """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -37,16 +42,17 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 def load_ticket(ticket_path: Path) -> dict:
-    """Load ticket from JSON file.
+    """
+    Load and parse a ticket JSON file from the given path.
     
-    Args:
-        ticket_path: Path to ticket file
+    Parameters:
+        ticket_path (Path): Path to the JSON ticket file.
     
     Returns:
-        Ticket dictionary
+        dict: Parsed ticket data.
     
     Raises:
-        TicketValidationError: If ticket cannot be loaded
+        TicketValidationError: If the file does not exist or contains invalid JSON.
     """
     if not ticket_path.exists():
         raise TicketValidationError(
@@ -71,15 +77,25 @@ def run_worker(
     ticket_path: Path,
     env: Optional[dict] = None,
 ) -> int:
-    """Run a worker with a ticket.
+    """
+    Run the specified worker class using the ticket at ticket_path and return an exit code representing the outcome.
     
-    Args:
-        worker_class: Worker class to instantiate
-        ticket_path: Path to ticket file
-        env: Optional environment dict
+    The function loads and validates the ticket, instantiates the worker (passing `env` if provided), executes the worker, emits structured CLI events, and maps observed conditions to an integer exit code.
+    
+    Parameters:
+        worker_class (type): Worker class to instantiate and run.
+        ticket_path (Path): Filesystem path to the ticket JSON file.
+        env (Optional[dict]): Optional environment mapping to pass to the worker constructor.
     
     Returns:
-        Exit code
+        int: Process exit code indicating the result:
+            - ExitCode.SUCCESS: Worker produced records (returned even if there were per-record errors).
+            - ExitCode.TOOL_NOT_FOUND: Required external tool was not found during worker initialization.
+            - ExitCode.CONFIG_ERROR: Worker configuration was invalid during initialization.
+            - ExitCode.VALIDATION_ERROR: Ticket validation failed while running the worker.
+            - ExitCode.UNKNOWN_ERROR: An unexpected exception occurred.
+            - For WADE-specific exceptions, the exit code returned by get_exit_code(e) (mapped from the exception).
+            - KeyboardInterrupt is treated as non-error and returns ExitCode.SUCCESS.
     """
     event_logger = EventLogger.get_logger("cli")
     
@@ -177,7 +193,11 @@ def run_worker(
 
 
 def main():
-    """CLI entry point."""
+    """
+    CLI entry point for the WADE Workers command-line interface.
+    
+    Parses command-line arguments (worker name, ticket path, optional --verbose and --env-file), loads a simple key=value environment file when provided, validates and dynamically imports the selected worker class from the internal worker mapping, invokes the worker via run_worker, and exits the process with the resulting exit code.
+    """
     parser = argparse.ArgumentParser(
         description="WADE Worker CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,

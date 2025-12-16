@@ -16,11 +16,28 @@ class BulkExtractorWorker(BaseWorker):
     module = "scan"
 
     def __init__(self, env=None, config=None):
+        """
+        Initialize the BulkExtractorWorker, calling the base class initializer and configuring its logger and global configuration.
+        
+        Parameters:
+            env: Optional environment overrides forwarded to the base initializer.
+            config: Optional configuration overrides forwarded to the base initializer.
+        """
         super().__init__(env, config)
         self.logger = EventLogger.get_logger("bulk_extractor_worker")
         self.cfg = get_global_config()
 
     def run(self, ticket_dict: dict) -> WorkerResult:
+        """
+        Process a scan ticket with bulk_extractor and write found features as JSONL artifact records.
+        
+        Parameters:
+            ticket_dict (dict): Serialized WorkerTicket containing metadata (including `dest_path` and `hostname`) and artifact context.
+        
+        Returns:
+            WorkerResult: On success, contains `path` set to the output directory and `count` equal to the number of records written.
+            On failure (missing input or execution error), returns a WorkerResult with `path=None`, `count=0`, and `errors` populated with a descriptive message.
+        """
         ticket = WorkerTicket.from_dict(ticket_dict)
         host = ticket.metadata.hostname or "unknown_host"
         target = Path(ticket.metadata.dest_path)

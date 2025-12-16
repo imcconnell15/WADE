@@ -21,15 +21,33 @@ class E01Classifier:
     
     def __init__(self):
         # Auto-detect ewfinfo if not configured
+        """
+        Initialize the classifier and determine the ewfinfo executable path.
+        
+        Sets self.ewfinfo_path to the configured EWFINFO_PATH if provided; otherwise attempts to locate ewfinfo via _find_ewfinfo().
+        """
         self.ewfinfo_path = EWFINFO_PATH or self._find_ewfinfo()
     
     def _find_ewfinfo(self) -> Optional[str]:
-        """Find ewfinfo on system."""
+        """
+        Locate the `ewfinfo` executable on the system PATH.
+        
+        Returns:
+            ewfinfo_path (Optional[str]): Full path to the `ewfinfo` executable if found, `None` otherwise.
+        """
         import shutil
         return shutil.which("ewfinfo")
     
     def can_classify(self, path: Path, head_bytes: bytes) -> bool:
-        """Check for EWF magic bytes."""
+        """
+        Determine whether a file is an Expert Witness Format (EWF) image by checking header magic at configured offsets or by known EWF file extensions.
+        
+        Parameters:
+            head_bytes (bytes): Initial bytes read from the file used to check for EWF magic at configured offsets.
+        
+        Returns:
+            `true` if the file matches EWF magic or has a known EWF extension (e.g., `.e01`, `.ex01`, `.e02`), `false` otherwise.
+        """
         for offset, magic in MAGIC_DB.get("ewf", []):
             if len(head_bytes) >= offset + len(magic):
                 if head_bytes[offset:offset+len(magic)] == magic:
@@ -43,7 +61,17 @@ class E01Classifier:
         return False
     
     def classify(self, path: Path) -> ClassificationResult:
-        """Classify E01 and extract metadata."""
+        """
+        Classify the given path as an E01/EWF image and extract available metadata.
+        
+        If the file is part of a fragmented EWF set, delegates to the fragment handler and returns its result. If ewfinfo is not available, returns a basic "e01" classification with confidence 0.7 and details noting ewfinfo unavailability. If ewfinfo runs but exits with an error, returns "e01" with confidence 0.6 and an error message containing the tool's stderr (truncated). On ewfinfo timeout, returns "e01" with confidence 0.6 and error "ewfinfo timeout". On successful ewfinfo execution, returns "e01" with confidence 0.95 and details populated from parsed ewfinfo output (includes a key "ewfinfo" set to "success"). Other exceptions produce an "e01" result with confidence 0.6 and an error describing the exception.
+        
+        Parameters:
+            path (Path): Filesystem path to the candidate E01/EWF image.
+        
+        Returns:
+            ClassificationResult: Classification outcome including `classification`, `confidence`, and either `details` (metadata) or `error` describing the failure.
+        """
         # Check if part of fragmented set
         if self._is_fragment(path):
             return self._handle_fragment(path)
@@ -95,9 +123,13 @@ class E01Classifier:
             )
     
     def _is_fragment(self, path: Path) -> bool:
-        """Check if E01 is part of multi-segment set.
+        """
+        Determine whether the given path is a later segment of an EWF multi-segment set.
         
-        Looks for E02, E03, etc. in same directory.
+        Checks that the file's suffix indicates a numbered EWF segment greater than 1 (for example `.e02`) and that a corresponding primary `.E01` file exists for the same base path.
+        
+        Returns:
+            `true` if the file is a segment numbered greater than 1 and a matching `.E01` primary exists, `false` otherwise.
         """
         if not path.suffix.lower().startswith(".e"):
             return False
@@ -118,7 +150,17 @@ class E01Classifier:
         return e01.exists()
     
     def _handle_fragment(self, path: Path) -> ClassificationResult:
-        """Handle E01 fragment."""
+        """
+        Handle an E01/EWF fragment file and optionally attempt defragmentation.
+        
+        If a fragment log is configured, appends the fragment path to the log. If auto-defragmentation is enabled and ewfexport is available, attempts to merge the fragment into a single raw image; on success returns a classification for the merged E01. If merging is not performed or fails, returns a fragment classification indicating the fragment was skipped.
+        
+        Parameters:
+            path (Path): Path to the fragment file.
+        
+        Returns:
+            ClassificationResult: If defragmentation succeeds, a result with classification `"e01"`, confidence 0.9, and details containing `{"defragmented": True, "merged_path": "<path>"}`. Otherwise, a result with classification `"e01_fragment"`, confidence 0.9, and details `{"fragment": True, "skip": True}`.
+        """
         # Log fragment
         if FRAGMENT_LOG:
             try:
@@ -145,10 +187,14 @@ class E01Classifier:
         )
     
     def _try_defrag(self, path: Path) -> Optional[Path]:
-        """Attempt to defragment E01 set using ewfexport.
+        """
+        Attempt to defragment an E01 multi-segment set into a merged raw image file.
+        
+        Parameters:
+            path (Path): Path to an E01 segment within the multi-segment set.
         
         Returns:
-            Path to merged raw image, or None on failure
+            Optional[Path]: Path to the merged raw image (named "<base>_merged.dd" in the same directory) if defragmentation succeeded, `None` otherwise.
         """
         # Find E01 base
         base = path.with_suffix("")
@@ -177,13 +223,26 @@ class E01Classifier:
         return None
     
     def _parse_ewfinfo(self, stdout: str) -> dict:
-        """Parse ewfinfo output for metadata.
+        """
+        Parse the text output produced by ewfinfo and extract EWF image metadata.
         
-        Extracts:
-          - hostname (from system/model/computer name)
-          - os_family (from description)
-          - date_collected (from acquisition date)
-          - sectors, bytes per sector
+        Parses common labeled fields from the provided ewfinfo stdout (for example
+        "Computer name", "Operating system", "Acquisition date", "Number of sectors",
+        and "Bytes per sector") and returns a dictionary of the discovered values.
+        Also derives an `os_family` key when the operating system string indicates
+        Windows, Linux, or macOS.
+        
+        Parameters:
+            stdout (str): The complete stdout text produced by ewfinfo for an image.
+        
+        Returns:
+            dict: A mapping of extracted metadata. Possible keys include:
+                - "hostname": host or model name string
+                - "os": operating system string
+                - "os_family": inferred OS family ("windows", "linux", "macos")
+                - "date_collected": acquisition date string
+                - "sectors": number of sectors (int)
+                - "bytes_per_sector": bytes per sector (int)
         """
         details = {}
         
