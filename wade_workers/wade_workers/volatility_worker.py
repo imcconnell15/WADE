@@ -1,94 +1,304 @@
-#!/usr/bin/env python3
-import os, json, shutil, subprocess
+"""
+WADE Volatility3 Worker
+
+Runs Volatility3 memory analysis modules against memory images.
+Supports configurable module lists via YAML config and environment overrides.
+
+Configuration:
+  YAML (wade_config.yaml):
+    volatility:
+      modules:
+        - windows.pslist
+        - windows.netscan
+      disabled_modules:
+        - windows.malfind
+  
+  Environment:
+    WADE_VOLATILITY_MODULES="windows.pslist,windows.netscan,windows.cmdline"
+    WADE_VOLATILITY_MODULES="+windows.registry.hivelist,-windows.malfind"
+"""
+import json
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
 from .base import BaseWorker, WorkerResult
-from .utils import wade_paths, now_iso
+from .subprocess_utils import run_tool, get_default_registry, ToolNotFoundError
+from .logging import EventLogger, finalize_worker_records
+from .module_config import get_global_config
 
-def _vol_cmd(env: Dict[str,str]) -> str:
-    # Prefer explicit path; else vol.py; else python3 -m volatility3
-    for c in (env.get("VOL_CMD"), "vol.py"):
-        if c and shutil.which(c):
-            return c
-    return "python3 -m volatility3"
 
-def _modules(env: Dict[str,str], cfg: dict) -> List[str]:
-    # YAML: volatility.modules: [windows.pslist, windows.netscan]
-    if "volatility" in cfg and isinstance(cfg["volatility"], dict) and cfg["volatility"].get("modules"):
-        m = cfg["volatility"]["modules"]
-        if isinstance(m, list) and m:
-            return [str(x) for x in m]
-    # ENV fallback
-    mods = env.get("VOL_MODULES", "windows.pslist,windows.psscan")
-    return [m.strip() for m in mods.split(",") if m.strip()]
+# Default modules if not configured
+DEFAULT_MODULES = [
+    "windows.info",
+    "windows.pslist",
+    "windows.pstree", 
+    "windows.cmdline",
+    "windows.netscan",
+    "windows.handles",
+    "windows.dlllist",
+    "windows.services",
+]
+
 
 class VolatilityWorker(BaseWorker):
+    """Worker for running Volatility3 memory analysis."""
+    
     tool = "volatility"
     module = "multi"
     help_text = "Run Volatility3 modules against a memory image. Outputs JSONL per module."
 
-    def _host_and_img(self, ticket) -> Tuple[str, Path]:
-        host = ticket.get("host") or self.env.get("WADE_HOSTNAME","host")
-        p = Path(ticket.get("dest_path") or ticket.get("path") or "")
-        if not p.exists():
-            raise FileNotFoundError(f"memory image not found: {p}")
-        return host, p
+    def __init__(self, env=None, config=None):
+        super().__init__(env, config)
+        self.logger = EventLogger.get_logger("volatility_worker")
+        self.module_config = get_global_config()
+        
+        # Verify volatility3 is available
+        try:
+            get_default_registry().require_tool("volatility3")
+        except ToolNotFoundError:
+            # Also try vol.py as fallback
+            try:
+                get_default_registry().require_tool("vol.py")
+            except ToolNotFoundError:
+                self.logger.log_event(
+                    "worker.volatility.tool_missing",
+                    status="error",
+                    error="Neither 'volatility3' nor 'vol.py' found in PATH or WADE_VOLATILITY3_PATH"
+                )
 
-    def _append_log(self, host: str, text: str):
-        _, log_dir = wade_paths(self.env, host, self.tool, self.module)
-        with open(log_dir / f"{self.tool}_{self.module}.log", "a", encoding="utf-8") as fh:
-            fh.write(text.rstrip() + "\n")
+    def _resolve_host_and_image(self, ticket: dict) -> Tuple[str, Path]:
+        """Extract host and image path from ticket.
+        
+        Args:
+            ticket: Worker ticket dict
+        
+        Returns:
+            Tuple of (hostname, image_path)
+        
+        Raises:
+            FileNotFoundError: If image doesn't exist
+        """
+        host = ticket.get("host") or self.env.get("WADE_HOSTNAME", "unknown_host")
+        
+        # Try various path keys
+        path_str = ticket.get("dest_path") or ticket.get("path") or ticket.get("image_path")
+        if not path_str:
+            raise ValueError("No image path specified in ticket (need 'dest_path', 'path', or 'image_path')")
+        
+        img_path = Path(path_str)
+        if not img_path.exists():
+            raise FileNotFoundError(f"Memory image not found: {img_path}")
+        
+        return host, img_path
+
+    def _get_modules(self) -> List[str]:
+        """Get list of Volatility modules to run.
+        
+        Priority:
+          1. WADE_VOLATILITY_MODULES env var
+          2. YAML config volatility.modules
+          3. DEFAULT_MODULES constant
+        
+        Returns:
+            List of module names to execute
+        """
+        return self.module_config.get_modules(
+            tool="volatility",
+            key="modules",
+            default=DEFAULT_MODULES,
+        )
+
+    def _run_module(
+        self,
+        module_name: str,
+        image_path: Path,
+        host: str,
+    ) -> Tuple[List[dict], str]:
+        """Run a single Volatility module.
+        
+        Args:
+            module_name: Module to run (e.g., "windows.pslist")
+            image_path: Path to memory image
+            host: Hostname for logging
+        
+        Returns:
+            Tuple of (parsed_records, error_message)
+            error_message is empty string on success
+        """
+        self.logger.log_event(
+            "worker.volatility.module_start",
+            module=module_name,
+            host=host,
+            image_path=str(image_path),
+        )
+        
+        # Try volatility3 first, fallback to vol.py
+        tool_name = "volatility3"
+        try:
+            get_default_registry().require_tool(tool_name)
+        except ToolNotFoundError:
+            tool_name = "vol.py"
+        
+        args = ["-f", str(image_path), module_name, "-r", "json"]
+        
+        try:
+            result = run_tool(
+                tool_name,
+                args,
+                timeout=300,  # 5 minutes per module
+                check=False,
+            )
+        except Exception as e:
+            error = f"Failed to spawn {tool_name}: {e}"
+            self.logger.log_worker_error("volatility", error, module=module_name, host=host)
+            return [], error
+        
+        if not result.success:
+            error = f"rc={result.rc}, stderr={result.truncated_stderr()}"
+            self.logger.log_worker_error(
+                "volatility",
+                error,
+                module=module_name,
+                host=host,
+                returncode=result.rc,
+            )
+            # Return minimal error record for visibility
+            return [{
+                "module": module_name,
+                "error": error,
+                "rc": result.rc,
+            }], error
+        
+        # Parse Volatility3 JSON output
+        records = self._parse_volatility_json(module_name, result.stdout)
+        
+        self.logger.log_event(
+            "worker.volatility.module_complete",
+            status="success",
+            module=module_name,
+            host=host,
+            record_count=len(records),
+            duration_sec=result.duration_sec,
+        )
+        
+        return records, ""
+
+    def _parse_volatility_json(self, module_name: str, stdout: str) -> List[dict]:
+        """Parse Volatility3 JSON output format.
+        
+        Volatility3 outputs JSON with "columns" and "rows" arrays.
+        Convert to list of dicts for easier downstream processing.
+        
+        Args:
+            module_name: Module that generated output
+            stdout: Raw stdout from volatility
+        
+        Returns:
+            List of record dicts
+        """
+        if not stdout.strip():
+            return []
+        
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            # Malformed JSON - store as raw
+            return [{"module": module_name, "raw_output": stdout}]
+        
+        # Handle columns/rows format
+        if isinstance(data, dict) and "columns" in data and "rows" in data:
+            columns = data.get("columns") or []
+            rows = data.get("rows") or []
+            
+            records = []
+            for row in rows:
+                try:
+                    # Zip columns and row values
+                    record = {
+                        "module": module_name,
+                        **{columns[i]: row[i] for i in range(min(len(columns), len(row)))}
+                    }
+                    records.append(record)
+                except Exception:
+                    # Malformed row - include as-is
+                    records.append({"module": module_name, "row": row})
+            
+            return records
+        
+        # Handle list format
+        if isinstance(data, list):
+            return [
+                {"module": module_name, **item} if isinstance(item, dict)
+                else {"module": module_name, "data": item}
+                for item in data
+            ]
+        
+        # Unknown format
+        return [{"module": module_name, "data": data}]
 
     def run(self, ticket: dict) -> WorkerResult:
-        host, img = self._host_and_img(ticket)
-        cmd = _vol_cmd(self.env)
-        mods = _modules(self.env, self.config)
-        out_count = 0
+        """Execute Volatility worker.
+        
+        Args:
+            ticket: Worker ticket with image path and host info
+        
+        Returns:
+            WorkerResult with execution summary
+        """
         errors: List[str] = []
-        last_out = None
-
-        for mod in mods:
-            args = [cmd, "-f", str(img), mod, "-r", "json"]
-            self._append_log(host, f"{now_iso()} running: {' '.join(args)}")
-            try:
-                cp = subprocess.run(args, capture_output=True, text=True, check=False)
-            except Exception as e:
-                errors.append(f"{mod}: spawn error: {e!r}")
-                continue
-
-            if cp.returncode != 0:
-                errors.append(f"{mod}: rc={cp.returncode} stderr={cp.stderr.strip()[:4000]}")
-                # still record a small error artifact for Splunk visibility
-                rec = {"ts": now_iso(), "module": mod, "rc": cp.returncode, "stderr": cp.stderr}
-                last_out, _ = self.run_records(host, [rec], str(img))
-                continue
-
-            # try to parse Vol3 JSON; if unknown, store raw
-            records = []
-            try:
-                data = json.loads(cp.stdout)
-                if isinstance(data, dict) and "columns" in data and "rows" in data:
-                    cols = data.get("columns") or []
-                    for row in data.get("rows") or []:
-                        try:
-                            records.append({"module": mod, **{cols[i]: row[i] for i in range(min(len(cols), len(row)))}})
-                        except Exception:
-                            records.append({"module": mod, "row": row})
-                elif isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict):
-                            item = {"module": mod, **item}
-                        else:
-                            item = {"module": mod, "row": item}
-                        records.append(item)
-                else:
-                    records.append({"module": mod, "raw": cp.stdout})
-            except Exception:
-                records.append({"module": mod, "raw": cp.stdout})
-
-            last_out, cnt = self.run_records(host, records, str(img))
-            out_count += cnt
-            self._append_log(host, f"{now_iso()} {mod} -> {cnt} records")
-
-        return WorkerResult(last_out, out_count, errors)
+        
+        try:
+            host, img_path = self._resolve_host_and_image(ticket)
+        except (ValueError, FileNotFoundError) as e:
+            errors.append(str(e))
+            return WorkerResult(path=None, count=0, errors=errors)
+        
+        self.logger.log_worker_start("volatility", host=host, image_path=str(img_path))
+        
+        modules = self._get_modules()
+        if not modules:
+            errors.append("No modules configured - check YAML config or WADE_VOLATILITY_MODULES")
+            return WorkerResult(path=None, count=0, errors=errors)
+        
+        total_records = 0
+        output_dir, _ = self._get_output_paths(host)
+        
+        for module_name in modules:
+            records, error = self._run_module(module_name, img_path, host)
+            
+            if error:
+                errors.append(f"{module_name}: {error}")
+            
+            if records:
+                # Write records to JSONL
+                output_file = output_dir / f"{module_name.replace('.', '_')}.jsonl"
+                count = finalize_worker_records(
+                    records,
+                    output_path=output_file,
+                    tool="volatility",
+                    module=module_name,
+                    host=host,
+                    metadata={"image_path": str(img_path)},
+                )
+                total_records += count
+        
+        self.logger.log_worker_complete(
+            "volatility",
+            host=host,
+            record_count=total_records,
+            output_path=output_dir,
+        )
+        
+        return WorkerResult(path=output_dir, count=total_records, errors=errors)
+    
+    def _get_output_paths(self, host: str) -> Tuple[Path, Path]:
+        """Get output and log directories for this host.
+        
+        Args:
+            host: Hostname
+        
+        Returns:
+            Tuple of (output_dir, log_dir)
+        """
+        from .utils import wade_paths
+        return wade_paths(self.env, host, self.tool, self.module)
