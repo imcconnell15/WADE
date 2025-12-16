@@ -1,15 +1,8 @@
-"""
-Ticket builder for staging daemon.
-
-Creates v2.0 tickets with full metadata for workers.
-"""
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Optional
-
+# staging/ticket_builder.py (additions/changes)
+from typing import Dict, Optional, List
 from wade_workers.ticket_schema import WorkerTicket, TicketMetadata
 from wade_workers.hashing import quick_hash
-
+from .tool_routing import ToolRouting
 
 def build_staging_ticket(
     dest_path: Path,
@@ -21,37 +14,14 @@ def build_staging_ticket(
     case_name: Optional[str] = None,
     analyst: Optional[str] = None,
     priority: int = 5,
-    tags: Optional[list] = None,
+    tags: Optional[List[str]] = None,
+    profile: str = "full",
+    location: Optional[str] = None,
+    details: Optional[Dict] = None,
     **custom_fields,
 ) -> WorkerTicket:
-    """Build worker ticket from staging daemon.
-    
-    Args:
-        dest_path: Path where file was staged
-        classification: File classification (e01, memory, disk, etc.)
-        hostname: Target system hostname (if known)
-        os_family: OS family (windows, linux, macos)
-        source_file: Original filename
-        case_id: Case identifier
-        case_name: Case name
-        analyst: Analyst username
-        priority: Priority 1-10 (default: 5)
-        tags: List of tags
-        **custom_fields: Additional metadata
-    
-    Returns:
-        WorkerTicket ready to queue
-    """
-    # Compute file hash
-    file_hash = None
-    file_size = None
-    try:
-        file_size = dest_path.stat().st_size
-        file_hash = quick_hash(dest_path, sample_mb=4)
-    except Exception:
-        pass
-    
-    # Build metadata
+    # ... existing hash/size logic ...
+    details = details or {}
     metadata = TicketMetadata(
         hostname=hostname or dest_path.parent.name or "unknown_host",
         classification=classification,
@@ -66,35 +36,18 @@ def build_staging_ticket(
         staged_utc=datetime.now(timezone.utc).isoformat(),
         priority=priority,
         tags=tags or [],
-        custom=custom_fields,
+        custom={**custom_fields, **details, **({"location": location} if location else {})},
     )
-    
-    return WorkerTicket(metadata=metadata)
 
+    # NEW: compute requested tools based on classification, profile, and details
+    router = ToolRouting()
+    requested = router.select_tools(classification=classification, profile=profile, details={"os_family": os_family, **details}, location=location)
 
-def queue_ticket(
-    ticket: WorkerTicket,
-    queue_root: Path,
-    profile: str = "default",
-) -> Path:
-    """Queue a ticket for processing.
-    
-    Args:
-        ticket: WorkerTicket to queue
-        queue_root: Queue root directory
-        profile: Worker profile (e.g., "default", "memory", "malware")
-    
-    Returns:
-        Path to queued ticket file
-    """
-    # Queue structure: {classification}/{profile}/{ticket_id}.json
-    classification = ticket.metadata.classification
-    ticket_id = ticket.metadata.ticket_id
-    
-    queue_dir = queue_root / classification / profile
-    queue_dir.mkdir(parents=True, exist_ok=True)
-    
-    ticket_path = queue_dir / f"{ticket_id}.json"
-    ticket.save(ticket_path)
-    
-    return ticket_path
+    ticket = WorkerTicket(metadata=metadata)
+    ticket.worker_config = {
+        **(ticket.worker_config or {}),
+        "profile": profile,
+        "location": location,
+        "requested_tools": requested,
+    }
+    return ticket
