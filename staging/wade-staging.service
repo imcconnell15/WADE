@@ -1,6 +1,7 @@
 # /etc/systemd/system/wade-staging.service
 [Unit]
 Description=WADE Staging Daemon (full vs light)
+Documentation=https://github.com/imcconnell15/WADE
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/opt/wade/stage_daemon.py
@@ -14,7 +15,9 @@ Group=autopsy
 # Uncomment if your Splunk UF runs as 'splunk' and you created the group:
 #SupplementaryGroups=splunk
 
+# Environment
 EnvironmentFile=-/etc/wade/wade.env
+EnvironmentFile=-/etc/wade/secrets.env
 Environment=PYTHONUNBUFFERED=1
 # If you want a tag in journald:
 SyslogIdentifier=wade-staging
@@ -31,13 +34,13 @@ ExecStartPre=/bin/sh -lc 'set -eu; owner="${WADE_OWNER_USER:-autopsy}"; \
   chown -R "$owner:$owner" "/home/$owner/Staging" "/home/$owner/DataSources" /var/wade'
 
 WorkingDirectory=/opt/wade
-ExecStart=/usr/bin/python3 /opt/wade/stage_daemon.py
+ExecStart=/usr/bin/python3 /opt/wade/staging/stage_daemon.py
 
 # Restart policy
 Restart=on-failure
-RestartSec=3s
-TimeoutStopSec=20s
-KillSignal=SIGTERM
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
 
 # Make files group-readable (UF) and keep group on new files/dirs
 UMask=002
@@ -64,6 +67,11 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 CapabilityBoundingSet=
+
+# Process management
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
