@@ -17,11 +17,24 @@ class MiscClassifier:
     priority = 100  # Lowest priority (run last)
     
     def can_classify(self, path: Path, head_bytes: bytes) -> bool:
-        """Always returns True (fallback)."""
+        """
+        Indicate whether this classifier can handle the provided path; acts as a fallback that accepts any input.
+        
+        Returns:
+            bool: `true` (this fallback classifier accepts all inputs).
+        """
         return True
     
     def classify(self, path: Path) -> ClassificationResult:
-        """Classify misc file."""
+        """
+        Determine a miscellaneous classification for the file at the given path by detecting whether it is text or binary.
+        
+        Parameters:
+            path (Path): Path to the file to classify.
+        
+        Returns:
+            ClassificationResult: A result with classification "misc". For text files, details include `file_type` and `content_type`; for binary files, details include `file_type` and `extension`. Confidence reflects heuristic certainty.
+        """
         is_text, sample = is_probably_text(path)
         
         if is_text:
@@ -30,7 +43,21 @@ class MiscClassifier:
             return self._classify_binary_file(path)
     
     def _classify_text_file(self, path: Path, sample: str) -> ClassificationResult:
-        """Classify text file."""
+        """
+        Infer a text file's broad content type and produce a misc classification.
+        
+        Parameters:
+            path (Path): Path to the file being classified.
+            sample (str): A text excerpt from the file used to infer content characteristics.
+        
+        Returns:
+            ClassificationResult: A classification with:
+                - classification: "misc"
+                - confidence: 0.5
+                - details: a dict containing
+                    - "file_type": "text"
+                    - "content_type": one of "json", "xml", "csv", "log", or "text" depending on the sample
+        """
         # Try to infer content type from sample
         sample_lower = sample.lower()
         
@@ -57,7 +84,14 @@ class MiscClassifier:
         )
     
     def _classify_binary_file(self, path: Path) -> ClassificationResult:
-        """Classify unknown binary file."""
+        """
+        Classify a non-text file by extension or reject it when binary documents are disabled.
+        
+        If WADE_STAGE_ACCEPT_DOCS is False, returns an 'unknown' result with confidence 0.0 and details {'rejected': True}. Otherwise infers a broad file_type from the file's lowercase suffix (e.g., 'document', 'spreadsheet', 'archive', 'executable', 'image', 'video', 'audio', or 'binary') and returns a 'misc' classification with confidence 0.4; the details include 'file_type' and the 'extension'.
+         
+        Returns:
+            ClassificationResult: The inferred classification result as described above.
+        """
         # Check if we should even accept this
         if not WADE_STAGE_ACCEPT_DOCS:
             return ClassificationResult(
@@ -113,7 +147,16 @@ class MalwareClassifier:
     priority = 45  # Between network and misc
     
     def can_classify(self, path: Path, head_bytes: bytes) -> bool:
-        """Check if file should be treated as malware."""
+        """
+        Determine whether the file's name suggests it is a malware sample.
+        
+        Parameters:
+            path (Path): Filesystem path whose filename is checked for malware-related indicator substrings (case-insensitive).
+            head_bytes (bytes): Initial bytes of the file (ignored by this classifier).
+        
+        Returns:
+            bool: `true` if the filename contains any malware indicator substring, `false` otherwise.
+        """
         name_lower = path.name.lower()
         
         # Check for malware indicators in filename
@@ -125,7 +168,15 @@ class MalwareClassifier:
         return any(ind in name_lower for ind in indicators)
     
     def classify(self, path: Path) -> ClassificationResult:
-        """Classify as malware sample."""
+        """
+        Classifies the given path as a malware sample.
+        
+        Parameters:
+            path (Path): File system path to classify; if the file exists and begins with the PE header ("MZ"), the result will include executable type details.
+        
+        Returns:
+            ClassificationResult: classification set to "malware", confidence set to 0.7, and details containing {"executable_type": "pe"} when the file is detected as a Windows PE executable.
+        """
         # Check if it's a Windows executable
         is_pe = path.read_bytes()[:2] == b"MZ" if path.exists() else False
         

@@ -17,7 +17,16 @@ class DiskClassifier:
     priority = 30  # After memory
     
     def can_classify(self, path: Path, head_bytes: bytes) -> bool:
-        """Check for disk image indicators."""
+        """
+        Determine whether the provided path or head bytes indicate a raw disk image.
+        
+        Parameters:
+            path (Path): Filesystem path of the candidate file; used to check filename-based extensions.
+            head_bytes (bytes): Leading bytes from the file (typically the first few kilobytes) used to detect GPT/MBR signatures or filesystem magic.
+        
+        Returns:
+            bool: `True` if signatures or filename patterns suggest the file is a disk image, `False` otherwise.
+        """
         # Check for GPT signature
         if b"EFI PART" in head_bytes[:512]:
             return True
@@ -41,7 +50,21 @@ class DiskClassifier:
         return False
     
     def classify(self, path: Path) -> ClassificationResult:
-        """Classify disk image and detect partition type."""
+        """
+        Classify a disk image file and collect partition and filesystem metadata.
+        
+        Parameters:
+            path (Path): Filesystem path to the disk image to analyze.
+        
+        Returns:
+            ClassificationResult: Classification with:
+                - classification: "disk_raw"
+                - confidence: 0.85
+                - details: dict with keys
+                    - "partition_type": "gpt", "mbr", or None
+                    - "filesystem": detected filesystem type (e.g., "ntfs", "fat32", "ext") or "unknown"
+                    - "hostname": present when a hostname could be extracted
+        """
         head = path.read_bytes()[:4096] if path.exists() else b""
         
         # Check partition table type
@@ -72,7 +95,12 @@ class DiskClassifier:
         )
     
     def _detect_filesystem(self, head: bytes) -> str:
-        """Detect filesystem type from magic bytes."""
+        """
+        Detects the filesystem type present in a disk image header by checking known filesystem signatures.
+        
+        Returns:
+            str: "ntfs", "fat32", "ext", or "unknown" if no recognized filesystem signature is found.
+        """
         if len(head) >= 512:
             # NTFS
             if head[3:11] == b"NTFS    ":
@@ -89,9 +117,16 @@ class DiskClassifier:
         return "unknown"
     
     def _try_extract_hostname(self, path: Path) -> str:
-        """Attempt to extract hostname from disk image.
+        """
+        Extract a hostname from the disk image at path using the external `target-info` utility when available.
         
-        Uses dissect target-info if available.
+        If `target-info` is not available, the output contains no hostname, or an error occurs, this function returns `None`.
+        
+        Parameters:
+            path (Path): Filesystem path to the disk image to inspect.
+        
+        Returns:
+            hostname (str): The discovered hostname or computer_name value, or `None` if not found or not obtainable.
         """
         try:
             import shutil

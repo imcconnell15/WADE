@@ -21,11 +21,21 @@ class ClassifierRegistry:
     """Registry of file classifiers."""
     
     def __init__(self):
+        """
+        Initialize the registry and populate it with the default classifier pipeline ordered by priority.
+        
+        Attributes:
+            classifiers (List[Classifier]): Ordered list of registered classifiers; earlier entries have lower priority.
+        """
         self.classifiers: List[Classifier] = []
         self._register_defaults()
     
     def _register_defaults(self) -> None:
-        """Register default classifiers in priority order."""
+        """
+        Populate the registry with the module's default classifier instances in a deterministic priority order.
+        
+        Replaces self.classifiers with the built-in classifier pipeline and ensures the list is ordered by each classifier's priority (ascending). The MiscClassifier is included as a fallback and is intended to run last.
+        """
         self.classifiers = [
             E01Classifier(),
             MemoryClassifier(),
@@ -41,24 +51,25 @@ class ClassifierRegistry:
         self.classifiers.sort(key=lambda c: c.priority)
     
     def register(self, classifier: Classifier) -> None:
-        """Register a custom classifier.
+        """
+        Add a classifier to the registry and reorder the registry by ascending priority.
         
-        Args:
-            classifier: Classifier instance
+        Parameters:
+            classifier (Classifier): Classifier instance to add. The classifier's numeric
+                `priority` attribute is used to determine its position in the registry.
         """
         self.classifiers.append(classifier)
         self.classifiers.sort(key=lambda c: c.priority)
     
     def classify(self, path: Path) -> ClassificationResult:
-        """Classify a file using the registered classifiers.
+        """
+        Selects and runs registered classifiers in priority order and returns the first successful classification.
         
-        Runs classifiers in priority order until one succeeds.
-        
-        Args:
-            path: File to classify
+        Parameters:
+            path (Path): Path to the file to classify.
         
         Returns:
-            ClassificationResult from the first successful classifier
+            ClassificationResult: The result from the first classifier whose `success` is `True`. If no classifier succeeds, returns a result with `classification` set to `"unknown"`, `confidence` set to `0.0`, and `details` containing `{"reason": "no_classifier_matched"}`.
         """
         # Read file head for quick magic byte checks
         head_bytes = read_head(path)
@@ -91,7 +102,11 @@ _default_registry: Optional[ClassifierRegistry] = None
 
 
 def get_classifier_registry() -> ClassifierRegistry:
-    """Get or create the global classifier registry."""
+    """
+    Return the singleton global classifier registry, creating and caching it on first access.
+    
+    @returns: The global ClassifierRegistry singleton instance.
+    """
     global _default_registry
     if _default_registry is None:
         _default_registry = ClassifierRegistry()

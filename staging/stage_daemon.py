@@ -48,6 +48,12 @@ class StagingDaemon:
     """Main staging daemon orchestrator."""
     
     def __init__(self):
+        """
+        Initialize the staging daemon's runtime resources.
+        
+        Sets up and stores the database connection, classifier registry, and event logger on the instance,
+        and ensures required directories for staging, data, and queueing exist.
+        """
         self.db_conn = init_db()
         self.classifier_registry = get_classifier_registry()
         self.event_logger = EventLogger.get_logger("staging_daemon")
@@ -56,21 +62,14 @@ class StagingDaemon:
         ensure_dirs(STAGING_ROOT, STAGE_FULL, STAGE_LIGHT, DATADIR, QUEUE_DIR)
     
     def process_file(self, file_path: Path) -> bool:
-        """Process a single file from staging.
+        """
+        Process a single staged file by deduplicating, validating, classifying, moving it to its destination, enqueueing a processing ticket, and recording the action in the database.
         
-        Workflow:
-          1. Check if already processed (dedup)
-          2. Wait for stability
-          3. Classify file
-          4. Move to destination
-          5. Create ticket
-          6. Record in DB
-        
-        Args:
-            file_path: Path to file in staging
+        Parameters:
+            file_path (Path): Path to the file in a staging directory.
         
         Returns:
-            True if processed successfully
+            bool: `True` if the file was successfully moved, ticketed, and recorded; `False` if processing was skipped or failed.
         """
         logger.info(f"Processing: {file_path}")
         
@@ -198,10 +197,15 @@ class StagingDaemon:
         return True
     
     def scan_once(self) -> int:
-        """Scan staging directories once and process all files.
+        """
+        Scan the configured staging directories once and attempt to process every regular file found.
+        
+        Scans both STAGE_FULL and STAGE_LIGHT (skipping non-existent directories), lists files
+        recursively when WADE_STAGE_RECURSIVE is set, and invokes process_file on each regular
+        file. Each successfully processed file increments the returned count.
         
         Returns:
-            Number of files processed
+            int: Number of files successfully processed.
         """
         count = 0
         
@@ -232,9 +236,10 @@ class StagingDaemon:
         return count
     
     def watch_continuous(self) -> None:
-        """Watch staging directories continuously using inotify.
+        """
+        Monitor staging directories continuously, using inotify when configured and available, otherwise using a polling loop.
         
-        Falls back to polling if inotify unavailable.
+        This delegates to an inotify-based watcher when INOTIFY_AVAILABLE and REQUIRE_CLOSE_WRITE are true; otherwise it runs the polling watcher.
         """
         if INOTIFY_AVAILABLE and REQUIRE_CLOSE_WRITE:
             self._watch_inotify()
@@ -242,7 +247,11 @@ class StagingDaemon:
             self._watch_polling()
     
     def _watch_inotify(self) -> None:
-        """Watch using inotify for efficient file system events."""
+        """
+        Monitor staging directories with inotify and process files when they are closed after writing.
+        
+        Adds watches for STAGE_FULL and STAGE_LIGHT if they exist, listens for `IN_CLOSE_WRITE` events, and calls `self.process_file` for the completed file. Logs startup and any per-file processing errors.
+        """
         logger.info("Starting inotify watch")
         
         watch_dirs = [str(STAGE_FULL), str(STAGE_LIGHT)]
@@ -266,7 +275,11 @@ class StagingDaemon:
                     logger.error(f"Error processing {file_path}: {e}", exc_info=True)
     
     def _watch_polling(self) -> None:
-        """Watch using polling (fallback)."""
+        """
+        Continuously poll the staging directories and perform scans at the configured interval.
+        
+        Repeatedly performs directory scans, waits POLL_INTERVAL_SEC seconds between iterations, and logs any errors encountered without terminating.
+        """
         logger.info(f"Starting polling watch (interval: {POLL_INTERVAL_SEC}s)")
         
         while True:
@@ -279,7 +292,14 @@ class StagingDaemon:
 
 
 def setup_logging(verbose: bool = False) -> None:
-    """Configure logging."""
+    """
+    Configure the root logger's level and format.
+    
+    When verbose is True, sets level to DEBUG; otherwise sets level to INFO. Also installs a basic log format of "YYYY-MM-DD HH:MM:SS [LEVEL] LOGGER_NAME: MESSAGE".
+     
+    Parameters:
+        verbose (bool): If True, enable DEBUG-level logging; if False, enable INFO-level logging.
+    """
     level = logging.DEBUG if verbose else logging.INFO
     
     logging.basicConfig(
@@ -290,6 +310,16 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 def main():
+    """
+    Parse command-line arguments, configure logging, and run the WADE Staging Daemon either once or in continuous watch mode.
+    
+    Recognized flags:
+    - --scan-once: perform a single scan and exit.
+    - --verbose, -v: enable debug logging.
+    
+    Returns:
+        exit_code (int): 0 on successful completion or normal shutdown (including KeyboardInterrupt).
+    """
     parser = argparse.ArgumentParser(description="WADE Staging Daemon")
     parser.add_argument(
         "--scan-once",

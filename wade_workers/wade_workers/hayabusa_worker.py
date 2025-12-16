@@ -21,6 +21,13 @@ class HayabusaWorker(BaseWorker):
     WIN_EVT_LOGS_DIR = r"C:\Windows\System32\WinEvt\Logs"
 
     def __init__(self, env=None, config=None):
+        """
+        Initialize the HayabusaWorker, set up its event logger, and load the global configuration.
+        
+        Parameters:
+            env (optional): Environment or runtime context passed to the base worker; used as-is.
+            config (optional): Worker-specific configuration overrides; passed to the base worker.
+        """
         super().__init__(env, config)
         self.logger = EventLogger.get_logger("hayabusa_worker")
         self.cfg = get_global_config()
@@ -29,6 +36,15 @@ class HayabusaWorker(BaseWorker):
     # Small helpers
     # ----------------------------
     def _contains_evtx(self, d: Path) -> bool:
+        """
+        Determine whether a directory contains any .evtx files, including within its subdirectories.
+        
+        Parameters:
+            d (Path): Directory to inspect.
+        
+        Returns:
+            bool: `True` if the directory or any of its subdirectories contains at least one `.evtx` file, `False` otherwise.
+        """
         if not d.exists() or not d.is_dir():
             return False
         # Cheap check first, then recurse if needed
@@ -38,6 +54,18 @@ class HayabusaWorker(BaseWorker):
 
     def _read_target_info(self, image: Path) -> dict:
         # Matches your prior bash usage: target-info "$filepath" -j -q
+        """
+        Retrieve and parse target metadata from an image using the external `target-info` tool.
+        
+        Parameters:
+            image (Path): Path to the target image or file to inspect.
+        
+        Returns:
+            dict: Parsed JSON object returned by `target-info`, containing the target metadata.
+        
+        Raises:
+            RuntimeError: If `target-info` exits with a non-zero return code (stderr/stdout included) or if its output cannot be parsed as JSON.
+        """
         res = run_tool("target-info", [str(image), "-j", "-q"], timeout=120, check=False)
         if res.rc != 0:
             raise RuntimeError(f"target-info rc={res.rc}: {res.stderr.strip() or res.stdout.strip()}")
@@ -47,6 +75,15 @@ class HayabusaWorker(BaseWorker):
             raise RuntimeError(f"target-info returned non-JSON: {e}")
 
     def _target_has_winevt_logs(self, image: Path) -> bool:
+        """
+        Check whether the given disk image exposes a Windows Event Logs ("Logs") directory under the Windows Event path.
+        
+        Parameters:
+            image (Path): Path to the target disk image or container to inspect (passed to `target-fs`).
+        
+        Returns:
+            True if a directory named "Logs" appears in the listing of the Windows Event directory inside the image, False otherwise.
+        """
         res = run_tool(
             "target-fs",
             [str(image), "-q", "ls", self.WIN_EVT_DIR],
@@ -60,8 +97,17 @@ class HayabusaWorker(BaseWorker):
 
     def _carve_winevt_logs(self, image: Path, carve_root: Path) -> Path:
         """
-        Carve C:\\Windows\\System32\\WinEvt\\Logs from an image into carve_root.
-        Returns the directory that should be passed to Hayabusa.
+        Carves Windows Evtx Logs from a disk image into a working directory.
+        
+        Parameters:
+            image (Path): Path to the disk image to read from.
+            carve_root (Path): Directory where carved files will be placed; will be created if missing.
+        
+        Returns:
+            Path: Path to the directory containing the carved .evtx files to be scanned (commonly carve_root/Logs or carve_root).
+        
+        Raises:
+            RuntimeError: If the carve operation fails or no `.evtx` files are found under the carve_root after carving.
         """
         carve_root.mkdir(parents=True, exist_ok=True)
 
@@ -88,8 +134,16 @@ class HayabusaWorker(BaseWorker):
 
     def _run_hayabusa_jsonl(self, evtx_dir: Path, tmp_out: Path) -> None:
         """
-        Runs Hayabusa and writes JSONL to tmp_out.
-        Default subcommand is json-timeline to match your bash.
+        Run Hayabusa against a directory of EVTX files and produce JSONL output at tmp_out.
+        
+        Reads Hayabusa settings from the worker's "hayabusa" tool config (notably "subcommand" and "timeout").
+        If "subcommand" is "json-timeline", runs Hayabusa in timeline mode; otherwise uses a detect-style invocation
+        which honors "min_level" and optional "rules_dir". If Hayabusa produces a non-empty tmp_out file or emits JSON
+        to stdout, that output is preserved; otherwise the function raises RuntimeError.
+        
+        Parameters:
+            evtx_dir (Path): Directory containing EVTX files to scan.
+            tmp_out (Path): Path where Hayabusa JSONL output will be written or captured.
         """
         hay_cfg = self.cfg.get_tool_config("hayabusa") or {}
 
@@ -126,6 +180,17 @@ class HayabusaWorker(BaseWorker):
     # Main worker entrypoint
     # ----------------------------
     def run(self, ticket_dict: dict) -> WorkerResult:
+        """
+        Process a worker ticket to run Hayabusa against Windows event logs and produce JSONL detection artifacts.
+        
+        Validates the ticket input, optionally enriches hostname/domain from target metadata, determines the directory of .evtx files (direct directory, parent of an .evtx file, or carved from a disk image), runs Hayabusa to generate raw JSONL, wraps each record with the ticket artifact envelope, writes the final JSONL output, and returns a WorkerResult summarizing the output path and record count. On failure, returns a WorkerResult with error details.
+        
+        Parameters:
+            ticket_dict (dict): Serialized WorkerTicket dictionary containing metadata and destination path.
+        
+        Returns:
+            WorkerResult: On success, contains path to the output directory and the number of records written. On failure, contains None path, a count of 0, and an errors list describing the failure.
+        """
         ticket = WorkerTicket.from_dict(ticket_dict)
         target = Path(ticket.metadata.dest_path)
 

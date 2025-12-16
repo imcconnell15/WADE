@@ -59,25 +59,27 @@ class ModuleConfig:
     """
     
     def __init__(self, config_data: Optional[Dict] = None):
-        """Initialize with config dictionary (typically from YAML).
+        """
+        Create a ModuleConfig instance from an optional configuration mapping.
         
-        Args:
-            config_data: Config dict, usually from YAML.load()
+        Parameters:
+            config_data (Optional[Dict]): Configuration mapping (typically the result of parsing a YAML file). When omitted or None, an empty configuration is used and stored internally.
         """
         self._config = config_data or {}
     
     @classmethod
     def from_yaml(cls, path: Path) -> ModuleConfig:
-        """Load configuration from YAML file.
+        """
+        Create a ModuleConfig populated from the contents of a YAML file.
         
-        Args:
-            path: Path to YAML config file
+        Parameters:
+            path (Path): Filesystem path to the YAML configuration file to read.
         
         Returns:
-            ModuleConfig instance
+            ModuleConfig: Instance populated with the parsed YAML mapping (empty mapping if the file is empty).
         
         Raises:
-            FileNotFoundError: If YAML file doesn't exist
+            FileNotFoundError: If the specified YAML file does not exist.
         """
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {path}")
@@ -89,13 +91,14 @@ class ModuleConfig:
     
     @classmethod
     def from_env(cls) -> ModuleConfig:
-        """Load config from default location specified in env.
+        """
+        Load module configuration from an environment-specified or default file path.
         
-        Checks WADE_CONFIG_PATH env var, falls back to /etc/wade/config.yaml
-        then ./wade_config.yaml.
+        Searches these locations in order and loads the first existing YAML file: the path in
+        the WADE_CONFIG_PATH environment variable, /etc/wade/config.yaml, then ./wade_config.yaml.
         
         Returns:
-            ModuleConfig instance (may be empty if no config found)
+            ModuleConfig: The loaded configuration, or an empty ModuleConfig if no config file is found.
         """
         candidates = [
             os.environ.get("WADE_CONFIG_PATH"),
@@ -113,13 +116,14 @@ class ModuleConfig:
         return cls({})
     
     def get_tool_config(self, tool: str) -> Dict:
-        """Get entire config section for a tool.
+        """
+        Retrieve the configuration mapping for the given tool.
         
-        Args:
-            tool: Tool name (e.g., "volatility", "dissect")
+        Parameters:
+            tool (str): Tool name, e.g., "volatility" or "dissect".
         
         Returns:
-            Config dict for tool (empty if not found)
+            dict: Configuration dictionary for the tool; empty dict if the tool is not configured.
         """
         return self._config.get(tool, {})
     
@@ -130,29 +134,31 @@ class ModuleConfig:
         default: Optional[List[str]] = None,
         env_var: Optional[str] = None,
     ) -> List[str]:
-        """Get module list for a tool with env override support.
+        """
+        Resolve a tool's module list using defaults, YAML configuration, and optional environment-variable overrides.
         
-        Priority:
-          1. Environment variable (if env_var specified)
-          2. YAML config[tool][key]
-          3. default parameter
+        Parameters:
+            tool (str): Tool section name in the configuration (e.g., "volatility").
+            key (str): Key inside the tool config that contains the module list (default: "modules").
+            default (Optional[List[str]]): Fallback module list used when neither YAML nor env provides modules.
+            env_var (Optional[str]): Explicit environment variable name to read overrides from. If omitted, the
+                environment variable WADE_<TOOL>_<KEY> (uppercased) is used.
         
-        Supports add/remove syntax in env vars:
-          "+module1,+module2,-module3" adds module1, module2 and removes module3
+        Behavior:
+            Priority for determining the final module list is:
+              1. Environment variable (if set)
+              2. YAML config at config[tool][key]
+              3. The provided `default` list
         
-        Args:
-            tool: Tool name (e.g., "volatility")
-            key: Config key to look up (default: "modules")
-            default: Default module list if not configured
-            env_var: Environment variable name (default: WADE_<TOOL>_<KEY>)
+            If the tool config contains a `disabled_<key>` list, those module names are removed from the resolved list.
+            Environment overrides support an add/remove syntax:
+              - A value without '+' or '-' replaces the entire list.
+              - Entries starting with '+' are added (preserving order where possible).
+              - Entries starting with '-' are removed.
+              - Mixed forms (some entries with +/- and some without) treat non-prefixed entries as additions.
         
         Returns:
-            List of module names
-        
-        Example:
-            # YAML: volatility.modules: [windows.pslist, windows.netscan]
-            # ENV: WADE_VOLATILITY_MODULES="+windows.cmdline,-windows.netscan"
-            # Result: [windows.pslist, windows.cmdline]
+            List[str]: The resolved ordered list of module names.
         """
         # Start with default
         modules = list(default or [])
@@ -183,20 +189,17 @@ class ModuleConfig:
         return modules
     
     def _apply_env_override(self, base: List[str], env_value: str) -> List[str]:
-        """Apply environment variable override with add/remove syntax.
+        """
+        Resolve an environment-style override string against a base module list using replacement or incremental +/- operations.
         
-        Syntax:
-          - "module1,module2,module3" - replace entire list
-          - "+module1,+module2" - add modules to list
-          - "-module1,-module2" - remove modules from list
-          - "+module1,-module2,module3" - mixed: add module1, remove module2, add module3
+        The env_value is a comma-separated list of tokens. If none of the tokens start with "+" or "-", the token list replaces the base list. If any token starts with "+" or "-", tokens modify the base list incrementally: "+" adds the module, "-" removes it, and tokens without a sign are treated as additions. When modifying incrementally, the function preserves the order of modules from the base list and appends newly added modules at the end.
         
-        Args:
-            base: Base module list
-            env_value: Comma-separated env value
+        Parameters:
+            base (List[str]): The original ordered list of module names.
+            env_value (str): Comma-separated override string (e.g., "a,b" or "+a,-b,c").
         
         Returns:
-            Modified module list
+            List[str]: The resulting ordered list of module names after applying the override.
         """
         parts = [p.strip() for p in env_value.split(",") if p.strip()]
         if not parts:
@@ -252,12 +255,11 @@ def get_global_config() -> ModuleConfig:
 
 
 def reload_global_config() -> ModuleConfig:
-    """Force reload of global configuration.
-    
-    Useful for testing or when config file changes at runtime.
+    """
+    Reload the global ModuleConfig from environment-determined sources.
     
     Returns:
-        Newly loaded ModuleConfig instance
+        ModuleConfig: The reloaded ModuleConfig instance.
     """
     global _global_config
     _global_config = ModuleConfig.from_env()

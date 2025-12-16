@@ -41,13 +41,41 @@ DEFAULT_MATRIX: Dict[Tuple[str, str], List[str]] = {
 }
 
 def _norm_class(cls: str) -> str:
+    """
+    Normalize a classification alias to its canonical class name.
+    
+    Parameters:
+        cls (str): Classification alias or name (case-insensitive).
+    
+    Returns:
+        str: Canonical class name from CLASS_ALIASES, or "unknown" if the input is not recognized.
+    """
     return CLASS_ALIASES.get((cls or "").lower(), "unknown")
 
 def _parse_list(value: str) -> List[str]:
+    """
+    Parse a comma-separated string into a list of trimmed, non-empty items.
+    
+    Parameters:
+        value (str): Comma-separated input string.
+    
+    Returns:
+        List[str]: Trimmed items in the order they appear, excluding empty entries.
+    """
     return [p.strip() for p in value.split(",") if p.strip()]
 
 def _apply_add_remove(base: List[str], expr: str) -> List[str]:
     # "+a,-b,c" → additive/removal; if no +/- anywhere, replace entire list
+    """
+    Apply an additive/removal expression to an ordered list of names.
+    
+    Parameters:
+        base (List[str]): The original ordered list; order is preserved for existing entries.
+        expr (str): Comma-separated expression tokens. Tokens starting with `+` add the name if absent; tokens starting with `-` remove the name; bare names append the name if absent. If none of the tokens start with `+` or `-`, the expression replaces the entire list with the parsed tokens.
+    
+    Returns:
+        List[str]: The resulting ordered, deduplicated list after applying the expression.
+    """
     parts = _parse_list(expr)
     if not parts:
         return base
@@ -96,11 +124,31 @@ class ToolRouting:
               disk_raw.light: [dissect]
     """
     def __init__(self, config_path: Optional[Path] = None, env: Optional[Dict[str, str]] = None):
+        """
+        Initialize the ToolRouting instance, establish environment and config path, and load the routing configuration.
+        
+        Parameters:
+            config_path (Optional[Path]): Optional path to a YAML configuration file; if omitted, the path is taken from the `WADE_CONFIG_PATH` environment variable or defaults to `/etc/wade/config.yaml`.
+            env (Optional[Dict[str, str]]): Optional environment mapping to use instead of the process environment.
+        
+        Attributes:
+            env (Dict[str, str]): Environment mapping used for configuration and overrides.
+            config_path (Path): Resolved path to the routing YAML configuration file.
+            cfg (Dict): Parsed routing configuration (empty dict if no config or on load error).
+        """
         self.env = env or dict(os.environ)
         self.config_path = Path(config_path or self.env.get("WADE_CONFIG_PATH", "/etc/wade/config.yaml"))
         self.cfg = self._load_cfg()
 
     def _load_cfg(self) -> Dict:
+        """
+        Load the YAML configuration from the instance's config_path and return it as a dictionary.
+        
+        Reads and parses YAML at self.config_path; if the file does not exist, is empty, or parsing/reading fails, returns an empty dict.
+        
+        Returns:
+            dict: Parsed configuration dictionary, or an empty dict on missing file, empty content, or error.
+        """
         if self.config_path.exists():
             try:
                 return yaml.safe_load(self.config_path.read_text()) or {}
@@ -109,6 +157,14 @@ class ToolRouting:
         return {}
 
     def _get_defaults(self) -> Dict[Tuple[str, str], List[str]]:
+        """
+        Construct the default routing matrix by merging built-in defaults with any YAML-provided overrides.
+        
+        YAML keys for classes are normalized via _norm_class; profile names are lowercased and default to "full" when omitted. When a YAML entry for a (class, profile) provides a list of tools, that list replaces the built-in entry for that key.
+        
+        Returns:
+            Dict[Tuple[str, str], List[str]]: Mapping from (canonical_class, profile) to an ordered list of tool names.
+        """
         res = dict(DEFAULT_MATRIX)
         routing = (self.cfg.get("routing") or {}).get("defaults") or {}
         # Merge YAML defaults
@@ -128,6 +184,18 @@ class ToolRouting:
         details: Optional[Dict] = None,
         location: Optional[str] = None,
     ) -> List[str]:
+        """
+        Compute the ordered list of tool names to run for the given classification and profile by resolving defaults and applying overrides.
+        
+        Parameters:
+            classification (str): Classification name or alias (will be normalized).
+            profile (str): Profile name (e.g., "full" or "light"); defaults to "full" when falsy.
+            details (Optional[Dict]): Optional details used for overrides (recognized key: `os_family` to apply OS-specific overrides).
+            location (Optional[str]): Optional location identifier to apply location-specific overrides.
+        
+        Returns:
+            List[str]: Ordered, deduplicated tool names after applying defaults, YAML and environment overrides, global disables/enables, and platform-specific sanitization.
+        """
         clsn = _norm_class(classification)
         prof = (profile or "full").lower()
         details = details or {}
@@ -173,6 +241,18 @@ class ToolRouting:
 
     def _apply_over_block(self, tools: List[str], block: Dict, clsn: str, prof: str) -> List[str]:
         # block schema: { add: { "memory.full": [x] }, remove: {...} }
+        """
+        Apply add/remove overrides from a routing block for the given classification and profile and return the resulting tool list.
+        
+        Parameters:
+            tools (List[str]): Base ordered list of tool names.
+            block (Dict): Overrides block that may contain "add" and/or "remove" mappings. Each mapping is expected to be a dict keyed by "<classification>.<profile>" with a list of tool names to add or remove.
+            clsn (str): Canonical classification used to form the key.
+            prof (str): Profile name used to form the key.
+        
+        Returns:
+            List[str]: The updated ordered tool list after applying any matching add then remove entries for the "{clsn}.{prof}" key.
+        """
         def apply(op: str, base: List[str]) -> List[str]:
             changes = (block.get(op) or {})
             key = f"{clsn}.{prof}"

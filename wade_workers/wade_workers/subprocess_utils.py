@@ -37,11 +37,26 @@ class CommandResult:
     
     @property
     def success(self) -> bool:
-        """True if command succeeded (rc=0 and didn't timeout)."""
+        """
+        Indicates whether the command completed successfully.
+        
+        Returns:
+            `true` if the return code is 0 and the command did not time out, `false` otherwise.
+        """
         return self.rc == 0 and not self.timed_out
     
     def truncated_stderr(self, max_chars: int = 200) -> str:
-        """Return truncated stderr for safe logging."""
+        """
+        Return a safely truncated version of the stored stderr suitable for logs.
+        
+        Truncates stderr to at most `max_chars` characters and appends an indicator with the total original character count when truncation occurs.
+        
+        Parameters:
+            max_chars (int): Maximum number of characters to keep from stderr before truncation.
+        
+        Returns:
+            str: The original stderr if its length is less than or equal to `max_chars`, otherwise a truncated stderr followed by "... (<total> total chars)".
+        """
         if len(self.stderr) <= max_chars:
             return self.stderr
         return self.stderr[:max_chars] + f"... ({len(self.stderr)} total chars)"
@@ -54,7 +69,15 @@ class ToolDiscovery(Protocol):
     (e.g., checking virtual environments, conda, modules).
     """
     def find_tool(self, tool_name: str) -> Optional[Path]:
-        """Return path to tool if found, None otherwise."""
+        """
+        Find the filesystem path for a named tool using the registry's configured discovery strategies.
+        
+        Parameters:
+            tool_name (str): Tool name to locate.
+        
+        Returns:
+            Optional[Path]: Path to the tool if found (first match of configured discoveries); `None` if no discovery locates the tool. The result is cached for subsequent lookups.
+        """
         ...
 
 
@@ -62,7 +85,15 @@ class SystemPathDiscovery:
     """Find tools on system PATH."""
     
     def find_tool(self, tool_name: str) -> Optional[Path]:
-        """Search for tool in PATH."""
+        """
+        Locate an executable on the system PATH by name.
+        
+        Parameters:
+            tool_name (str): The executable name to look up.
+        
+        Returns:
+            Optional[Path]: Path to the executable if found, `None` otherwise.
+        """
         try:
             result = subprocess.run(
                 ["which", tool_name],
@@ -84,10 +115,29 @@ class EnvVarDiscovery:
     """
     
     def __init__(self, env_prefix: str = "WADE_"):
+        """
+        Initialize the EnvVarDiscovery with a prefix for environment variable overrides.
+        
+        Parameters:
+            env_prefix (str): Prefix used to build environment variable names for tool overrides.
+                For a tool named "foo", the discovery will look for an environment variable
+                formed by uppercasing the tool name and surrounding it with this prefix and
+                the suffix "_PATH" (for example, "WADE_FOO_PATH" when using the default prefix).
+        """
         self.env_prefix = env_prefix
     
     def find_tool(self, tool_name: str) -> Optional[Path]:
-        """Check for WADE_<TOOL>_PATH environment variable."""
+        """
+        Resolve a tool path from an environment-variable override.
+        
+        Checks the environment variable formed as `"<env_prefix><TOOL>_PATH"` (where `<TOOL>` is the uppercased tool_name) and returns its Path if it exists and is a file.
+        
+        Parameters:
+            tool_name (str): Canonical name of the tool to look up.
+        
+        Returns:
+            Optional[Path]: Path to the tool if the environment variable points to an existing file, `None` otherwise.
+        """
         import os
         env_var = f"{self.env_prefix}{tool_name.upper()}_PATH"
         tool_path = os.environ.get(env_var)
@@ -112,6 +162,11 @@ class ToolRegistry:
     """
     
     def __init__(self):
+        """
+        Create an empty ToolRegistry.
+        
+        Initializes the ordered list of discovery strategies (applied in registration order) and an empty cache that maps tool names to a resolved Path or None to avoid repeated discovery work.
+        """
         self._discoveries: List[ToolDiscovery] = []
         self._cache: Dict[str, Optional[Path]] = {}
     
@@ -120,9 +175,13 @@ class ToolRegistry:
         self._discoveries.append(discovery)
     
     def find_tool(self, tool_name: str) -> Optional[Path]:
-        """Find tool using registered discovery strategies.
+        """
+        Locate a tool by querying registered discovery strategies in order and cache the result.
         
-        Results are cached to avoid repeated searches.
+        Searches each registered discovery in sequence until one returns a path; the resolved path (or None if not found) is stored in the registry cache to avoid repeated lookups.
+        
+        Returns:
+            Optional[Path]: Path to the tool if found, None otherwise.
         """
         if tool_name in self._cache:
             return self._cache[tool_name]
@@ -139,7 +198,15 @@ class ToolRegistry:
         return None
     
     def require_tool(self, tool_name: str) -> Path:
-        """Find tool or raise ToolNotFoundError."""
+        """
+        Resolve a tool name to its filesystem path or raise an error if it cannot be located.
+        
+        Returns:
+            Path: Filesystem path to the discovered tool executable.
+        
+        Raises:
+            ToolNotFoundError: If no discovery strategy can locate the tool.
+        """
         path = self.find_tool(tool_name)
         if not path:
             raise ToolNotFoundError(f"Required tool not found: {tool_name}")
@@ -170,6 +237,12 @@ class CommandExecutionError(Exception):
     """Raised when a command fails and check=True."""
     
     def __init__(self, result: CommandResult):
+        """
+        Initialize the exception with the failing command's result and build its error message.
+        
+        Parameters:
+            result (CommandResult): The command execution outcome that caused the exception. Stored on the exception as the `result` attribute. The exception message includes the return code, the joined command, and a truncated version of the command's stderr.
+        """
         self.result = result
         super().__init__(
             f"Command failed with rc={result.rc}: {' '.join(result.cmd)}\n"
@@ -186,28 +259,23 @@ def safe_run(
     cwd: Optional[Path] = None,
     max_output_chars: int = 4000,
 ) -> CommandResult:
-    """Run command with consistent error handling and logging.
+    """
+    Execute a subprocess command with standardized logging, output truncation, and failure handling.
     
-    Args:
-        cmd: Command and arguments to execute
-        timeout: Timeout in seconds (default: 60)
-        check: Raise CommandExecutionError if rc != 0
-        log_output: Log command execution (default: True)
-        env: Environment variables (merged with os.environ)
-        cwd: Working directory
-        max_output_chars: Truncate stdout/stderr to this length
+    Parameters:
+        cmd (List[str]): Command and arguments to execute.
+        timeout (int): Maximum execution time in seconds (default 60).
+        check (bool): If True, raise CommandExecutionError when the command exits non‑zero.
+        log_output (bool): If True, log start, completion, and error summaries.
+        env (Optional[Dict[str, str]]): Environment overrides merged on top of the current environment.
+        cwd (Optional[Path]): Working directory for the command.
+        max_output_chars (int): Maximum number of characters to keep from stdout/stderr.
     
     Returns:
-        CommandResult with execution details
+        CommandResult: Execution details including return code, truncated stdout/stderr, duration, and timeout flag.
     
     Raises:
-        CommandExecutionError: If check=True and command fails
-        subprocess.TimeoutExpired: If command times out
-    
-    Example:
-        result = safe_run(["volatility3", "-f", "mem.raw", "windows.pslist"])
-        if result.success:
-            parse_volatility_output(result.stdout)
+        CommandExecutionError: When `check` is True and the command did not succeed.
     """
     start = time.time()
     timed_out = False
@@ -269,22 +337,20 @@ def run_tool(
     registry: Optional[ToolRegistry] = None,
     **run_kwargs,
 ) -> CommandResult:
-    """Run a tool by name, automatically discovering its path.
+    """
+    Run a named tool by resolving its filesystem path and executing it with the provided arguments.
     
-    Args:
-        tool_name: Name of tool to run (e.g., "volatility3")
-        args: Arguments to pass to the tool
-        registry: ToolRegistry to use (default: global registry)
-        **run_kwargs: Additional arguments passed to safe_run()
+    Parameters:
+        tool_name (str): Name of the tool to locate and run (e.g., "volatility3").
+        args (List[str]): Argument list to pass to the tool executable.
+        registry (Optional[ToolRegistry]): Registry used to resolve the tool path; uses the module's default registry when None.
+        **run_kwargs: Additional keyword arguments forwarded to safe_run (e.g., timeout, check, env, cwd).
     
     Returns:
-        CommandResult
+        CommandResult: Execution result including return code, stdout/stderr, duration, and timeout flag.
     
     Raises:
-        ToolNotFoundError: If tool cannot be found
-    
-    Example:
-        result = run_tool("volatility3", ["-f", "mem.raw", "windows.pslist"])
+        ToolNotFoundError: If the tool cannot be located by the registry.
     """
     if registry is None:
         registry = get_default_registry()

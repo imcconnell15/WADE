@@ -77,7 +77,15 @@ class WorkerTicket:
     schema_version: str = "2.0"
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert ticket to dictionary for JSON serialization."""
+        """
+        Produce a serializable dictionary representation of the worker ticket.
+        
+        Returns:
+            ticket_dict (Dict[str, Any]): Dictionary with keys:
+                - "schema_version": schema version string.
+                - "metadata": dict representation of the ticket's metadata.
+                - "worker_config": worker configuration dictionary.
+        """
         return {
             "schema_version": self.schema_version,
             "metadata": asdict(self.metadata),
@@ -85,17 +93,35 @@ class WorkerTicket:
         }
     
     def to_json(self) -> str:
-        """Serialize to JSON string."""
+        """
+        Serialize the worker ticket to a JSON-formatted string.
+        
+        Returns:
+            json_str (str): JSON representation of the ticket containing `schema_version`, `metadata`, and `worker_config`, formatted with indentation.
+        """
         return json.dumps(self.to_dict(), indent=2)
     
     def save(self, path: Path) -> None:
-        """Save ticket to JSON file."""
+        """
+        Write the ticket's JSON representation to the given filesystem path, creating any missing parent directories.
+        
+        Parameters:
+            path (Path): Filesystem path to the output JSON file; parent directories will be created if they do not exist.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.to_json())
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> WorkerTicket:
-        """Load ticket from dictionary."""
+        """
+        Construct a WorkerTicket from a serialized mapping, handling legacy v1 tickets by migrating them to the v2 schema.
+        
+        Parameters:
+            data (Dict[str, Any]): Dictionary representing a serialized ticket (v2 schema produced by to_dict/to_json, or a legacy v1 ticket). If "schema_version" is absent it is treated as "1.0".
+        
+        Returns:
+            WorkerTicket: A WorkerTicket instance populated from the provided dictionary.
+        """
         schema_version = data.get("schema_version", "1.0")
         
         # Handle old format (schema v1.0)
@@ -114,24 +140,44 @@ class WorkerTicket:
     
     @classmethod
     def from_json(cls, json_str: str) -> WorkerTicket:
-        """Load ticket from JSON string."""
+        """
+        Construct a WorkerTicket from a JSON-formatted string.
+        
+        Parameters:
+            json_str (str): JSON representation of a ticket payload.
+        
+        Returns:
+            WorkerTicket: Parsed WorkerTicket instance built from the provided JSON.
+        """
         data = json.loads(json_str)
         return cls.from_dict(data)
     
     @classmethod
     def load(cls, path: Path) -> WorkerTicket:
-        """Load ticket from JSON file."""
+        """
+        Constructs a WorkerTicket from a JSON file at the given filesystem path.
+        
+        Parameters:
+            path (Path): Path to the JSON file containing the ticket.
+        
+        Returns:
+            WorkerTicket: Ticket reconstructed from the file's JSON content.
+        """
         return cls.from_json(path.read_text())
     
     @classmethod
     def _from_v1(cls, data: Dict[str, Any]) -> WorkerTicket:
-        """Migrate v1 ticket format to v2.
+        """
+        Convert a legacy v1 ticket dictionary into a v2 WorkerTicket instance.
         
-        Maps old field names to new schema:
-          - host -> hostname
-          - path/dest_path -> dest_path
-          - classification -> classification
-          - os/os_family -> os_family
+        Builds a TicketMetadata from mapped v1 fields, preserves any unmapped keys in metadata.custom,
+        and moves v1 `plugins` into the returned ticket's worker_config.
+        
+        Parameters:
+            data (Dict[str, Any]): A dictionary containing a v1 ticket representation.
+        
+        Returns:
+            WorkerTicket: A WorkerTicket populated from the provided v1 data with schema_version "2.0".
         """
         # Extract core fields with backward compat
         hostname = data.get("host") or data.get("hostname", "unknown_host")
@@ -185,22 +231,17 @@ class WorkerTicket:
         )
     
     def get_artifact_envelope(self, tool: str, module: str) -> Dict[str, Any]:
-        """Get metadata envelope to inject into each artifact JSON line.
+        """
+        Produce a metadata envelope to merge into each artifact record.
         
-        This envelope is added to every record for Splunk searchability.
+        The envelope contains ticket identity, source file and path, classification, the provided tool and module names, case and analyst info, OS fields when present, current UTC artifact_created_utc timestamp, tags, and any custom metadata from the ticket.
         
-        Args:
-            tool: Tool name (e.g., "volatility")
-            module: Module/plugin name (e.g., "windows.pslist")
+        Parameters:
+            tool (str): Name of the producing tool (e.g., "volatility").
+            module (str): Name of the tool module or plugin (e.g., "windows.pslist").
         
         Returns:
-            Dict with fields to merge into each artifact record
-        
-        Example:
-            envelope = ticket.get_artifact_envelope("volatility", "windows.pslist")
-            for record in results:
-                artifact = {**envelope, **record}
-                json.dump(artifact, f)
+            Dict[str, Any]: Mapping of envelope fields suitable for merging into an artifact JSON object.
         """
         m = self.metadata
         return {
@@ -238,13 +279,16 @@ class WorkerTicket:
 
 
 def validate_ticket(ticket: WorkerTicket) -> List[str]:
-    """Validate ticket and return list of warnings/errors.
+    """
+    Check a WorkerTicket for missing or invalid required fields.
     
-    Args:
-        ticket: Ticket to validate
+    Performs these validations: hostname presence and not "unknown_host", dest_path presence and filesystem existence, classification not "unknown", created_utc is a valid ISO-8601 timestamp, and priority is between 1 and 10.
+    
+    Parameters:
+        ticket (WorkerTicket): The ticket to validate.
     
     Returns:
-        List of validation messages (empty = valid)
+        List[str]: A list of validation messages; an empty list indicates the ticket is valid.
     """
     issues = []
     m = ticket.metadata

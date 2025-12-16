@@ -21,6 +21,28 @@ def build_staging_ticket(
     **custom_fields,
 ) -> WorkerTicket:
     # ... existing hash/size logic ...
+    """
+    Builds a WorkerTicket for staging a file, populating metadata and worker_config including requested tools.
+    
+    Parameters:
+        dest_path (Path): Destination filesystem path for the staged file.
+        classification (str): Classification label used to route tools and tag the ticket.
+        hostname (Optional[str]): Hostname to record; if omitted, derived from dest_path.parent.name or "unknown_host".
+        os_family (Optional[str]): Operating system family used when selecting tools.
+        source_file (Optional[str]): Original source filename; defaults to dest_path.name.
+        case_id (Optional[str]): Case identifier associated with the ticket.
+        case_name (Optional[str]): Case name associated with the ticket.
+        analyst (Optional[str]): Analyst name to record on the ticket.
+        priority (int): Priority level for the ticket.
+        tags (Optional[List[str]]): List of tags to attach to the ticket.
+        profile (str): Tooling/profile name used for tool selection and added to worker_config.
+        location (Optional[str]): Location string included in metadata and worker_config.
+        details (Optional[Dict]): Additional metadata details merged into the ticket's custom fields and used for tool selection.
+        **custom_fields: Arbitrary additional custom fields to include in the ticket's custom metadata.
+    
+    Returns:
+        WorkerTicket: A ticket whose metadata is populated (including file hash/size, staged UTC timestamp, and custom fields) and whose worker_config includes "profile", "location", and "requested_tools" as determined by ToolRouting.select_tools.
+    """
     details = details or {}
     metadata = TicketMetadata(
         hostname=hostname or dest_path.parent.name or "unknown_host",

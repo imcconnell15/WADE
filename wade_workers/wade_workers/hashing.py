@@ -37,11 +37,30 @@ class HashResult:
     sample_size: int
     
     def __getitem__(self, algo: str) -> str:
-        """Allow dict-like access: result["sha256"]"""
+        """
+        Retrieve the hex digest for the given algorithm name.
+        
+        Parameters:
+            algo (str): Name of the hash algorithm (e.g., "sha256").
+        
+        Returns:
+            str: Hexadecimal digest for `algo`.
+        
+        Raises:
+            KeyError: If `algo` is not present in the stored hashes.
+        """
         return self.hashes[algo]
     
     def __contains__(self, algo: str) -> bool:
-        """Check if algorithm was computed: "md5" in result"""
+        """
+        Determine whether a digest for the given algorithm exists in the result.
+        
+        Parameters:
+            algo (str): Name of the hash algorithm to check (e.g., "sha256", "md5").
+        
+        Returns:
+            bool: `True` if a digest for `algo` is present, `False` otherwise.
+        """
         return algo in self.hashes
 
 
@@ -53,17 +72,18 @@ class HashStrategy(ABC):
     
     @abstractmethod
     def hash(self, path: Path) -> HashResult:
-        """Compute hash of file at path.
+        """
+        Compute configured hash(es) for the file at the given path.
         
-        Args:
-            path: File to hash
+        Parameters:
+            path (Path): Path to the file to hash.
         
         Returns:
-            HashResult with computed hashes
+            HashResult: Contains a mapping of algorithm names to hex digests, the file's total size in bytes, and the number of bytes actually sampled/processed.
         
         Raises:
-            FileNotFoundError: If path doesn't exist
-            PermissionError: If file is not readable
+            FileNotFoundError: If the file does not exist.
+            PermissionError: If the file cannot be read due to permission restrictions.
         """
         pass
 
@@ -85,13 +105,14 @@ class FullFileHasher(HashStrategy):
     CHUNK_SIZE = 8192  # Read 8KB at a time
     
     def __init__(self, algos: Optional[List[str]] = None):
-        """Initialize with list of algorithms to compute.
+        """
+        Create a FullFileHasher configured to compute the specified digest algorithms.
         
-        Args:
-            algos: List of algorithm names (default: md5, sha1, sha256)
+        Parameters:
+            algos (Optional[List[str]]): Algorithm names to compute (e.g., "md5", "sha256"). If omitted, uses the default set.
         
         Raises:
-            ValueError: If unsupported algorithm requested
+            ValueError: If any algorithm in `algos` is not supported.
         """
         self.algos = algos or self.DEFAULT_ALGOS
         
@@ -101,7 +122,18 @@ class FullFileHasher(HashStrategy):
             raise ValueError(f"Unsupported algorithms: {unsupported}")
     
     def hash(self, path: Path) -> HashResult:
-        """Hash entire file with all configured algorithms."""
+        """
+        Compute cryptographic digests of the entire file using the configured algorithms.
+        
+        Reads the file in fixed-size chunks and returns a HashResult containing per-algorithm hex digests,
+        the total file_size in bytes, and sample_size equal to file_size.
+        
+        Returns:
+            HashResult: Hashes mapping (algorithm -> hex digest), file_size, and sample_size.
+        
+        Raises:
+            FileNotFoundError: If the given path does not exist.
+        """
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
         
@@ -142,17 +174,26 @@ class QuickHasher(HashStrategy):
     """
     
     def __init__(self, sample_bytes: int = 4 * 1024 * 1024, algo: str = "sha256"):
-        """Initialize quick hasher.
+        """
+        Initialize the QuickHasher with a sampling size and hash algorithm.
         
-        Args:
-            sample_bytes: Bytes to read from head and tail (default: 4MB each)
-            algo: Hash algorithm (default: sha256)
+        Parameters:
+            sample_bytes (int): Number of bytes to read from the file head and (if the file is larger) the tail when computing the quick hash; defaults to 4 MiB.
+            algo (str): Name of the hash algorithm to use (e.g., "sha256"); defaults to "sha256".
         """
         self.sample_bytes = sample_bytes
         self.algo = algo
     
     def hash(self, path: Path) -> HashResult:
-        """Hash first and last N bytes of file."""
+        """
+        Compute a quick sample hash of a file by hashing its head and, if present, its tail using the configured algorithm.
+        
+        Returns:
+            HashResult: Contains the file path, a mapping from algorithm name to hex digest, the total file size in bytes, and sample_size equal to the number of bytes actually hashed (head plus optional tail).
+        
+        Raises:
+            FileNotFoundError: If the provided path does not exist.
+        """
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
         
@@ -198,17 +239,29 @@ class StreamingHasher(HashStrategy):
         algos: Optional[List[str]] = None,
         chunk_size: int = 1024 * 1024,  # 1MB chunks
     ):
-        """Initialize streaming hasher.
+        """
+        Configure the StreamingHasher with the hashing algorithms to compute and the read chunk size.
         
-        Args:
-            algos: List of algorithms (default: sha256)
-            chunk_size: Bytes per chunk (default: 1MB)
+        Parameters:
+            algos (Optional[List[str]]): Names of hash algorithms to compute (default: ["sha256"]).
+            chunk_size (int): Number of bytes read per I/O chunk (default: 1_048_576).
         """
         self.algos = algos or ["sha256"]
         self.chunk_size = chunk_size
     
     def hash(self, path: Path) -> HashResult:
-        """Hash file in chunks without loading entire file."""
+        """
+        Compute cryptographic hashes of the entire file by reading it in fixed-size chunks.
+        
+        Parameters:
+            path (Path): Path to the file to hash.
+        
+        Returns:
+            HashResult: Contains the file path, a mapping of algorithm name to hex digest, the total file size in bytes, and sample_size equal to the number of bytes actually read.
+        
+        Raises:
+            FileNotFoundError: If the given path does not exist.
+        """
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
         
@@ -237,14 +290,15 @@ class StreamingHasher(HashStrategy):
 # Convenience functions for common use cases
 
 def quick_hash(path: Path, sample_mb: int = 4) -> str:
-    """Quick hash for deduplication (head+tail SHA256).
+    """
+    Compute a fast SHA-256 digest by hashing the file's head and tail samples for deduplication.
     
-    Args:
-        path: File to hash
-        sample_mb: MB to sample from head and tail
+    Parameters:
+        path (Path): Path to the file to hash.
+        sample_mb (int): Number of megabytes to read from the head and from the tail (each); total bytes hashed is head + tail.
     
     Returns:
-        SHA256 hex digest string
+        str: Hexadecimal SHA-256 digest of the sampled data.
     """
     hasher = QuickHasher(sample_bytes=sample_mb * 1024 * 1024)
     result = hasher.hash(path)
@@ -252,13 +306,14 @@ def quick_hash(path: Path, sample_mb: int = 4) -> str:
 
 
 def forensic_hash(path: Path) -> Dict[str, str]:
-    """Full MD5+SHA1+SHA256 for forensic analysis.
+    """
+    Compute MD5, SHA-1, and SHA-256 hashes of a file for forensic purposes.
     
-    Args:
-        path: File to hash
+    Parameters:
+        path (Path): Path to the file to hash.
     
     Returns:
-        Dict mapping algo name to hex digest
+        Dict[str, str]: Mapping of algorithm name ('md5', 'sha1', 'sha256') to the corresponding hex digest.
     """
     hasher = FullFileHasher(algos=["md5", "sha1", "sha256"])
     result = hasher.hash(path)
