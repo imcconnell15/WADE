@@ -226,9 +226,13 @@ def main():
     worker_map = {
         "volatility": "VolatilityWorker",
         "dissect": "DissectWorker",
+        "plaso": "PlasoWorker",
         "yara": "YaraWorker",
         "hayabusa": "HayabusaWorker",
-        "bulkextractor": "BulkExtractorWorker",
+        "bulk_extractor": "BulkExtractorWorker",
+        "autopsy": "AutopsyManifestWorker",
+        "netcfg": "NetworkConfigWorker",
+        "netdoc": "NetworkDocWorker",
     }
     
     if args.worker not in worker_map:
