@@ -54,7 +54,7 @@ class VMClassifier:
             details={"format": "unknown"},
         )
     
-    def _classify_qcow(self, path: Path) -> ClassificationResult:
+    def _classify_qcow(self, _path: Path) -> ClassificationResult:
         """Classify QCOW2 image."""
         return ClassificationResult(
             classification="vm_disk",
