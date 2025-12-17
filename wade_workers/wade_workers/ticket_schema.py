@@ -104,7 +104,11 @@ class WorkerTicket:
         
         # Schema v2.0+
         metadata_dict = data.get("metadata", {})
-        metadata = TicketMetadata(**metadata_dict)
+        known_fields = {f.name for f in fields(TicketMetadata)}
+        filtered = {k: v for k, v in metadata_dict.items() if k in known_fields}
+        extra = {k: v for k, v in metadata_dict.items() if k not in known_fields}
+        metadata = TicketMetadata(**filtered)
+        metadata.custom.update(extra)
         
         return cls(
             metadata=metadata,
