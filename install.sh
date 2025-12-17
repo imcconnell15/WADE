@@ -1533,7 +1533,7 @@ run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
   '"pip_cached_install \"$VENV_DIR/bin\" inotify PyYAML"'
 
    # Smoke test essential imports
-   "'"$VENV_DIR"'/bin/python" - <<'"'"'PY'"'"'
+  "'"$VENV_DIR"'/bin/python" - <<'PY'
 import json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
