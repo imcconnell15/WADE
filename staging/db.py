@@ -60,7 +60,6 @@ def path_signature(p: Path) -> str:
     
     Returns:
         Signature string
-
         
     Raises:
         OSError: If file is inaccessible
