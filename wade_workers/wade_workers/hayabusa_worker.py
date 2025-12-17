@@ -20,7 +20,7 @@ class HayabusaWorker(BaseWorker):
     WIN_EVT_DIR = r"C:\Windows\System32\WinEvt"
     WIN_EVT_LOGS_DIR = r"C:\Windows\System32\WinEvt\Logs"
 
-    def __init__(self, env=None, config=None):
+    def __init__(self, env=None, config=None) -> None:
         super().__init__(env, config)
         self.logger = EventLogger.get_logger("hayabusa_worker")
         self.cfg = get_global_config()
