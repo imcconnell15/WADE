@@ -55,7 +55,7 @@ class VolatilityWorker(BaseWorker):
             # Try fallback
             try:
                 self.vol_path = get_default_registry().require_tool("vol.py")
-            except ToolNotFoundError as e:
+            except ToolNotFoundError:
                 self.logger.log_worker_error(
                     "volatility",
                     "Tool not found - install volatility3 or set WADE_VOLATILITY3_PATH",
@@ -214,7 +214,7 @@ class VolatilityWorker(BaseWorker):
                 f"Failed to parse {module_name} output",
                 details={"module": module_name, "error": str(e)},
                 suggestion="Check volatility3 output format"
-            )
+            ) from e
         
         self.logger.log_event(
             "worker.volatility.module_complete",
