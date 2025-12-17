@@ -134,7 +134,7 @@ class VMClassifier:
         try:
             content = path.read_bytes()
             hostname = self._parse_ovf_hostname(content)
-        except Exception:
+        except (OSError, UnicodeDecodeError):
             pass
         
         details = {"format": "ovf"}
