@@ -64,11 +64,10 @@ def dispatch_ticket(ticket_path: Path, env: Optional[dict] = None) -> int:
             continue
 
         # Merge per-tool overrides into ticket.worker_config[tool]
-        wc = ticket.worker_config or {}
-        per_tool = wc.get(tool, {})
+        wc = dict(ticket.worker_config or {})
+        per_tool = dict(wc.get(tool, {}))
         per_tool.update(overrides)
         wc[tool] = per_tool
-        ticket.worker_config = wc
 
         # Run worker
         worker = WorkerClass(env=env)
