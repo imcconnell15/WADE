@@ -109,12 +109,17 @@ class VMClassifier:
         hostname = None
         try:
             with tarfile.open(path, "r") as tar:
-                members = tar.getnames()
-                # Look for .ovf file
-                ovf_files = [m for m in members if m.endswith(".ovf")]
-                if ovf_files:
-                    ovf_content = tar.extractfile(ovf_files[0]).read()
-                    hostname = self._parse_ovf_hostname(ovf_content)
+                # Look for .ovf file (avoid path traversal)
+                for member in tar.getmembers():
+                    if member.name.endswith(".ovf") and member.isfile():
+                        # Prevent path traversal
+                        if ".." in member.name or member.name.startswith("/"):
+                            continue
+                        f = tar.extractfile(member)
+                        if f:
+                            ovf_content = f.read()
+                            hostname = self._parse_ovf_hostname(ovf_content)
+                            break
         except Exception:
             pass
         
