@@ -194,7 +194,7 @@ SHOULD_LINEMERGE = false
 
 ### Process Analysis (Volatility)
 
-```
+```spl
 index=wade_volatility sourcetype=wade:volatility:memory module=windows.pslist
 | table host case_id PID ImageFileName Threads Handles CreateTime
 | sort -Threads
@@ -203,7 +203,7 @@ index=wade_volatility sourcetype=wade:volatility:memory module=windows.pslist
 
 ### Malware Detection (YARA)
 
-```
+```spl
 index=wade_yara sourcetype=wade:yara:scan
 | stats count by rule host case_id
 | sort -count
@@ -212,7 +212,7 @@ index=wade_yara sourcetype=wade:yara:scan
 
 ### Windows Event Analysis (Hayabusa)
 
-```
+```spl
 index=wade_hayabusa sourcetype=wade:hayabusa:detections
 | search Level IN ("High", "Critical")
 | table Timestamp Computer EventID RuleTitle Details MitreTactics
@@ -222,7 +222,7 @@ index=wade_hayabusa sourcetype=wade:hayabusa:detections
 
 ### Timeline Correlation (Plaso)
 
-```
+```spl
 index=wade_plaso sourcetype=wade:plaso:timeline host="DESKTOP-ABC123"
 | timechart count by source_module
 
@@ -230,7 +230,7 @@ index=wade_plaso sourcetype=wade:plaso:timeline host="DESKTOP-ABC123"
 
 ### Network Connections (Volatility)
 
-```
+```spl
 index=wade_volatility module=windows.netscan
 | table host LocalAddr LocalPort ForeignAddr ForeignPort State PID Owner
 | where State="ESTABLISHED"
