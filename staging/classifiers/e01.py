@@ -152,12 +152,16 @@ class E01Classifier:
             Path to merged raw image, or None on failure
         """
         
-         # Find E01 base
+        # Find E01 base
         base = path.with_suffix("")
         e01_upper = base.with_suffix(".E01")
         e01_lower = base.with_suffix(".e01")
         
-        if not (e01_upper.exists() or e01_lower.exists()):
+        if e01_upper.exists():
+            e01 = e01_upper
+        elif e01_lower.exists():
+            e01 = e01_lower
+        else:
             return None
         
         # Output path
