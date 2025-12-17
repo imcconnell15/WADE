@@ -81,7 +81,7 @@ class VolatilityWorker(BaseWorker):
                 "Failed to parse ticket",
                 details={"error": str(e)},
                 suggestion="Check ticket schema version and format"
-            )
+            )  from e
         
         # Validate required fields
         if not ticket.metadata.dest_path:
