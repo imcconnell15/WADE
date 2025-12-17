@@ -880,7 +880,7 @@ sudo systemctl restart postgresql
 
 -   [ ]  Distributed deployment (model sharding)
 -   [ ]  Active learning from analyst feedback
--   [] Automated report generation
+-   [ ] Automated report generation
 -   [ ]  Voice interface for hands-free operation
 -   [ ]  AR/VR visualization integration
 
