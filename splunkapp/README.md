@@ -1,4 +1,3 @@
-```
 # WADE Splunk Integration
 
 Splunk apps and add-ons for ingesting, indexing, and analyzing WADE forensic artifacts.
