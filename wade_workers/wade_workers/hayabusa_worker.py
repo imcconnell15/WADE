@@ -44,7 +44,7 @@ class HayabusaWorker(BaseWorker):
         try:
             return json.loads(res.stdout)
         except Exception as e:
-            raise RuntimeError(f"target-info returned non-JSON: {e}")
+            raise RuntimeError(f"target-info returned non-JSON: {e}") from e
 
     def _target_has_winevt_logs(self, image: Path) -> bool:
         res = run_tool(
