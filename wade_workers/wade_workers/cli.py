@@ -17,6 +17,7 @@ from .exceptions import (
     TicketValidationError,
     ConfigurationError,
     WorkerExecutionError,
+    get_exit_code,
 )
 from .exit_codes import ExitCode, exit_code_name
 from .logging import EventLogger
