@@ -86,7 +86,9 @@ def is_probably_text(p: Path, sample_bytes: int = TEXT_SNIFF_BYTES) -> Tuple[boo
     # Try Latin-1 fallback
     try:
         text = sample.decode("latin-1")
-        return True, text
+        printable_ratio = sum(c.isprintable() or c.isspace() for c in text) / max(len(text), 1)
+        if printable_ratio > 0.7:
+            return True, text
     except Exception:
         pass
     
@@ -229,6 +231,7 @@ def ensure_dirs(*paths: Path) -> None:
     for path in paths:
         path.mkdir(parents=True, exist_ok=True)
 
+import errno
 
 def move_atomic(src: Path, dest: Path) -> None:
     """Move file atomically, falling back to copy+delete.
@@ -242,7 +245,9 @@ def move_atomic(src: Path, dest: Path) -> None:
     try:
         # Try atomic rename (works within same filesystem)
         src.rename(dest)
-    except OSError:
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
         # Cross-filesystem; copy then delete
         shutil.copy2(src, dest)
         src.unlink(missing_ok=True)
