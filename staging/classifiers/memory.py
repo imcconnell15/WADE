@@ -54,10 +54,13 @@ class MemoryClassifier:
     def classify(self, path: Path) -> ClassificationResult:
         """Classify memory dump and detect OS profile."""
         # Detect specific types
-        head = path.read_bytes()[:512] if path.exists() else b""
+        try:
+            head = path.read_bytes()[:512]
+        except OSError:
+            head = b""
         
         # Hibernation file
-        if head.startswith(b"hibr") or head.startswith(b"HIBR"):
+        if head.startswith((b"hibr", b"HIBR")):
             return self._classify_hibernation(path)
         
         # LIME dump
