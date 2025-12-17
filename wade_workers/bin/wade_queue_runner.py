@@ -10,7 +10,7 @@ WORKER_MAP = {
     "dissect": ("wade_workers.dissect_worker", "DissectWorker"),
     "plaso": ("wade_workers.plaso_worker", "PlasoWorker"),
     "hayabusa": ("wade_workers.hayabusa_worker", "HayabusaWorker"),
-    "bulk_extractor": ("wade_workers.bulkextractor_worker", "bulkextractor"),
+    "bulk_extractor": ("wade_workers.bulkextractor_worker", "BulkExtractorWorker"),
     "yara": ("wade_workers.yara_worker", "YaraWorker"),
     # Optional/placeholder workers:
     "autopsy": ("wade_workers.autopsy_manifest", "AutopsyManifestWorker"),
