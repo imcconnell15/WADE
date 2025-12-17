@@ -105,8 +105,9 @@ class MemoryClassifier:
                     classification="unknown",
                     confidence=0.0,
                 )
-        except Exception:
-            pass
+        except (OSError, MemoryError) as e:
+            # Log but continue - entropy check is optional
+            pass  # Could add logging here if logger available
         
         # Try volatility imageinfo (expensive, so only if looks promising)
         profile, os_family = self._detect_profile_volatility(path)
