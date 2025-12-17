@@ -145,9 +145,6 @@ def match_host_from_filename(datasources: Path, p: Path) -> Optional[str]:
     # Check if filename contains a known hostname
     filename_lower = p.stem.lower()
     for hostname in hostnames:
-     # Check if filename contains a known hostname
-     filename_lower = p.stem.lower()
-     for hostname in hostnames:
         pattern = re.compile(r'\b' + re.escape(hostname.lower()) + r'\b')
         if pattern.search(filename_lower):
             return hostname
