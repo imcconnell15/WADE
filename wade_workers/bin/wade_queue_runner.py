@@ -26,7 +26,7 @@ def _load_worker(module_name: str, class_name: str) -> type | None:
      try:
          mod = importlib.import_module(module_name)
          return getattr(mod, class_name)
-    except Exception as e:
+     except Exception as e:
         _logger.debug("Failed to load %s.%s: %s", module_name, class_name, e)
          return None
 
