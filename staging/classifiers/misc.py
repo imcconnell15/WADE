@@ -127,7 +127,11 @@ class MalwareClassifier:
     def classify(self, path: Path) -> ClassificationResult:
         """Classify as malware sample."""
         # Check if it's a Windows executable
-        is_pe = path.read_bytes()[:2] == b"MZ" if path.exists() else False
+        is_pe = False
+        try:
+            is_pe = path.read_bytes()[:2] == b"MZ"
+        except OSError:
+            pass
         
         details = {}
         if is_pe:
