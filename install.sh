@@ -1595,7 +1595,7 @@ ExecStartPre=/bin/sh -lc 'set -eu; owner="${WADE_OWNER_USER:-autopsy}"; \
   chown -R "$owner:$owner" "/home/$owner/Staging" "/home/$owner/DataSources" /var/wade'
 
 WorkingDirectory=/opt/wade
-ExecStart=/usr/bin/python3 /opt/wade/staging/stage_daemon.py
+ExecStart=${VENV_DIR}/bin/python /opt/wade/staging/stage_daemon.py
 
 # Restart policy
 Restart=on-failure
