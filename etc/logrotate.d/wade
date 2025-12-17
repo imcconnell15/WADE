@@ -5,9 +5,6 @@
     delaycompress
     notifempty
     missingok
-    create 0640 autopsy autopsy
-    sharedscripts
-    postrotate
-        systemctl reload wade-staging >/dev/null 2>&1 || true
-    endscript
+    copytruncate
+    # No create directive needed with copytruncate
 }
