@@ -215,7 +215,11 @@ def main():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
-                env[key.strip()] = value.strip()
+                key = key.strip()
+                if key:
+                    env[key] = value.strip()
+                else:
+                    logger.warning(f"Skipping malformed env line: {line}")
     
     # Import worker class
     worker_map = {
