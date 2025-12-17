@@ -5,7 +5,7 @@ Detects virtual machine disk formats (QCOW, VHDX, VMDK, VDI, OVA).
 """
 import tarfile
 from pathlib import Path
-
+from typing import Optional
 from .base import ClassificationResult, Classifier
 from ..config import MAGIC_DB
 
@@ -82,8 +82,8 @@ class VMClassifier:
                 match = re.search(r'displayName\s*=\s*"([^"]+)"', text)
                 if match:
                     hostname = match.group(1)
-        except Exception:
-            pass
+        except (OSError, UnicodeDecodeError):
+            pass  # Binary VMDK or inaccessible file
         
         details = {"format": "vmdk", "hypervisor": "vmware"}
         if hostname:
@@ -147,7 +147,7 @@ class VMClassifier:
             details=details,
         )
     
-    def _parse_ovf_hostname(self, ovf_content: bytes) -> str:
+    def _parse_ovf_hostname(self, ovf_content: bytes) -> Optional[str]:
         """Extract hostname from OVF XML."""
         import re
         text = ovf_content.decode("utf-8", errors="ignore")
