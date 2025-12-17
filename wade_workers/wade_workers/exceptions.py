@@ -253,10 +253,10 @@ def get_exit_code(exc: BaseException) -> int:
         return 1  # last-resort fallback
 
     # Some ExitCode members may not exist yet; getattr() keeps this resilient.
-    timeout_code = getattr(ExitCode, "TIMEOUT", ExitCode.GENERAL_ERROR)
-    tool_exec_code = getattr(ExitCode, "TOOL_ERROR", ExitCode.GENERAL_ERROR)
+    timeout_code = getattr(ExitCode, "TOOL_TIMEOUT", ExitCode.GENERAL_ERROR)
+    tool_exec_code = getattr(ExitCode, "TOOL_EXECUTION_ERROR", ExitCode.GENERAL_ERROR)
     parse_code = getattr(ExitCode, "PARSE_ERROR", ExitCode.GENERAL_ERROR)
-    file_code = getattr(ExitCode, "FILE_ERROR", ExitCode.GENERAL_ERROR)
+    file_code = getattr(ExitCode, "FILE_ACCESS_ERROR", ExitCode.GENERAL_ERROR)
     worker_code = getattr(ExitCode, "WORKER_ERROR", ExitCode.GENERAL_ERROR)
 
     if isinstance(exc, ToolNotFoundError):
@@ -278,4 +278,4 @@ def get_exit_code(exc: BaseException) -> int:
     if isinstance(exc, WadeException):
         return int(ExitCode.GENERAL_ERROR)
 
-    return int(getattr(ExitCode, "GENERAL_ERROR", 1))
+    return int(ExitCode.INVALID_TICKET)
