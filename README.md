@@ -1,4 +1,3 @@
-```text-md
 # WADE --- Wide-Area Data Extraction
 
 *A modular DFIR automation framework for staging, routing, and processing forensic artifacts at scale---built for austere ops, friendly to Splunk, and designed for real-world incident response.*
@@ -50,7 +49,6 @@ graph TB
     I5 --> J
     I6 --> J
     J --> K[Splunk]
-```
 
 ### Core Components
 
