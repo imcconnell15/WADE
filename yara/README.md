@@ -1,7 +1,3 @@
-```
-## 📄 yara/README.md
-
-```markdown
 # WADE YARA Rules
 
 This directory contains YARA rules for malware detection and IOC scanning within the WADE framework.
