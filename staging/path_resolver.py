@@ -16,7 +16,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 from .config import DATADIR
 
