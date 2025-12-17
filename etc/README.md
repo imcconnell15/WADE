@@ -1,4 +1,3 @@
-```
 # WADE Configuration Directory
 
 This directory contains all configuration files for the WADE framework. Configuration follows a layered approach: defaults → YAML → environment variables.
