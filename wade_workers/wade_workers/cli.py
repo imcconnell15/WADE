@@ -121,7 +121,7 @@ def run_worker(
                 ticket_path=str(ticket_path),
                 error=str(e),
             )
-            return ExitCode.VALIDATION_ERROR
+            return ExitCode.INVALID_TICKET
         
         # Check result
         if result.errors:
