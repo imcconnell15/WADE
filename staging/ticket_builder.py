@@ -1,4 +1,6 @@
 # staging/ticket_builder.py (additions/changes)
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Optional, List
 from wade_workers.ticket_schema import WorkerTicket, TicketMetadata
 from wade_workers.hashing import quick_hash
