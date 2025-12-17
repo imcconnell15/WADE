@@ -179,7 +179,6 @@ class StagingDaemon:
             classification=classification,
             confidence=result.confidence,
             profile=profile,
-            profile=profile,
             location=location,
             details=details,
         )
