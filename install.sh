@@ -1547,6 +1547,21 @@ import yaml  # PyYAML
 print("WADE staging venv OK:", sys.executable, "inotify=", ok_inotify)
 PY
 
+   # Smoke test essential imports
+   "'"$VENV_DIR"'/bin/python" - <<'"'"'PY'"'"'
+import json, os, sys
+from datetime import datetime, timezone
+from pathlib import Path
+try:
+    import inotify.adapters  # provided by "inotify" package
+    ok_inotify = True
+except Exception as e:
+    ok_inotify = False
+    print("[WARN] inotify not available in venv:", e)
+import yaml  # PyYAML
+print("WADE staging venv OK:", sys.executable, "inotify=", ok_inotify)
+PY
+
   install -d -m 0755 /var/wade/logs/stage /var/wade/state
   chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /var/wade
 
