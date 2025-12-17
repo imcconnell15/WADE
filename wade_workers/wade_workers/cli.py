@@ -174,7 +174,7 @@ def run_worker(
             error_type=e.__class__.__name__,
             error=str(e),
         )
-        return ExitCode.UNKNOWN_ERROR
+        return ExitCode.GENERAL_ERROR
 
 
 def main():
