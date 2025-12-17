@@ -179,7 +179,9 @@ class StagingDaemon:
             classification=classification,
             confidence=result.confidence,
             profile=profile,
-            **details,
+            profile=profile,
+            location=location,
+            details=details,
         )
         
         logger.info(f"Successfully processed: {file_path} → {dest_path}")
@@ -277,7 +279,7 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="WADE Staging Daemon")
     parser.add_argument(
         "--scan-once",
@@ -303,9 +305,13 @@ def main():
     else:
         try:
             daemon.watch_continuous()
+            return 0
         except KeyboardInterrupt:
             logger.info("Shutting down...")
             return 0
+        except Exception as e:
+            logger.exception(f"Daemon crashed: {e}")
+            return 1
 
 
 if __name__ == "__main__":
