@@ -251,9 +251,9 @@ persist_prompt_answers() {
     set_shell_kv "$envf" "WADE_ALLOW_NETS" "$ALLOW_NETS_CSV"
 
     if [[ "${WHIFF_ENABLE_EFF:-0}" == "1" && "${PATCH_WADE_ENV:-1}" == "1" ]]; then
-      set_shell_kv "$envf" "WHIFF_BIND_ADDR" "${WHIFF_BIND}"
-      set_shell_kv "$envf" "WHIFF_PORT"      "${WHIFF_PORT}"
-      set_shell_kv "$envf" "WHIFF_URL"       "http://${WHIFF_BIND}:${WHIFF_PORT}/annotate"
+      set_shell_kv "$envf" "WHIFF_BIND_ADDR" "${WHIFF_BIND:-127.0.0.1}"
+      set_shell_kv "$envf" "WHIFF_PORT"      "${WHIFF_PORT:-8088}"
+      set_shell_kv "$envf" "WHIFF_URL"       "http://${WHIFF_BIND:-127.0.0.1}:${WHIFF_PORT:-8088}/annotate"
     fi
   fi
 
