@@ -22,7 +22,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 from .ticket_schema import WorkerTicket
 
 class EventLogger:
@@ -42,7 +42,7 @@ class EventLogger:
     """
     
     # Core schema fields present in every event
-    CORE_FIELDS = {
+    CORE_FIELDS: ClassVar[set[str]] = {
         "timestamp_utc",
         "event_type",
         "source",
@@ -119,7 +119,7 @@ class EventLogger:
                 json.dump(event, f, ensure_ascii=False, default=str)
                 f.write("\n")
         except Exception as e:
-            self._logger.error(f"Failed to write event to {log_path}: {e}")
+            self._logger.exception("Failed to write event to %s", log_path)
             # Don't raise - logging errors shouldn't crash the application
         
         return log_path
