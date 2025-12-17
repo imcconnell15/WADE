@@ -709,14 +709,14 @@ mkdir -p "${WADE_ETC}/"{conf.d,modules,json_injection.d} \
 
 # Preseed wade.conf from repo if present
 if [[ -f "${ETC_SRC_DIR}/wade.conf" && ! -f "${WADE_ETC}/wade.conf" ]]; then
-  echo "[*] Using preseeded wade.conf from ${SCRIPT_DIR}"
-  install -m 0644 "${SCRIPT_DIR}/wade.conf" "${WADE_ETC}/wade.conf"
+  echo "[*] Using preseeded wade.conf from ${ETC_SRC_DIR}"
+  install -m 0644 "${ETC_SRC_DIR}/wade.conf" "${WADE_ETC}/wade.conf"
 fi
 
 # Preseed wade.env from repo if present
 if [[ -f "${ETC_SRC_DIR}/wade.env" && ! -f "${WADE_ETC}/wade.env" ]]; then
-  echo "[*] Using preseeded wade.env from ${SCRIPT_DIR}"
-  install -m 0600 "${SCRIPT_DIR}/wade.env" "${WADE_ETC}/wade.env"
+  echo "[*] Using preseeded wade.env from ${ETC_SRC_DIR}"
+  install -m 0600 "${ETC_SRC_DIR}/wade.env" "${WADE_ETC}/wade.env"
 fi
 
 # Preseed config.yaml from repo if present
