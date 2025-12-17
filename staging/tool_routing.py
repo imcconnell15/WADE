@@ -157,12 +157,12 @@ class ToolRouting:
         disabled_env = set(_parse_list(self.env.get("WADE_DISABLE_TOOLS", "")))
         enabled_env = set(_parse_list(self.env.get("WADE_ENABLE_TOOLS", "")))  # allow opt-in even if disabled
 
+        # Apply disables (YAML + env), then re-add any WADE_ENABLE_TOOLS explicitly
+        tools = [t for t in tools if t not in disabled_yaml and t not in disabled_env] + [t for t in enabled_env if t not in tools]
+
         # Platform sanity: remove hayabusa if not windows
         if os_family and "windows" not in os_family:
             tools = [t for t in tools if t != "hayabusa"]
-
-        # Apply disables (YAML + env), then re-add any WADE_ENABLE_TOOLS explicitly
-        tools = [t for t in tools if t not in disabled_yaml and t not in disabled_env] + [t for t in enabled_env if t not in tools]
 
         # Remove duplicates, preserve order
         uniq = []
