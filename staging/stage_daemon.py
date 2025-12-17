@@ -123,18 +123,6 @@ class StagingDaemon:
         
         # Detect profile (full/light) and location
         profile, location = detect_profile(file_path, STAGING_ROOT)
-
-        ticket = build_staging_ticket(
-            dest_path=dest_path,
-            classification=classification,
-            hostname=details.get("hostname"),
-            os_family=details.get("os_family"),
-            source_file=file_path.name,
-            priority=5,
-            profile=profile,
-            location=location,
-            details=details,
-        )
         
         # Enrich details with host matching
         if "hostname" not in details:
