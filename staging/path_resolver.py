@@ -14,7 +14,7 @@ Directory structure:
 """
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 
@@ -32,9 +32,9 @@ def ymd_from_mtime(p: Path) -> str:
     """
     try:
         mtime = p.stat().st_mtime
-        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d")
     except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
+        return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 def _sanitize(s: str) -> str:
