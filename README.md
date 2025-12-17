@@ -95,6 +95,137 @@ The installer will:
 -   Configure logrotate policies
 -   Create directory structure under `/home/autopsy/`
 
+🔧 Additional DFIR Tools
+------------------------
+
+WADE includes optional analysis tools that can be enabled/disabled during installation:
+
+### Piranha --- APT Analysis & Threat Intelligence
+
+Description: GUI-based threat intelligence and APT (Advanced Persistent Threat) analysis tool with MITRE ATT&CK mapping capabilities.
+
+Key Features:
+
+-   Interactive GUI for APT campaign analysis
+-   MITRE ATT&CK technique mapping
+-   CVE to CAPEC correlation
+-   Keyword-based IOC mapping
+-   Automated APT reporting
+
+Installation:
+
+```source-shell
+# Enabled by default in install.sh
+MOD_PIRANHA_ENABLED="1"
+
+# Or disable if not needed
+MOD_PIRANHA_ENABLED="0" bash install.sh
+```
+
+Usage:
+
+```source-shell
+# Launch via X11 forwarding (GUI)
+ssh -X autopsy@wade-host
+piranha
+
+# Logs stored at
+/var/log/wade/piranha/APT_Report.log
+```
+
+Repository: [williamjsmail/piranha](https://github.com/williamjsmail/piranha)
+
+Installation Path: `/opt/piranha/`
+
+* * * * *
+
+### Barracuda --- Web-Based DFIR Helper
+
+Description: Flask-based web application providing interactive DFIR analysis with MITRE ATT&CK integration and data enrichment capabilities.
+
+Key Features:
+
+-   Web-based interface (no X11 required)
+-   MITRE ATT&CK Enterprise framework integration
+-   Data upload and analysis workflows
+-   Pandas/NumPy-powered data manipulation
+-   RESTful API for automation
+
+Installation:
+
+```source-shell
+# Enabled by default in install.sh
+MOD_BARRACUDA_ENABLED="1"
+
+# Or disable if not needed
+MOD_BARRACUDA_ENABLED="0" bash install.sh
+```
+
+Usage:
+
+```source-shell
+# Start service
+sudo systemctl start barracuda.service
+sudo systemctl enable barracuda.service
+
+# Access web interface
+http://<wade-host>:5000
+
+# Check status
+sudo systemctl status barracuda.service
+
+# View logs
+sudo journalctl -u barracuda -f
+```
+
+Repository: [williamjsmail/Barracuda](https://github.com/williamjsmail/Barracuda)
+
+Installation Path: `/opt/barracuda/`
+
+Configuration:
+
+```source-shell
+# Port configuration
+BARRACUDA_PORT=5000  # Default, set in /etc/wade/wade.env
+
+# MITRE data location
+/opt/barracuda/enterprise-attack.json
+```
+
+* * * * *
+
+### Installation Toggles
+
+Both tools can be controlled via environment variables before running `install.sh`:
+
+```source-shell
+# Install with both tools
+sudo -E bash ./install.sh
+
+# Install without Piranha
+MOD_PIRANHA_ENABLED="0" sudo -E bash ./install.sh
+
+# Install without Barracuda
+MOD_BARRACUDA_ENABLED="0" sudo -E bash ./install.sh
+
+# Install without both (minimal WADE)
+MOD_PIRANHA_ENABLED="0" MOD_BARRACUDA_ENABLED="0" sudo -E bash ./install.sh
+```
+
+System Requirements:
+
+-   Piranha: Requires X11 libraries for GUI (installed automatically)
+-   Barracuda: Headless-compatible, runs as web service
+-   Both: Python 3.8+, Qt5 libraries (on apt-based systems)
+
+Offline Installation:\
+Both tools support offline installation. Place archived repositories in:
+
+```
+${WADE_PKG_DIR}/piranha/piranha*.tar.gz
+${WADE_PKG_DIR}/barracuda/barracuda*.tar.gz
+```
+
 * * * * *
 
 📂 Repository Structure
