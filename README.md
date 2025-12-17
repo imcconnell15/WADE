@@ -53,11 +53,11 @@ graph TB
 
 ### Core Components
 
-1.  [Staging Daemon](https://github.com/imcconnell15/WADE/pull/staging/) --- File classification, metadata extraction, ticket generation
-2.  [Worker Framework](https://github.com/imcconnell15/WADE/pull/wade_workers/) --- Tool execution engine with unified ticket schema
-3.  [Configuration System](https://github.com/imcconnell15/WADE/pull/etc/) --- Centralized YAML and environment-based config
-4.  [Splunk Integration](https://github.com/imcconnell15/WADE/pull/splunkapp/) --- Index definitions, props/transforms, dashboards
-5.  [YARA Rules](https://github.com/imcconnell15/WADE/pull/yara/) --- Malware detection and IOC scanning
+1.  [Staging Daemon](staging/) --- File classification, metadata extraction, ticket generation
+2.  [Worker Framework](wade_workers/) --- Tool execution engine with unified ticket schema
+3.  [Configuration System](etc/) --- Centralized YAML and environment-based config
+4.  [Splunk Integration](splunkapp/) --- Index definitions, props/transforms, dashboards
+5.  [YARA Rules](yara/) --- Malware detection and IOC scanning
 
 * * * * *
 
