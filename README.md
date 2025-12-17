@@ -1,6 +1,6 @@
-# WADE --- Wide-Area Data Extraction
+# WADE — Wide-Area Data Extraction
 
-*A modular DFIR automation framework for staging, routing, and processing forensic artifacts at scale---built for austere ops, friendly to Splunk, and designed for real-world incident response.*
+*A modular DFIR automation framework for staging, routing, and processing forensic artifacts at scale—built for austere ops, friendly to Splunk, and designed for real-world incident response.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -16,12 +16,12 @@ WADE is a comprehensive forensic artifact processing pipeline that automatically
 
 ### Key Features
 
-✅ **Idempotent & Auditable** --- Deterministic installs, per-file JSON event logs, SQLite-backed deduplication
-✅ **Modular Architecture** --- Independent classifiers, workers, and routing engine
-✅ **Configuration-Driven** --- YAML + environment variables for flexible tool selection
-✅ **Online or Offline** --- Works with pinned packages; air-gapped operation ready
-✅ **Ops-Friendly** --- systemd units, logrotate policies, comprehensive logging
-✅ **Splunk-Native** --- Direct integration with Splunk forwarders and indexes
+✅ **Idempotent & Auditable** — Deterministic installs, per-file JSON event logs, SQLite-backed deduplication  
+✅ **Modular Architecture** — Independent classifiers, workers, and routing engine  
+✅ **Configuration-Driven** — YAML + environment variables for flexible tool selection  
+✅ **Online or Offline** — Works with pinned packages; air-gapped operation ready  
+✅ **Ops-Friendly** — systemd units, logrotate policies, comprehensive logging  
+✅ **Splunk-Native** — Direct integration with Splunk forwarders and indexes
 
 ---
 
