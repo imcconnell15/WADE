@@ -24,9 +24,9 @@ class ClassifierRegistry:
         self.classifiers: List[Classifier] = []
         self._register_defaults()
     
-    def _register_defaults(self) -> None:
-        """Register default classifiers in priority order."""
-        self.classifiers = [
+     def _register_defaults(self) -> None:
+         """Register default classifiers in priority order."""
+        self.classifiers = sorted([
             E01Classifier(),
             MemoryClassifier(),
             VMClassifier(),
@@ -34,11 +34,8 @@ class ClassifierRegistry:
             NetworkConfigClassifier(),
             MalwareClassifier(),
             NetworkDocumentClassifier(),
-            MiscClassifier(),  # Fallback (always last)
-        ]
-        
-        # Sort by priority
-        self.classifiers.sort(key=lambda c: c.priority)
+            MiscClassifier(),  # Fallback (should have lowest priority)
+        ], key=lambda c: c.priority)
     
     def register(self, classifier: Classifier) -> None:
         """Register a custom classifier.
