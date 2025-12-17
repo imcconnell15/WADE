@@ -118,7 +118,7 @@ class MalwareClassifier:
         
         # Check for malware indicators in filename
         indicators = [
-            "malware", "suspicious", "sample", "dropper",
+            "malware", "suspicious", "dropper",
             "ransomware", "trojan", "virus", "infected",
         ]
         
