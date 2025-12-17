@@ -60,6 +60,10 @@ def path_signature(p: Path) -> str:
     
     Returns:
         Signature string
+
+        
+    Raises:
+        OSError: If file is inaccessible
     """
     stat = p.stat()
     return f"{p.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
