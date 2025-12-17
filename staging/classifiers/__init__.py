@@ -24,8 +24,8 @@ class ClassifierRegistry:
         self.classifiers: List[Classifier] = []
         self._register_defaults()
     
-     def _register_defaults(self) -> None:
-         """Register default classifiers in priority order."""
+    def _register_defaults(self) -> None:
+        """Register default classifiers in priority order."""
         self.classifiers = sorted([
             E01Classifier(),
             MemoryClassifier(),
