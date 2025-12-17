@@ -933,7 +933,7 @@ if [[ ! -f "${WADE_ETC}/json_injection.d/00-universal.jq" ]]; then
 # Add WADE metadata to each JSON object
 . as $o
 | $o
-| .wade |= ( .wade // {WADE_ETC} )
+| .wade |= ( .wade // {} )
 | .wade.hostname = (env.WADE_HOSTNAME // env.HOSTNAME)
 | .wade.module = (env.MODULE // null)
 | .wade.pipeline = (env.PIPELINE // null)
