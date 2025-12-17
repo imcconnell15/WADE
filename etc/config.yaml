@@ -3,25 +3,24 @@
 # Or set WADE_CONFIG_PATH environment variable
 
 # --- Routing (tool assignment) ---
-routing:
-  defaults:
-    e01:
-      full:  [dissect, hayabusa, autopsy, bulk_extractor]
+   defaults:
+     e01:
+      full: [dissect, hayabusa, autopsy, bulk_extractor]
       light: [dissect, hayabusa]
-    disk_raw:
-      full:  [dissect, hayabusa, autopsy, bulk_extractor]
+     disk_raw:
+      full: [dissect, hayabusa, autopsy, bulk_extractor]
       light: [dissect]
-    memory:
-      full:  [volatility, yara_mem]
+     memory:
+      full: [volatility, yara_mem]
       light: [volatility]
-    vm_disk:
-      full:  [dissect]
-    vm_package:
-      full:  [dissect]
-    network_config:
-      full:  [netcfg]
-    network_doc:
-      full:  [netdoc]
+     vm_disk:
+      full: [dissect]
+     vm_package:
+      full: [dissect]
+     network_config:
+      full: [netcfg]
+     network_doc:
+      full: [netdoc]
 
   # Optional: globally disable noisy/heavy tools
   disabled_tools:
@@ -82,7 +81,7 @@ volatility:
   
   # Modules to explicitly disable (even if in default list)
   disabled_modules:
-    # - windows.malfind  # Uncomment to disable
+  # - windows.malfind  # Uncomment to disable
   
   # Module-specific parameters (future enhancement)
   module_params:
