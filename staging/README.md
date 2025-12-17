@@ -1,3 +1,4 @@
+```text-md
 # WADE Staging Daemon
 
 The **Staging Daemon** is the entry point for all evidence files entering the WADE pipeline. It provides intelligent classification, metadata extraction, deduplication, and ticket generation for downstream worker processing.
@@ -43,7 +44,12 @@ graph TB
     P --> Q[Enqueue Ticket]
 ```
 
+* * * * *
+
 📂 Module Structure
+-------------------
+
+```
 staging/
 ├── classifiers/              # Classification engine
 │   ├── __init__.py          # Registry and orchestration
@@ -62,20 +68,32 @@ staging/
 ├── ticket_builder.py        # Ticket generation
 ├── tool_routing.py          # Tool selection engine
 └── wade-staging.service     # systemd unit file
+
+```
+
+* * * * *
+
 🔍 Classification System
-Priority-Based Registry
+------------------------
+
+### Priority-Based Registry
+
 Classifiers are executed in priority order (lowest number = highest priority). The first classifier that returns a successful result wins.
 
-Priority	Classifier	Detects	Magic Bytes / Indicators
-10	E01Classifier	EnCase EWF images	EVF\x09\r\n\x81 or .E01/.Ex01
-15	DiskClassifier	Raw disk images	GPT signature, MBR boot sig, NTFS/FAT32 headers
-20	MemoryClassifier	Memory dumps	Hibernation, LiME, entropy checks
-25	VMClassifier	VM disk formats	QCOW2, VMDK, VHD, VHDX, VDI, OVA, OVF
-40	NetworkConfigClassifier	Device configs	Text files with Cisco/Juniper/PAN syntax
-45	MalwareClassifier	Malware samples	PE header + suspicious filenames
-50	NetworkDocumentClassifier	Network diagrams	.vsdx, .drawio, topology keywords
-100	MiscClassifier	Everything else	Fallback for text/binary/documents
-Classifier Interface
+| Priority | Classifier | Detects | Magic Bytes / Indicators |
+| --- | --- | --- | --- |
+| 10 | E01Classifier | EnCase EWF images | `EVF\x09\r\n\x81` or `.E01/.Ex01` |
+| 15 | DiskClassifier | Raw disk images | GPT signature, MBR boot sig, NTFS/FAT32 headers |
+| 20 | MemoryClassifier | Memory dumps | Hibernation, LiME, entropy checks |
+| 25 | VMClassifier | VM disk formats | QCOW2, VMDK, VHD, VHDX, VDI, OVA, OVF |
+| 40 | NetworkConfigClassifier | Device configs | Text files with Cisco/Juniper/PAN syntax |
+| 45 | MalwareClassifier | Malware samples | PE header + suspicious filenames |
+| 50 | NetworkDocumentClassifier | Network diagrams | `.vsdx`, `.drawio`, topology keywords |
+| 100 | MiscClassifier | Everything else | Fallback for text/binary/documents |
+
+### Classifier Interface
+
+```source-python
 from pathlib import Path
 from typing import Protocol
 
@@ -100,7 +118,11 @@ class Classifier(Protocol):
     def classify(self, path: Path) -> ClassificationResult:
         """Full classification with metadata extraction."""
         ...
-Example: E01Classifier
+```
+
+### Example: E01Classifier
+
+```source-python
 class E01Classifier:
     priority = 10  # Highest priority
 
@@ -116,7 +138,7 @@ class E01Classifier:
         # Check if part of a fragment set
         if self._is_fragment(path):
             return self._handle_fragment(path)
-        
+
         # Run ewfinfo to extract metadata
         ewfinfo_path = self._find_ewfinfo()
         if not ewfinfo_path:
@@ -126,16 +148,16 @@ class E01Classifier:
                 details={"note": "ewfinfo not available"},
                 error=None
             )
-        
+
         result = subprocess.run(
             [ewfinfo_path, str(path)],
             capture_output=True,
             text=True,
             timeout=30
         )
-        
+
         metadata = self._parse_ewfinfo(result.stdout)
-        
+
         return ClassificationResult(
             classification="e01",
             confidence=0.95,
@@ -147,32 +169,45 @@ class E01Classifier:
                 "bytes_per_sector": metadata.get("bytes_per_sector"),
             }
         )
-Metadata Extraction Examples
-E01Classifier extracts via ewfinfo:
+```
 
-Computer name / hostname
-OS information
-Acquisition date/time
-Drive geometry (sectors, bytes per sector)
-Examiner notes
-MemoryClassifier extracts via Volatility:
+### Metadata Extraction Examples
 
-Suggested profile (e.g., Win10x64_19041)
-OS family (Windows/Linux)
-Hibernation file detection
-LiME dump detection
-DiskClassifier extracts via heuristics + target-info:
+E01Classifier extracts via `ewfinfo`:
 
-Partition type (GPT/MBR)
-Filesystem (NTFS, FAT32, ext2/3/4)
-Hostname (from filesystem metadata)
-VMClassifier extracts from descriptors:
+-   Computer name / hostname
+-   OS information
+-   Acquisition date/time
+-   Drive geometry (sectors, bytes per sector)
+-   Examiner notes
 
-Hypervisor type (VMware, VirtualBox, Hyper-V, QEMU/KVM)
-VM format (VMDK, VDI, VHDX, QCOW2)
-Hostname from VMDK descriptor or OVF manifest
+MemoryClassifier extracts via Volatility:
+
+-   Suggested profile (e.g., `Win10x64_19041`)
+-   OS family (Windows/Linux)
+-   Hibernation file detection
+-   LiME dump detection
+
+DiskClassifier extracts via heuristics + `target-info`:
+
+-   Partition type (GPT/MBR)
+-   Filesystem (NTFS, FAT32, ext2/3/4)
+-   Hostname (from filesystem metadata)
+
+VMClassifier extracts from descriptors:
+
+-   Hypervisor type (VMware, VirtualBox, Hyper-V, QEMU/KVM)
+-   VM format (VMDK, VDI, VHDX, QCOW2)
+-   Hostname from VMDK descriptor or OVF manifest
+
+* * * * *
+
 🎫 Ticket Generation
-Ticket Builder Flow
+--------------------
+
+### Ticket Builder Flow
+
+```source-python
 from staging.ticket_builder import build_staging_ticket
 
 ticket = build_staging_ticket(
@@ -190,7 +225,11 @@ ticket = build_staging_ticket(
     location="datacenterA",
     details=classification_result.details
 )
-Ticket Schema (v2.0)
+```
+
+### Ticket Schema (v2.0)
+
+```source-json
 {
   "schema_version": "2.0",
   "metadata": {
@@ -229,25 +268,39 @@ Ticket Schema (v2.0)
     ]
   }
 }
-🛤️ Tool Routing
-Routing Engine
-The ToolRouting class selects which tools to run based on:
+```
 
-Classification (e.g., e01, memory, disk_raw)
-Profile (full vs light)
-OS family (Windows, Linux, macOS)
-Location (site-specific overrides)
-Environment variables
+* * * * *
+
+🛤️ Tool Routing
+----------------
+
+### Routing Engine
+
+The ToolRouting class selects which tools to run based on:
+
+1.  Classification (e.g., `e01`, `memory`, `disk_raw`)
+2.  Profile (`full` vs `light`)
+3.  OS family (Windows, Linux, macOS)
+4.  Location (site-specific overrides)
+5.  Environment variables
+
 Priority (highest to lowest):
 
-1. DEFAULT_MATRIX (code defaults)
+```
+1\. DEFAULT_MATRIX (code defaults)
 2. config.yaml routing.defaults
 3. config.yaml os_overrides
 4. config.yaml location_overrides
 5. Environment variable (WADE_ROUTE_<CLASS>_<PROFILE>)
 6. Global disable/enable (WADE_DISABLE_TOOLS / WADE_ENABLE_TOOLS)
 7. Platform sanitization (remove hayabusa on non-Windows)
-Example Routing
+
+```
+
+### Example Routing
+
+```source-python
 from staging.tool_routing import ToolRouting
 
 router = ToolRouting()
@@ -268,9 +321,13 @@ tools = router.select_tools(
     details={"os_family": "Linux"}
 )
 # Returns: ["volatility"]  (hayabusa removed for Linux)
-Configuration Examples
+```
+
+### Configuration Examples
+
 YAML (etc/config.yaml):
 
+```source-yaml
 routing:
   defaults:
     e01:
@@ -295,8 +352,11 @@ routing:
     remote_site_B:
       remove:
         e01.full: [plaso]  # Skip heavy processing at remote site
+```
+
 Environment Variable:
 
+```source-shell
 # Override E01 full routing
 WADE_ROUTE_E01_FULL=dissect,hayabusa,+yara,-plaso
 
@@ -305,19 +365,30 @@ WADE_DISABLE_TOOLS=autopsy,bulk_extractor
 
 # Global enable (overrides disabled)
 WADE_ENABLE_TOOLS=yara_mem
+```
+
+* * * * *
+
 💾 Deduplication System
-Two-Tier Strategy
-1. Path Signature:
+-----------------------
 
-Combines: {resolved_path}_{file_size}_{mtime}
-Purpose: Skip unchanged files at original location
-Fast check before classification
-2. Content Signature:
+### Two-Tier Strategy
 
-SHA256 of head (4MB) + tail (4MB)
-Purpose: Detect renamed/moved files with identical content
-Computed during classification
-Database Schema
+1\. Path Signature:
+
+-   Combines: `{resolved_path}_{file_size}_{mtime}`
+-   Purpose: Skip unchanged files at original location
+-   Fast check before classification
+
+2\. Content Signature:
+
+-   SHA256 of head (4MB) + tail (4MB)
+-   Purpose: Detect renamed/moved files with identical content
+-   Computed during classification
+
+### Database Schema
+
+```source-sql
 CREATE TABLE processed (
     sig TEXT PRIMARY KEY,           -- Path signature
     src_path TEXT NOT NULL,
@@ -332,7 +403,11 @@ CREATE TABLE processed (
 );
 
 CREATE INDEX idx_content_sig ON processed(content_sig);
-Usage
+```
+
+### Usage
+
+```source-python
 from staging.db import init_db, path_signature, already_processed, record_processed
 
 conn = init_db()
@@ -363,14 +438,26 @@ record_processed(
     profile="full",
     content_sig=content_sig
 )
+```
+
+* * * * *
+
 🗂️ Path Resolution
-Destination Structure
+-------------------
+
+### Destination Structure
+
+```
 DataSources/
 └── <sourcetype>/              # e.g., "e01", "memory", "disk"
     └── <hostname>/            # Sanitized hostname
         └── <original_filename>
+
+```
+
 Sourcetype Mapping:
 
+```source-python
 CLASSIFICATION_TO_SOURCETYPE = {
     "e01": "e01",
     "disk_raw": "disk",
@@ -382,26 +469,38 @@ CLASSIFICATION_TO_SOURCETYPE = {
     "malware": "malware",
     "misc": "misc"
 }
-Example Paths
-Input: /home/autopsy/Staging/full/DESKTOP-ABC123_20251215.E01
-Output: /home/autopsy/DataSources/e01/DESKTOP-ABC123/DESKTOP-ABC123_20251215.E01
+```
 
-Input: /home/autopsy/Staging/light/memory_dump.raw
-Output: /home/autopsy/DataSources/memory/SERVER-XYZ/memory_dump.raw
+### Example Paths
 
-Collision Handling:
-If destination exists, append counter: file.E01, file_1.E01, file_2.E01, etc.
+Input: `/home/autopsy/Staging/full/DESKTOP-ABC123_20251215.E01`\
+Output: `/home/autopsy/DataSources/e01/DESKTOP-ABC123/DESKTOP-ABC123_20251215.E01`
+
+Input: `/home/autopsy/Staging/light/memory_dump.raw`\
+Output: `/home/autopsy/DataSources/memory/SERVER-XYZ/memory_dump.raw`
+
+Collision Handling:\
+If destination exists, append counter: `file.E01`, `file_1.E01`, `file_2.E01`, etc.
+
+* * * * *
 
 🎛️ Configuration
-Environment Variables
+-----------------
+
+### Environment Variables
+
 Core Settings:
 
+```source-shell
 WADE_STAGINGDIR=/home/autopsy/Staging
 WADE_DATADIR=/home/autopsy/DataSources
 WADE_QUEUE_DIR=/home/autopsy/DataSources/_queue
 WADE_LOG_DIR=/var/wade/logs
+```
+
 Behavior:
 
+```source-shell
 WADE_STAGE_STABLE_SECONDS=10       # Wait for file stability
 WADE_STAGE_POLL_INTERVAL=30        # Directory scan interval
 WADE_STAGE_REQUIRE_CLOSE_WRITE=true   # Wait for inotify CLOSE_WRITE
@@ -409,20 +508,37 @@ WADE_STAGE_VERIFY_NO_WRITERS=true     # Check lsof for open writers
 WADE_STAGE_RECURSIVE=false            # Don't recurse subdirectories
 WADE_STAGE_ACCEPT_DOCS=false          # Reject Office docs by default
 WADE_STAGE_AUTO_DEFRAG_E01=false      # Don't auto-reassemble fragments
+```
+
 Tool Paths:
 
+```source-shell
 WADE_EWFINFO_PATH=/usr/bin/ewfinfo
 WADE_EWFEXPORT_PATH=/usr/bin/ewfexport
 WADE_VOLATILITY_PATH=/opt/volatility3/vol.py
 WADE_LSOF_PATH=/usr/bin/lsof
+```
+
 Database:
 
+```source-shell
 WADE_STAGE_DB_PATH=/var/wade/staging/staging.db
+```
+
 Fragment Logging:
 
+```source-shell
 WADE_STAGE_FRAGMENT_LOG=/var/wade/logs/fragments.log
+```
+
+* * * * *
+
 🚀 Usage
-systemd Service
+--------
+
+### systemd Service
+
+```source-shell
 # Start staging daemon
 sudo systemctl start wade-staging.service
 
@@ -434,7 +550,11 @@ sudo systemctl status wade-staging.service
 
 # Logs
 journalctl -u wade-staging -f
-Manual Execution
+```
+
+### Manual Execution
+
+```source-shell
 # One-time scan (process existing files and exit)
 /opt/wade/staging/stage_daemon.py --scan-once
 
@@ -443,24 +563,36 @@ Manual Execution
 
 # Verbose logging
 /opt/wade/staging/stage_daemon.py --verbose
-Staging Directories
+```
+
+### Staging Directories
+
+```source-shell
 # Full pipeline (all tools)
 cp evidence.E01 /home/autopsy/Staging/full/
 
 # Light pipeline (minimal tools for triage)
 cp memory.dmp /home/autopsy/Staging/light/
+```
+
+* * * * *
+
 📊 Event Logging
-All staging events are logged to /var/wade/logs/staging/stage_YYYY-MM-DD.jsonl in JSONL format.
+----------------
+
+All staging events are logged to `/var/wade/logs/staging/stage_YYYY-MM-DD.jsonl` in JSONL format.
 
 Event Types:
 
-staged — File successfully classified and enqueued
-classification_error — Classification failed
-dedup_skip — File skipped (already processed)
-fragment_detected — E01 fragment detected
-rejected — File rejected (unsupported type)
+-   `staged` --- File successfully classified and enqueued
+-   `classification_error` --- Classification failed
+-   `dedup_skip` --- File skipped (already processed)
+-   `fragment_detected` --- E01 fragment detected
+-   `rejected` --- File rejected (unsupported type)
+
 Example Event:
 
+```source-json
 {
   "timestamp_utc": "2025-12-16T20:00:00.123Z",
   "event_type": "staged",
@@ -477,8 +609,16 @@ Example Event:
   "requested_tools": ["dissect", "hayabusa", "plaso"],
   "duration_sec": 2.5
 }
+```
+
+* * * * *
+
 🛠️ Troubleshooting
-Files Not Being Processed
+-------------------
+
+### Files Not Being Processed
+
+```source-shell
 # Check service status
 sudo systemctl status wade-staging.service
 
@@ -491,7 +631,11 @@ sudo chown -R autopsy:autopsy /home/autopsy/Staging/
 
 # Verify file stability
 watch -n 1 'ls -lh /home/autopsy/Staging/full/'
-Classification Failures
+```
+
+### Classification Failures
+
+```source-shell
 # View recent classification errors
 grep '"event_type": "classification_error"' /var/wade/logs/staging/stage_$(date +%Y-%m-%d).jsonl | tail -5
 
@@ -507,14 +651,22 @@ print(f'Confidence: {result.confidence}')
 print(f'Details: {result.details}')
 print(f'Error: {result.error}')
 "
-Tool Detection Issues
+```
+
+### Tool Detection Issues
+
+```source-shell
 # Check tool availability
 which ewfinfo volatility target-info
 
 # Set explicit paths
 echo "WADE_EWFINFO_PATH=/usr/local/bin/ewfinfo" | sudo tee -a /etc/wade/wade.env
 sudo systemctl restart wade-staging.service
-Deduplication Issues
+```
+
+### Deduplication Issues
+
+```source-shell
 # View processed files
 sqlite3 /var/wade/staging/staging.db "SELECT * FROM processed ORDER BY staged_utc DESC LIMIT 10;"
 
@@ -525,7 +677,14 @@ sqlite3 /var/wade/staging/staging.db "DELETE FROM processed WHERE src_path='/pat
 sudo systemctl stop wade-staging.service
 sudo rm /var/wade/staging/staging.db
 sudo systemctl start wade-staging.service
+```
+
+* * * * *
+
 🧪 Testing
+----------
+
+```source-shell
 # Run staging tests
 pytest staging/tests/ -v
 
@@ -537,35 +696,51 @@ pytest staging/tests/test_tool_routing.py -v
 
 # Integration test (requires test fixtures)
 pytest staging/tests/test_integration.py -v
+```
+
+* * * * *
+
 📚 API Reference
-StagingDaemon
+----------------
+
+### StagingDaemon
+
+```source-python
 class StagingDaemon:
     def __init__(self):
         """Initialize daemon with config, DB, logger."""
-    
+
     def process_file(self, file_path: Path) -> bool:
         """Process a single file through the pipeline."""
-    
+
     def scan_once(self) -> int:
         """Scan directories once, return count processed."""
-    
+
     def watch_continuous(self) -> None:
         """Watch directories continuously (blocks)."""
-ClassifierRegistry
+```
+
+### ClassifierRegistry
+
+```source-python
 class ClassifierRegistry:
     def register(self, classifier: Classifier) -> None:
         """Register a custom classifier."""
-    
+
     def classify(self, path: Path) -> ClassificationResult:
         """Run priority-ordered classification."""
 
 def get_classifier_registry() -> ClassifierRegistry:
     """Get the global registry singleton."""
-ToolRouting
+```
+
+### ToolRouting
+
+```source-python
 class ToolRouting:
     def __init__(self, config_path: Optional[Path] = None, env: Optional[Dict] = None):
         """Initialize with config and environment."""
-    
+
     def select_tools(
         self,
         classification: str,
@@ -574,8 +749,12 @@ class ToolRouting:
         location: Optional[str] = None
     ) -> List[str]:
         """Select tools based on classification and overrides."""
+```
+
+* * * * *
+
 For more information:
 
-Main README
-Worker Documentation
-Configuration Guide
+-   [Main README](https://github.com/imcconnell15/WADE/README.md)
+-   [Worker Documentation](https://github.com/imcconnell15/WADE/wade_workers/README.md)
+-   [Configuration Guide](https://github.com/imcconnell15/WADE/etc/README.md)
