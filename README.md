@@ -49,6 +49,7 @@ graph TB
     I5 --> J
     I6 --> J
     J --> K[Splunk]
+```
 
 ### Core Components
 
