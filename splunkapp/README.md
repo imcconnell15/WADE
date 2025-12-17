@@ -254,7 +254,7 @@ Panels:
 
 SPL:
 
-```
+```spl
 index=wade_events event_type=staged
 | stats count by tool classification
 | sort -count
