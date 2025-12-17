@@ -61,7 +61,7 @@ def load_ticket(ticket_path: Path) -> dict:
             f"Invalid ticket JSON: {e}",
             details={"path": str(ticket_path)},
             suggestion="Check ticket file format"
-        )
+        ) from e
     
     return ticket_data
 
@@ -162,7 +162,7 @@ def run_worker(
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
         event_logger.log_event("cli.interrupted", status="warning")
-        return ExitCode.SUCCESS  # Not an error
+        return 130  # Standard Ctrl+C exit code (128 + SIGINT)
     
     except Exception as e:
         # Unexpected exceptions
