@@ -228,7 +228,7 @@ def main():
         "plaso": "PlasoWorker",
         "yara": "YaraWorker",
         "hayabusa": "HayabusaWorker",
-        "bulk_extractor": "BulkExtractorWorker",
+        "bulkextractor": "BulkExtractorWorker",
         "autopsy": "AutopsyManifestWorker",
         "netcfg": "NetworkConfigWorker",
         "netdoc": "NetworkDocWorker",
