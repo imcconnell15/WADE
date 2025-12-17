@@ -22,7 +22,9 @@ def build_staging_ticket(
     details: Optional[Dict] = None,
     **custom_fields,
 ) -> WorkerTicket:
-    # ... existing hash/size logic ...
+    # Compute file hash and size for deduplication
+    file_size = dest_path.stat().st_size if dest_path.exists() else None
+    file_hash = quick_hash(dest_path) if dest_path.exists() else None
     details = details or {}
     metadata = TicketMetadata(
         hostname=hostname or dest_path.parent.name or "unknown_host",
