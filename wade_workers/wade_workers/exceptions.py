@@ -240,3 +240,42 @@ class WorkerExecutionError(WadeException):
             details["worker"] = worker
         super().__init__(message, details=details, suggestion=suggestion)
         self.worker = worker
+
+def get_exit_code(exc: BaseException) -> int:
+    """Map WADE exceptions to process exit codes.
+
+    Keep this mapping centralized so CLI/daemons stay consistent.
+    """
+    # Local import avoids potential circular imports at module load time.
+    try:
+        from .exit_codes import ExitCode
+    except Exception:
+        return 1  # last-resort fallback
+
+    # Some ExitCode members may not exist yet; getattr() keeps this resilient.
+    timeout_code = getattr(ExitCode, "TIMEOUT", ExitCode.GENERAL_ERROR)
+    tool_exec_code = getattr(ExitCode, "TOOL_ERROR", ExitCode.GENERAL_ERROR)
+    parse_code = getattr(ExitCode, "PARSE_ERROR", ExitCode.GENERAL_ERROR)
+    file_code = getattr(ExitCode, "FILE_ERROR", ExitCode.GENERAL_ERROR)
+    worker_code = getattr(ExitCode, "WORKER_ERROR", ExitCode.GENERAL_ERROR)
+
+    if isinstance(exc, ToolNotFoundError):
+        return int(ExitCode.TOOL_NOT_FOUND)
+    if isinstance(exc, TicketValidationError):
+        return int(ExitCode.VALIDATION_ERROR)
+    if isinstance(exc, ConfigurationError):
+        return int(ExitCode.CONFIG_ERROR)
+    if isinstance(exc, ToolTimeoutError):
+        return int(timeout_code)
+    if isinstance(exc, ToolExecutionError):
+        return int(tool_exec_code)
+    if isinstance(exc, ParseError):
+        return int(parse_code)
+    if isinstance(exc, FileAccessError):
+        return int(file_code)
+    if isinstance(exc, WorkerExecutionError):
+        return int(worker_code)
+    if isinstance(exc, WadeException):
+        return int(ExitCode.GENERAL_ERROR)
+
+    return int(getattr(ExitCode, "GENERAL_ERROR", 1))
