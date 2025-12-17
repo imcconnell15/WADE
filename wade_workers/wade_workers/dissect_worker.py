@@ -22,6 +22,7 @@ Configuration:
     WADE_DISSECT_LINUX_PLUGINS="log.authlog,log.syslog,cronjobs.cronjobs"
 """
 import json
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -297,7 +298,6 @@ class DissectWorker(BaseWorker):
                 log_output=False,
             )
             # Feed target-query output to rdump stdin
-            import subprocess
             proc = subprocess.run(
                 ["rdump", "-J"],
                 input=tq_result.stdout,
