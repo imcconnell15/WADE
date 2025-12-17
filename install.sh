@@ -1571,8 +1571,8 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-User=autopsy
-Group=autopsy
+User=${LWADEUSER}
+Group=${LWADEUSER}
 # Uncomment if your Splunk UF runs as 'splunk' and you created the group:
 #SupplementaryGroups=splunk
 
@@ -1616,7 +1616,7 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=false
-ReadWritePaths=/home/autopsy /var/wade
+ReadWritePaths=/home/${LWADEUSER} /var/wade
 # Add /var/log/wade only if the daemon truly writes there:
 #ReadWritePaths=/home/autopsy /var/wade /var/log/wade
 
