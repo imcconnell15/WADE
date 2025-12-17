@@ -968,7 +968,7 @@ if (( MEM_GB < 32 )); then
 fi
 
 #####################################
-# NEW: Build the package bundle & install once
+# Build the package bundle & install once
 #####################################
 # Core
 pkg_add samba
@@ -1522,21 +1522,19 @@ run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
   install -d -m 0755 /etc/wade
 
   install -d -m 0755 /opt/wade/staging
-  rsync -a --delete "'"$STAGE_SRC_DIR"/"'" /opt/wade/staging/
+  rsync -a --delete "${STAGE_SRC_DIR}/" /opt/wade/staging/
 
-  install -d -m 0755 "/home/'"${LWADEUSER}"'/.venvs"
-  python3 -m venv "'"$VENV_DIR"'"
-  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "'"$VENV_DIR"'"
+  install -d -m 0755 "/home/${LWADEUSER}/.venvs"
+  python3 -m venv "${VENV_DIR}"
+  chown -R "${LWADEUSER}:${LWADEUSER}" "${VENV_DIR}"
 
-  "'"$VENV_DIR"'/bin/python" -m pip install -U pip setuptools wheel >/dev/null 2>&1 || true
+  "${VENV_DIR}/bin/python" -m pip install -U pip setuptools wheel >/dev/null 2>&1 || true
   # speed-up: use shared wheelhouse (use inotify + PyYAML for staging + workers)
-  '"pip_cached_install \"$VENV_DIR/bin\" inotify PyYAML"'
+  pip_cached_install "${VENV_DIR}/bin" inotify PyYAML
 
-   # Smoke test essential imports
-  "'"$VENV_DIR"'/bin/python" - <<'PY'
-import json, os, sys
-from datetime import datetime, timezone
-from pathlib import Path
+  # Smoke test essential imports
+  "${VENV_DIR}/bin/python" - <<PY
+import sys
 try:
     import inotify.adapters  # provided by "inotify" package
     ok_inotify = True
@@ -1548,13 +1546,13 @@ print("WADE staging venv OK:", sys.executable, "inotify=", ok_inotify)
 PY
 
   install -d -m 0755 /var/wade/logs/stage /var/wade/state
-  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /var/wade
+  chown -R "${LWADEUSER}:${LWADEUSER}" /var/wade
 
-  STAGING_ROOT="/home/'"${LWADEUSER}"'/'"${WADE_STAGINGDIR}"'"
-  DATAS_ROOT="/home/'"${LWADEUSER}"'/'"${WADE_DATADIR}"'"
+  STAGING_ROOT="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
+  DATAS_ROOT="/home/${LWADEUSER}/${WADE_DATADIR}"
   QUEUE_DIR="${WADE_QUEUE_DIR:-_queue}"
 
-  install -d -o "'"${LWADEUSER}"'" -g "'"${LWADEUSER}"'" -m 0755 \
+  install -d -o "${LWADEUSER}" -g "${LWADEUSER}" -m 0755 \
       "${STAGING_ROOT}/full" "${STAGING_ROOT}/light" \
       "${DATAS_ROOT}/Hosts" "${DATAS_ROOT}/Network" "${DATAS_ROOT}/${QUEUE_DIR}"
 
@@ -1573,7 +1571,7 @@ StartLimitBurst=10
 Type=simple
 User=${LWADEUSER}
 Group=${LWADEUSER}
-# Uncomment if your Splunk UF runs as 'splunk' and you created the group:
+# Uncomment if your Splunk UF runs as splunk and you created the group:
 #SupplementaryGroups=splunk
 
 # Environment
@@ -1585,14 +1583,7 @@ SyslogIdentifier=wade-staging
 
 # Preflight: create dirs and set ownership (runs as root only for these steps)
 PermissionsStartOnly=yes
-ExecStartPre=/bin/sh -lc 'set -eu; owner="${WADE_OWNER_USER:-autopsy}"; \
-  umask 0002; \
-  mkdir -p /var/wade/logs/stage /var/wade/state \
-           "/home/$owner/Staging/full" "/home/$owner/Staging/light" \
-           "/home/$owner/DataSources/_queue" "/home/$owner/DataSources/Hosts" \
-           "/home/$owner/DataSources/Network" "/home/$owner/DataSources/Unknown" \
-           "/home/$owner/Staging/ignored"; \
-  chown -R "$owner:$owner" "/home/$owner/Staging" "/home/$owner/DataSources" /var/wade'
+ExecStartPre=/bin/sh -lc "set -eu; umask 0002; mkdir -p /var/wade/logs/stage /var/wade/state \"${STAGING_ROOT}/full\" \"${STAGING_ROOT}/light\" \"${DATAS_ROOT}/${QUEUE_DIR}\" \"${DATAS_ROOT}/Hosts\" \"${DATAS_ROOT}/Network\" \"${DATAS_ROOT}/Unknown\" \"${STAGING_ROOT}/ignored\"; chown -R ${LWADEUSER}:${LWADEUSER} \"${STAGING_ROOT}\" \"${DATAS_ROOT}\" /var/wade"
 
 WorkingDirectory=/opt/wade
 ExecStart=${VENV_DIR}/bin/python /opt/wade/staging/stage_daemon.py
@@ -1639,10 +1630,11 @@ WantedBy=multi-user.target
 EOF
 
   systemd_queue_enable wade-staging.service
-  sha256sum /opt/wade/staging/stage_daemon.py | awk '"'"'{print $1}'"'"' > "'"${STEPS_DIR}/wade-stage.ver"'"
-  install -d -m 0755 /home/'"${LWADEUSER}"'/WADE 2>/dev/null || true
-  "'"$VENV_DIR"'/bin/pip" freeze > /home/'"${LWADEUSER}"'/WADE/requirements.lock || true
+  sha256sum /opt/wade/staging/stage_daemon.py | awk "{print \$1}" > "${STEPS_DIR}/wade-stage.ver"
+  install -d -m 0755 "/home/${LWADEUSER}/WADE" 2>/dev/null || true
+  "${VENV_DIR}/bin/pip" freeze > "/home/${LWADEUSER}/WADE/requirements.lock" || true
 ' || fail_note "wade-stage" "service install/start failed"
+
 
 #####################################
 # pipx tools: volatility3 + dissect (consolidated)
@@ -1685,8 +1677,7 @@ exec vol \
 EOF
   chmod 0755 /usr/local/bin/vol3
   VOL_VENV="/opt/pipx/venvs/volatility3"
-  VOL_PYTHON_VER=$("$VOL_VENV/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-  VOL_SITE_PACKAGES="$VOL_VENV/lib/python${VOL_PYTHON_VER}/site-packages/volatility3/symbols"
+  VOL_SITE_PACKAGES="$VOL_VENV/lib/python3*/site-packages/volatility3/symbols"
   mkdir -p "$VOL_SITE_PACKAGES"
   cp /var/wade/vol3/symbols/* "$VOL_SITE_PACKAGES/"
 
