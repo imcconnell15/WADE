@@ -727,12 +727,12 @@ sqlite3 /var/wade/staging/staging.db "DELETE FROM processed WHERE sig='path_base
 📚 Documentation
 ----------------
 
--   [Staging Daemon](https://github.com/imcconnell15/WADE/pull/staging/README.md) --- Classification engine and ticket generation
--   [Worker Framework](https://github.com/imcconnell15/WADE/pull/wade_workers/README.md) --- Tool execution and output normalization
--   [Configuration Guide](https://github.com/imcconnell15/WADE/pull/etc/README.md) --- Environment and YAML configuration
--   [Splunk Integration](https://github.com/imcconnell15/WADE/pull/splunkapp/README.md) --- Index setup and search examples
--   [YARA Rules](https://github.com/imcconnell15/WADE/pull/yara/README.md) --- Rule management and custom rules
--   [Troubleshooting Guide](https://github.com/imcconnell15/WADE/pull/trouble/README.md) --- Common issues and solutions
+-   [Staging Daemon](staging/README.md) --- Classification engine and ticket generation
+-   [Worker Framework](wade_workers/README.md) --- Tool execution and output normalization
+-   [Configuration Guide](etc/README.md) --- Environment and YAML configuration
+-   [Splunk Integration](splunkapp/README.md) --- Index setup and search examples
+-   [YARA Rules](yara/README.md) --- Rule management and custom rules
+-   [Troubleshooting Guide](trouble/README.md) --- Common issues and solutions
 
 * * * * *
 
