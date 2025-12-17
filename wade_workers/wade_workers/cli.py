@@ -92,7 +92,8 @@ def run_worker(
             worker = worker_class(env=env)
         except ToolNotFoundError as e:
             logger.error(f"Tool not found: {e}")
-            logger.error(f"Suggestion: {e.suggestion}")
+            if e.suggestion:
+                logger.error(f"Suggestion: {e.suggestion}")
             event_logger.log_event(
                 "cli.worker_init_failed",
                 status="error",
