@@ -1465,7 +1465,7 @@ Description=WADE Staging Daemon (full vs light)
 Documentation=https://github.com/imcconnell15/WADE
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=/opt/wade/stage_daemon.py
+ConditionPathExists=/opt/wade/staging/stage_daemon.py
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
