@@ -216,7 +216,7 @@ wade_oscap_eval() {
 # sync WHIFF_* values into wade.conf
 #---------------------------------------
 sync_whiff_into_wade_conf() {
-  local conf="${:-/etc/wade}/wade.conf"
+  local conf="${WADE_ETC:-/etc/wade}/wade.conf"
   [[ -f "$conf" ]] || return 0   # nothing to do if somehow missing
 
   # inner helper: set or update KEY="value" in conf
@@ -605,32 +605,32 @@ bootstrap_fresh_install
 #####################################
 # WADE scaffolding & default config
 #####################################
-="/etc/wade"
+WADE_ETC="/etc/wade"
 WADE_VAR="/var/wade"
-mkdir -p "${}/"{conf.d,modules,json_injection.d} \
+mkdir -p "${WADE_ETC}/"{conf.d,modules,json_injection.d} \
          "${WADE_VAR}/"{logs,state,tmp,pkg,tools.d,pipelines.d}
 
 # Preseed wade.conf from repo if present
-if [[ -f "${ETC_SRC_DIR}/wade.conf" && ! -f "${}/wade.conf" ]]; then
+if [[ -f "${ETC_SRC_DIR}/wade.conf" && ! -f "${WADE_ETC}/wade.conf" ]]; then
   echo "[*] Using preseeded wade.conf from ${SCRIPT_DIR}"
-  install -m 0644 "${SCRIPT_DIR}/wade.conf" "${}/wade.conf"
+  install -m 0644 "${SCRIPT_DIR}/wade.conf" "${WADE_ETC}/wade.conf"
 fi
 
 # Preseed wade.env from repo if present
-if [[ -f "${ETC_SRC_DIR}/wade.env" && ! -f "${}/wade.env" ]]; then
+if [[ -f "${ETC_SRC_DIR}/wade.env" && ! -f "${WADE_ETC}/wade.env" ]]; then
   echo "[*] Using preseeded wade.env from ${SCRIPT_DIR}"
-  install -m 0600 "${SCRIPT_DIR}/wade.env" "${}/wade.env"
+  install -m 0600 "${SCRIPT_DIR}/wade.env" "${WADE_ETC}/wade.env"
 fi
 
 # Preseed config.yaml from repo if present
-if [[ -f "${ETC_SRC_DIR}/config.yaml" && ! -f "${}/config.yaml" ]]; then
+if [[ -f "${ETC_SRC_DIR}/config.yaml" && ! -f "${WADE_ETC}/config.yaml" ]]; then
   echo "[*] Using preseeded config.yaml from ${ETC_SRC_DIR}"
-  install -m 0600 "${ETC_SRC_DIR}/config.yaml" "${}/config.yaml"
+  install -m 0600 "${ETC_SRC_DIR}/config.yaml" "${WADE_ETC}/config.yaml"
 fi
 
 # Seed default wade.conf if missing
-if [[ ! -f "${}/wade.conf" ]]; then
-  cat >"${}/wade.conf"<<'CONF'
+if [[ ! -f "${WADE_ETC}/wade.conf" ]]; then
+  cat >"${WADE_ETC}/wade.conf"<<'CONF'
 ### /etc/wade/wade.conf (defaults) ##############################
 WADE_HOSTNAME=""
 WADE_OWNER_USER="autopsy"
@@ -792,7 +792,7 @@ STIG_SKIP_RULES=""
 # "source" (build from GitHub) or "repo" (use distro package if available)
 BULK_EXTRACTOR_MODE="source"
 CONF
-  chmod 0644 "${}/wade.conf"
+  chmod 0644 "${WADE_ETC}/wade.conf"
 fi
 
 # Keep a small WHIFF config that derives from /etc/wade/wade.conf
@@ -807,9 +807,9 @@ WCONF
 chmod 0644 /etc/whiff/install.conf
 
 # Seed ModuleConfig YAML for workers (new)
-if [[ ! -f "${}/config.yaml" ]]; then
-  echo "[*] Creating ${}/config.yaml (ModuleConfig defaults)"
-  install -d -m 0755 "${}"
+if [[ ! -f "${WADE_ETC}/config.yaml" ]]; then
+  echo "[*] Creating ${WADE_ETC}/config.yaml (ModuleConfig defaults)"
+  install -d -m 0755 "${WADE_ETC}"
   cat > "$}/config.yaml" <<'YAML'
 # WADE Tool Configuration (defaults). Override with env WADE_<TOOL>_<KEY>.
 volatility:
@@ -827,16 +827,16 @@ dissect:
     - log.authlog
     - history.bashhistory
 YAML
-  chmod 0644 "${}/config.yaml"
+  chmod 0644 "${WADE_ETC}/config.yaml"
 fi
 
 # Seed universal jq injector
-if [[ ! -f "${}/json_injection.d/00-universal.jq" ]]; then
-  cat >"${}/json_injection.d/00-universal.jq"<<'JQ'
+if [[ ! -f "${WADE_ETC}/json_injection.d/00-universal.jq" ]]; then
+  cat >"${WADE_ETC}/json_injection.d/00-universal.jq"<<'JQ'
 # Add WADE metadata to each JSON object
 . as $o
 | $o
-| .wade |= ( .wade // {} )
+| .wade |= ( .wade // {WADE_ETC} )
 | .wade.hostname = (env.WADE_HOSTNAME // env.HOSTNAME)
 | .wade.module = (env.MODULE // null)
 | .wade.pipeline = (env.PIPELINE // null)
@@ -844,13 +844,13 @@ if [[ ! -f "${}/json_injection.d/00-universal.jq" ]]; then
 | .wade.case_id = (env.CASE_ID // null)
 | .wade.location = (env.LOCATION // null)
 JQ
-  chmod 0644 "${}/json_injection.d/00-universal.jq"
+  chmod 0644 "${WADE_ETC}/json_injection.d/00-universal.jq"
 fi
 
 # Load config stack
-source "${}/wade.conf"
-for f in "${}/conf.d/"*.conf; do [[ -f "$f" ]] && source "$f"; done
-for f in "${}/modules/"*.conf; do [[ -f "$f" ]] && source "$f"; done
+source "${WADE_ETC}/wade.conf"
+for f in "${WADE_ETC}/conf.d/"*.conf; do [[ -f "$f" ]] && source "$f"; done
+for f in "${WADE_ETC}/modules/"*.conf; do [[ -f "$f" ]] && source "$f"; done
 OFFLINE="${OFFLINE:-${WADE_OFFLINE:-0}}"
 
 # ---- Safe defaults so set -u never trips on older configs
@@ -2626,7 +2626,7 @@ install_wade_logrotate "wade-staging" "/var/wade/logs/stage" "${LWADEUSER:-autop
 #####################################
 # Persist facts & endpoints
 #####################################
-ENV_FILE="${}/wade.env"
+ENV_FILE="${WADE_ETC}/wade.env"
 IPV4="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
 OUTCONF="/opt/splunkforwarder/etc/system/local/outputs.conf"
@@ -2776,7 +2776,7 @@ echo "    Barracuda : ${IPV4}:5000"
 echo "    WHIFF     : $( [[ "$WHIFF_ENABLE_EFF" = "1" ]] && echo "http://${WHIFF_BIND}:${WHIFF_PORT}" || echo "disabled" )"
 echo "    Tools     : vol3, dissect, bulk_extractor, plaso (+ piranha, barracuda, hayabusa, whiff)"
 echo "    STIG      : reports (if run) under ${STIG_REPORT_DIR}"
-echo "    Config    : ${}/wade.conf (defaults), ${}/wade.env (facts & ports)"
+echo "    Config    : ${WADE_ETC}/wade.conf (defaults), ${WADE_ETC}/wade.env (facts & ports)"
 UF_PRESENT="no"
 UF_OUT_TARGETS=""
 UF_DS_TARGET=""
