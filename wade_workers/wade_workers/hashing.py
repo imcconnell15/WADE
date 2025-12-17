@@ -80,8 +80,9 @@ class FullFileHasher(HashStrategy):
         print(f"MD5: {result['md5']}")
     """
     
-    SUPPORTED_ALGOS = {"md5", "sha1", "sha224", "sha256", "sha384", "sha512"}
-    DEFAULT_ALGOS = ["md5", "sha1", "sha256"]
+    SUPPORTED_ALGOS: ClassVar[Set[str]] = {"md5", "sha1", "sha224", "sha256", "sha384", "sha512"}
+    DEFAULT_ALGOS: ClassVar[List[str]] = ["md5", "sha1", "sha256"]
+
     CHUNK_SIZE = 8192  # Read 8KB at a time
     
     def __init__(self, algos: Optional[List[str]] = None):
