@@ -23,7 +23,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
+from .ticket_schema import WorkerTicket
 
 class EventLogger:
     """Structured JSONL logger for WADE events.
