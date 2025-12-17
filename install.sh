@@ -810,7 +810,7 @@ chmod 0644 /etc/whiff/install.conf
 if [[ ! -f "${WADE_ETC}/config.yaml" ]]; then
   echo "[*] Creating ${WADE_ETC}/config.yaml (ModuleConfig defaults)"
   install -d -m 0755 "${WADE_ETC}"
-  cat > "$}/config.yaml" <<'YAML'
+  cat > "${WADE_ETC}/config.yaml" <<'YAML'
 # WADE Tool Configuration (defaults). Override with env WADE_<TOOL>_<KEY>.
 volatility:
   modules:
