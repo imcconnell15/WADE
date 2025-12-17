@@ -167,7 +167,7 @@ def run_worker(
     
     except Exception as e:
         # Unexpected exceptions
-        logger.exception(f"Unexpected error: {e}")
+        logger.exception("Unexpected error")
         event_logger.log_event(
             "cli.unexpected_error",
             status="error",
