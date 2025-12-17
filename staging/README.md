@@ -41,6 +41,8 @@ graph TB
     N --> O[Move File]
     O --> P[Record in DB]
     P --> Q[Enqueue Ticket]
+```
+
 📂 Module Structure
 staging/
 ├── classifiers/              # Classification engine
