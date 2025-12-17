@@ -39,8 +39,6 @@ ExecStart=/usr/bin/python3 /opt/wade/staging/stage_daemon.py
 # Restart policy
 Restart=on-failure
 RestartSec=10
-StartLimitInterval=300
-StartLimitBurst=5
 
 # Make files group-readable (UF) and keep group on new files/dirs
 UMask=002
