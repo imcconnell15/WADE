@@ -10,7 +10,7 @@ WORKER_MAP = {
     "dissect": ("wade_workers.dissect_worker", "DissectWorker"),
     "plaso": ("wade_workers.plaso_worker", "PlasoWorker"),
     "hayabusa": ("wade_workers.hayabusa_worker", "HayabusaWorker"),
-    "bulk_extractor": ("wade_workers.bulk_extractor_worker", "BulkExtractorWorker"),
+    "bulk_extractor": ("wade_workers.bulkextractor_worker", "bulkextractor"),
     "yara": ("wade_workers.yara_worker", "YaraWorker"),
     # Optional/placeholder workers:
     "autopsy": ("wade_workers.autopsy_manifest", "AutopsyManifestWorker"),
@@ -18,14 +18,19 @@ WORKER_MAP = {
     "netdoc": ("wade_workers.netdoc_worker", "NetworkDocWorker"),
 }
 
-def _load_worker(module_name: str, class_name: str):
-    try:
-        mod = importlib.import_module(module_name)
-        return getattr(mod, class_name)
-    except Exception:
-        return None
+import logging
 
-def _resolve_worker(tool: str):
+_logger = logging.getLogger(__name__)
+
+def _load_worker(module_name: str, class_name: str) -> type | None:
+     try:
+         mod = importlib.import_module(module_name)
+         return getattr(mod, class_name)
+    except Exception as e:
+        _logger.debug("Failed to load %s.%s: %s", module_name, class_name, e)
+         return None
+
+def _resolve_worker(tool: str) -> tuple[tuple[str, str] | None, dict]:
     # alias handling
     if tool == "yara_mem":
         return WORKER_MAP.get("yara"), {"mode": "memory"}
