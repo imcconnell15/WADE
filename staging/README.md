@@ -1,4 +1,3 @@
-```text-md
 # WADE Staging Daemon
 
 The **Staging Daemon** is the entry point for all evidence files entering the WADE pipeline. It provides intelligent classification, metadata extraction, deduplication, and ticket generation for downstream worker processing.
