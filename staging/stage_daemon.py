@@ -26,17 +26,17 @@ except ImportError:
     INOTIFY_AVAILABLE = False
 
 # Local imports
-from config import (
+from .config import (
     STAGING_ROOT, STAGE_FULL, STAGE_LIGHT,
     DATADIR, QUEUE_DIR,
     REQUIRE_CLOSE_WRITE, POLL_INTERVAL_SEC,
     WADE_STAGE_RECURSIVE,
 )
-from file_ops import wait_stable, no_open_writers, move_atomic, ensure_dirs
-from db import init_db, path_signature, already_processed, already_processed_by_content, record_processed
-from path_resolver import build_destination, detect_profile, match_host_from_filename
-from classifiers import get_classifier_registry
-from ticket_builder import build_staging_ticket, queue_ticket
+from .file_ops import wait_stable, no_open_writers, move_atomic, ensure_dirs
+from .db import init_db, path_signature, already_processed, already_processed_by_content, record_processed
+from .path_resolver import build_destination, detect_profile, match_host_from_filename
+from .classifiers import get_classifier_registry
+from .ticket_builder import build_staging_ticket, queue_ticket
 from wade_workers.hashing import quick_hash
 from wade_workers.logging import EventLogger
 
