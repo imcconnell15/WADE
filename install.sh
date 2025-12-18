@@ -1586,7 +1586,7 @@ PermissionsStartOnly=yes
 ExecStartPre=/bin/sh -lc "set -eu; umask 0002; mkdir -p /var/wade/logs/stage /var/wade/state \"${STAGING_ROOT}/full\" \"${STAGING_ROOT}/light\" \"${DATAS_ROOT}/${QUEUE_DIR}\" \"${DATAS_ROOT}/Hosts\" \"${DATAS_ROOT}/Network\" \"${DATAS_ROOT}/Unknown\" \"${STAGING_ROOT}/ignored\"; chown -R ${LWADEUSER}:${LWADEUSER} \"${STAGING_ROOT}\" \"${DATAS_ROOT}\" /var/wade"
 
 WorkingDirectory=/opt/wade
-ExecStart=${VENV_DIR}/bin/python /opt/wade/staging/stage_daemon.py
+ExecStart=${VENV_DIR}/bin/python -m staging.stage_daemon
 
 # Restart policy
 Restart=on-failure
