@@ -27,7 +27,7 @@ def _load_worker(module_name: str, class_name: str) -> type | None:
          mod = importlib.import_module(module_name)
          return getattr(mod, class_name)
      except Exception as e:
-        _logger.debug("Failed to load %s.%s: %s", module_name, class_name, e)
+         _logger.debug("Failed to load %s.%s: %s", module_name, class_name, e)
          return None
 
 def _resolve_worker(tool: str) -> tuple[tuple[str, str] | None, dict]:
