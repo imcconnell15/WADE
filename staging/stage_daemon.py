@@ -36,7 +36,7 @@ from .file_ops import wait_stable, no_open_writers, move_atomic, ensure_dirs
 from .db import init_db, path_signature, already_processed, already_processed_by_content, record_processed
 from .path_resolver import build_destination, detect_profile, match_host_from_filename
 from .classifiers import get_classifier_registry
-from .ticket_builder import build_staging_ticket, queue_ticket
+from .ticket_builder import build_staging_ticket
 from wade_workers.hashing import quick_hash
 from wade_workers.logging import EventLogger
 
