@@ -249,7 +249,7 @@ class EventLogger:
         """
         if log_dir is None:
             import os
-            log_dir = Path(os.environ.get("WADE_LOG_DIR", "/data/logs"))
+            log_dir = Path(os.environ.get("WADE_LOG_DIR", "/var/wade/logs/stage"))
         
         return cls(log_dir, source)
 
