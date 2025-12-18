@@ -2,9 +2,10 @@
 # Place this file at: /etc/wade/config.yaml or ./wade_config.yaml
 # Or set WADE_CONFIG_PATH environment variable
 
-# --- Routing (tool assignment) ---
-   defaults:
-     e01:
+ # --- Routing (tool assignment) ---
+routing:
+    defaults:
+      e01:
       full: [dissect, hayabusa, autopsy, bulk_extractor]
       light: [dissect, hayabusa]
      disk_raw:
