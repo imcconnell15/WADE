@@ -231,56 +231,56 @@ class StagingDaemon:
             self._watch_polling()
     
     def _watch_inotify(self) -> None:
-    """Watch using inotify for efficient file system events."""
-    logger.info("Starting inotify watch")
+        """Watch using inotify for efficient file system events."""
+        logger.info("Starting inotify watch")
     
-    watch_dirs = [STAGE_FULL, STAGE_LIGHT]
+        watch_dirs = [STAGE_FULL, STAGE_LIGHT]
     
-    if WADE_STAGE_RECURSIVE:
-        # Create separate InotifyTree instances for each root
-        watchers = []
-        for watch_dir in watch_dirs:
-            if watch_dir.exists():
-                tree = inotify.adapters.InotifyTree(str(watch_dir))
-                watchers.append(tree)
-                logger.info(f"Watching recursively: {watch_dir}")
+        if WADE_STAGE_RECURSIVE:
+            # Create separate InotifyTree instances for each root
+            watchers = []
+            for watch_dir in watch_dirs:
+                if watch_dir.exists():
+                    tree = inotify.adapters.InotifyTree(str(watch_dir))
+                    watchers.append(tree)
+                    logger.info(f"Watching recursively: {watch_dir}")
         
-        # Monitor all watchers in parallel
-        import select
+            # Monitor all watchers in parallel
+            import select
         
-        while True:
-            for watcher in watchers:
-                for event in watcher.event_gen(yield_nones=False, timeout_s=0):
-                    (_, type_names, path, filename) = event
+            while True:
+                for watcher in watchers:
+                    for event in watcher.event_gen(yield_nones=False, timeout_s=0):
+                        (_, type_names, path, filename) = event
                     
-                    if "IN_CLOSE_WRITE" in type_names:
-                        file_path = Path(path) / filename
+                        if "IN_CLOSE_WRITE" in type_names:
+                            file_path = Path(path) / filename
                         
-                        try:
-                            self.process_file(file_path)
-                        except Exception as e:
-                            logger.error(f"Error processing {file_path}: {e}", exc_info=True)
+                            try:
+                                self.process_file(file_path)
+                            except Exception as e:
+                                logger.error(f"Error processing {file_path}: {e}", exc_info=True)
             
-            # Brief sleep to avoid busy-waiting
-            time.sleep(0.1)
-    else:
-        # Non-recursive: original behavior
-        i = inotify.adapters.Inotify()
-        for watch_dir in watch_dirs:
-            if watch_dir.exists():
-                i.add_watch(str(watch_dir))
-                logger.info(f"Watching: {watch_dir}")
+                # Brief sleep to avoid busy-waiting
+                time.sleep(0.1)
+        else:
+            # Non-recursive: original behavior
+            i = inotify.adapters.Inotify()
+            for watch_dir in watch_dirs:
+                if watch_dir.exists():
+                    i.add_watch(str(watch_dir))
+                    logger.info(f"Watching: {watch_dir}")
         
-        for event in i.event_gen(yield_nones=False):
-            (_, type_names, path, filename) = event
+            for event in i.event_gen(yield_nones=False):
+                (_, type_names, path, filename) = event
             
-            if "IN_CLOSE_WRITE" in type_names:
-                file_path = Path(path) / filename
+                if "IN_CLOSE_WRITE" in type_names:
+                    file_path = Path(path) / filename
                 
-                try:
-                    self.process_file(file_path)
-                except Exception as e:
-                    logger.error(f"Error processing {file_path}: {e}", exc_info=True)
+                    try:
+                        self.process_file(file_path)
+                    except Exception as e:
+                        logger.error(f"Error processing {file_path}: {e}", exc_info=True)
     
     def _watch_polling(self) -> None:
         """Watch using polling (fallback)."""
