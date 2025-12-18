@@ -1,0 +1,240 @@
+# WADE Tool Configuration
+# Place this file at: /etc/wade/config.yaml or ./wade_config.yaml
+# Or set WADE_CONFIG_PATH environment variable
+
+ # --- Routing (tool assignment) ---
+routing:
+    defaults:
+      e01:
+      full: [dissect, hayabusa, autopsy, bulk_extractor]
+      light: [dissect, hayabusa]
+     disk_raw:
+      full: [dissect, hayabusa, autopsy, bulk_extractor]
+      light: [dissect]
+     memory:
+      full: [volatility, yara_mem]
+      light: [volatility]
+     vm_disk:
+      full: [dissect]
+     vm_package:
+      full: [dissect]
+     network_config:
+      full: [netcfg]
+     network_doc:
+      full: [netdoc]
+
+  # Optional: globally disable noisy/heavy tools
+  disabled_tools:
+    - autopsy   # enable later when Autopsy node is ready
+
+  # Optional: OS-specific adjustments
+  os_overrides:
+    windows:
+      add:
+        memory.full: [hayabusa]
+      remove:
+        memory.full: [autopsy]
+
+  # Optional: location-specific adjustments (from detect_profile location)
+  location_overrides:
+    datacenterA:
+      add:
+        e01.full: [yara_mem]
+
+# ============================================================================
+# Volatility3 Configuration
+# ============================================================================
+volatility:
+  # Modules to run (list format)
+  modules:
+    # System info
+    - windows.info
+    
+    # Process analysis
+    - windows.pslist
+    - windows.pstree
+    - windows.cmdline
+    - windows.psscan
+    
+    # Network
+    - windows.netscan
+    - windows.netstat
+    
+    # Handles & DLLs
+    - windows.handles
+    - windows.dlllist
+    
+    # Services & drivers
+    - windows.services
+    - windows.svcscan
+    
+    # Registry
+    - windows.registry.hivelist
+    - windows.registry.printkey
+    
+    # Malware detection
+    - windows.malfind
+    - windows.hollowprocesses
+    
+    # Memory artifacts
+    - windows.vadinfo
+    - windows.strings
+  
+  # Modules to explicitly disable (even if in default list)
+  disabled_modules:
+  # - windows.malfind  # Uncomment to disable
+  
+  # Module-specific parameters (future enhancement)
+  module_params:
+    windows.printkey:
+      key: "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+
+# ============================================================================
+# Dissect Configuration
+# ============================================================================
+dissect:
+  # Windows plugin bundle
+  windows_plugins:
+    # Execution
+    - amcache.general
+    - amcache.applications
+    - prefetch
+    - regf.userassist
+    - regf.shellbags
+    - regf.shimcache
+    
+    # Persistence
+    - regf.runkeys
+    - services.services
+    - tasks.tasks
+    - startupinfo.startupinfo
+    
+    # User activity
+    - lnk.lnk
+    - jumplist.automatic_destination
+    - jumplist.custom_destination
+    - recyclebin.recyclebin
+    
+    # Logs
+    - log.evtx.evtx
+    - firewall.logs
+    - sru.application_timeline
+    
+    # Browsers (consolidated)
+    - browser.history
+    - browser.downloads
+    - browser.cookies
+    - browser.passwords
+    
+    # SSH/Remote
+    - ssh.known_hosts
+    - ssh.authorized_keys
+    - putty.sessions
+    
+    # Anti-virus
+    - mcafee.msc
+    - symantec.logs
+  
+  # Linux plugin bundle
+  linux_plugins:
+    # Auth & logs
+    - log.authlog
+    - log.syslog
+    - log.messages
+    - log.journal
+    - log.lastlog
+    
+    # Shell history
+    - history.bashhistory
+    
+    # Scheduled tasks
+    - cronjobs.cronjobs
+    
+    # Network
+    - linux.network.interfaces
+    - linux.network.dns
+    - linux.iptables.iptables
+    
+    # Processes & services
+    - linux.processes.processes
+    - linux.services.services
+    
+    # Packages
+    - debian.dpkg.status
+    - debian.apt.logs
+    - packagemanager.logs
+    
+    # Containers
+    - container.containers
+    - container.logs
+    
+    # Webservers
+    - webserver.access
+    - webserver.error
+  
+  # Disabled plugins (across all OS types)
+  disabled_windows_plugins:
+    # - browser.passwords  # Uncomment to skip password extraction
+  
+  disabled_linux_plugins:
+    # - log.journal  # Uncomment if systemd journals not needed
+
+
+# ============================================================================
+# YARA Configuration
+# ============================================================================
+yara:
+  # Path to compiled rules
+  ruleset: /opt/wade/yara/packed_rules.yar
+  
+  # Alternative: list of rule files
+  # rule_files:
+  #   - /opt/wade/yara/malware.yar
+  #   - /opt/wade/yara/webshells.yar
+  
+  # Scan options
+  timeout_sec: 300
+  max_matches: 1000
+
+
+# ============================================================================
+# Bulk Extractor Configuration
+# ============================================================================
+bulk_extractor:
+  # Scanners to enable
+  scanners:
+    - email
+    - url
+    - ccn
+    - telephone
+    - base64
+  
+  # Scanners to disable
+  disabled_scanners:
+    - wordlist  # Can be large
+
+
+# ============================================================================
+# Hayabusa Configuration
+# ============================================================================
+hayabusa:
+  # Rule directory
+  rules_dir: /opt/hayabusa/rules
+  
+  # Minimum level to report
+  min_level: low
+  
+  # Output format
+  output_format: jsonl
+
+
+# ============================================================================
+# Splunk Integration
+# ============================================================================
+splunk:
+  enabled: false
+  rest_url: ""  # e.g., https://splunk.example.org:8089
+  token: ""     # HEC token or management token
+  timeout_sec: 10
+  index: wade_artifacts

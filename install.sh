@@ -167,6 +167,103 @@ ensure_pipx_installed() {
   fi
 }
 
+set_shell_kv() {
+  local file="$1" key="$2" val="$3"
+  [[ -z "$file" || -z "$key" ]] && return 0
+  touch "$file"
+
+  local esc="${val//\\/\\\\}"
+  esc="${esc//&/\\&}"
+  esc="${esc//|/\\|}"
+
+  if grep -qE "^[[:space:]]*${key}=" "$file"; then
+    sed -i -E "s|^[[:space:]]*${key}=.*|${key}=\"${esc}\"|" "$file"
+  else
+    printf '%s="%s"\n' "$key" "$val" >>"$file"
+  fi
+}
+
+set_secret_kv() {
+  # Writes KEY="value" into secrets.env WITHOUT spewing secrets into xtrace logs.
+  local file="$1" key="$2" val="$3"
+  [[ -z "$val" ]] && return 0
+
+  local had_xtrace=0
+  case "$-" in *x*) had_xtrace=1; set +x ;; esac
+
+  touch "$file"
+  chmod 0600 "$file"
+  chown root:root "$file" 2>/dev/null || true
+
+  set_shell_kv "$file" "$key" "$val"
+
+  (( had_xtrace )) && set -x || true
+}
+
+persist_prompt_answers() {
+  local WADE_ETC="${WADE_ETC:-/etc/wade}"
+  local conf="${WADE_ETC}/wade.conf"
+  local envf="${WADE_ETC}/wade.env"
+  local secrets="${WADE_ETC}/secrets.env"
+
+  # ---- WADE identity (safe to persist) ----
+  set_shell_kv "$conf" "WADE_HOSTNAME"   "$LWADE"
+  set_shell_kv "$conf" "WADE_OWNER_USER" "$LWADEUSER"
+  set_shell_kv "$conf" "WADE_SMB_USERS"  "$SMB_USERS_CSV"
+  set_shell_kv "$conf" "WADE_ALLOW_NETS" "$ALLOW_NETS_CSV"
+
+  # ---- Splunk UF prompt choices -> wade.conf defaults ----
+  local splunk_hosts="${PRESET_SPLUNK_SERVER_LINE:-${DEFAULT_HOSTS:-${SPLUNK_UF_RCVR_HOSTS:-}}}"
+  [[ -n "$splunk_hosts" ]] && set_shell_kv "$conf" "SPLUNK_UF_RCVR_HOSTS" "$splunk_hosts"
+  set_shell_kv "$conf" "SPLUNK_UF_DEFAULT_INDEX"    "$PRESET_SPLUNK_INDEX"
+  set_shell_kv "$conf" "SPLUNK_UF_COMPRESSED"       "$PRESET_SPLUNK_COMPRESSED"
+  set_shell_kv "$conf" "SPLUNK_UF_USE_ACK"          "$PRESET_SPLUNK_USEACK"
+  set_shell_kv "$conf" "SPLUNK_UF_SSL_VERIFY"       "$PRESET_SPLUNK_SSL_VERIFY"
+  set_shell_kv "$conf" "SPLUNK_UF_SSL_COMMON_NAME"  "$PRESET_SPLUNK_SSL_CN"
+  set_shell_kv "$conf" "SPLUNK_UF_DEPLOYMENT_SERVER" "$PRESET_SPLUNK_DS"
+
+  # ---- WHIFF non-secret settings -> wade.conf ----
+  set_shell_kv "$conf" "WHIFF_ENABLE" "$WHIFF_ENABLE_EFF"
+  set_shell_kv "$conf" "WHIFF_BIND"   "${WHIFF_BIND:-}"
+  set_shell_kv "$conf" "WHIFF_PORT"   "${WHIFF_PORT:-}"
+  set_shell_kv "$conf" "WHIFF_THREADS" "${WHIFF_THREADS:-}"
+  set_shell_kv "$conf" "WHIFF_CTX"     "${WHIFF_CTX:-}"
+  set_shell_kv "$conf" "INSTALL_PG_LOCAL" "${INSTALL_PG_LOCAL:-}"
+  set_shell_kv "$conf" "DB_HOST" "${DB_HOST:-}"
+  set_shell_kv "$conf" "DB_PORT" "${DB_PORT:-}"
+  set_shell_kv "$conf" "DB_NAME" "${DB_NAME:-}"
+  set_shell_kv "$conf" "DB_USER" "${DB_USER:-}"
+  set_shell_kv "$conf" "ONLINE_MODE" "${ONLINE_MODE:-}"
+  set_shell_kv "$conf" "DL_MODELS_NOW" "${DL_MODELS_NOW:-}"
+  set_shell_kv "$conf" "SEED_BASELINE_DOCS" "${SEED_BASELINE_DOCS:-}"
+  set_shell_kv "$conf" "RUN_INITIAL_CRAWL" "${RUN_INITIAL_CRAWL:-}"
+  set_shell_kv "$conf" "ENABLE_NIGHTLY_BACKFILL" "${ENABLE_NIGHTLY_BACKFILL:-}"
+  set_shell_kv "$conf" "PATCH_WADE_ENV" "${PATCH_WADE_ENV:-}"
+  set_shell_kv "$conf" "PACKAGE_SPLUNK_ADDON" "${PACKAGE_SPLUNK_ADDON:-}"
+
+  # ---- Runtime env “facts” (only if wade.env exists yet) ----
+  if [[ -f "$envf" ]]; then
+    local ipv4_now; ipv4_now="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    set_shell_kv "$envf" "WADE_HOSTNAME"   "$LWADE"
+    set_shell_kv "$envf" "WADE_HOST_IPV4"  "$ipv4_now"
+    set_shell_kv "$envf" "WADE_OWNER_USER" "$LWADEUSER"
+    set_shell_kv "$envf" "WADE_SMB_USERS"  "$SMB_USERS_CSV"
+    set_shell_kv "$envf" "WADE_ALLOW_NETS" "$ALLOW_NETS_CSV"
+
+    if [[ "${WHIFF_ENABLE_EFF:-0}" == "1" && "${PATCH_WADE_ENV:-1}" == "1" ]]; then
+      set_shell_kv "$envf" "WHIFF_BIND_ADDR" "${WHIFF_BIND:-127.0.0.1}"
+      set_shell_kv "$envf" "WHIFF_PORT"      "${WHIFF_PORT:-8088}"
+      set_shell_kv "$envf" "WHIFF_URL"       "http://${WHIFF_BIND:-127.0.0.1}:${WHIFF_PORT:-8088}/annotate"
+    fi
+  fi
+
+  # ---- Secrets (DO NOT put these in wade.conf/wade.env) ----
+  set_secret_kv "$secrets" "PG_DB_PASS" "${PG_DB_PASS:-}"
+  set_secret_kv "$secrets" "DB_PASS"    "${DB_PASS:-}"
+
+  # Intentionally NOT persisting SMB_ALL_PW (don’t store Samba passwords in plaintext).
+}
+
 # ensure_pipx_pkg <package> [install-args...]
 ensure_pipx_pkg() {
   local name="$1"; shift || true
@@ -414,7 +511,7 @@ get_ver_capa_rules(){
 # == WADE Staging Daemon (detector)
 get_ver_wade_stage(){
   local svc="/etc/systemd/system/wade-staging.service"
-  local bin="/opt/wade/stage_daemon.py"
+  local bin="/opt/wade/staging/stage_daemon.py"
   systemctl is-enabled --quiet wade-staging.service >/dev/null 2>&1 || { echo ""; return; }
   [[ -f "$bin" ]] || { echo ""; return; }
   sha256sum "$bin" 2>/dev/null | awk '{print $1}'
@@ -438,8 +535,12 @@ get_ver_plaso_docker(){
 }
 
 # === Staging & Malware Extractor source (from repo) ===
-STAGE_SRC="${SCRIPT_DIR}/staging/stage_daemon.py"
-STAGE_EXPECT_SHA="$(sha256_of "$STAGE_SRC" 2>/dev/null || true)"
+# Deploy staging as a module directory
+ETC_SRC_DIR="${SCRIPT_DIR}/etc"
+ETC_EXPECT_SHA="$(sha256_of "${ETC_SRC_DIR}/config.yaml" 2>/dev/null || true)"
+
+STAGE_SRC_DIR="${SCRIPT_DIR}/staging"
+STAGE_EXPECT_SHA="$(sha256_of "${STAGE_SRC_DIR}/stage_daemon.py" 2>/dev/null || true)"
 
 MWEX_SRC="${SCRIPT_DIR}/malware/wade_mw_extract.py"
 MWEX_EXPECT_SHA="$(sha256_of "$MWEX_SRC" 2>/dev/null || true)"
@@ -607,15 +708,21 @@ mkdir -p "${WADE_ETC}/"{conf.d,modules,json_injection.d} \
          "${WADE_VAR}/"{logs,state,tmp,pkg,tools.d,pipelines.d}
 
 # Preseed wade.conf from repo if present
-if [[ -f "${SCRIPT_DIR}/wade.conf" && ! -f "${WADE_ETC}/wade.conf" ]]; then
-  echo "[*] Using preseeded wade.conf from ${SCRIPT_DIR}"
-  install -m 0644 "${SCRIPT_DIR}/wade.conf" "${WADE_ETC}/wade.conf"
+if [[ -f "${ETC_SRC_DIR}/wade.conf" && ! -f "${WADE_ETC}/wade.conf" ]]; then
+  echo "[*] Using preseeded wade.conf from ${ETC_SRC_DIR}"
+  install -m 0644 "${ETC_SRC_DIR}/wade.conf" "${WADE_ETC}/wade.conf"
 fi
 
 # Preseed wade.env from repo if present
-if [[ -f "${SCRIPT_DIR}/wade.env" && ! -f "${WADE_ETC}/wade.env" ]]; then
-  echo "[*] Using preseeded wade.env from ${SCRIPT_DIR}"
-  install -m 0600 "${SCRIPT_DIR}/wade.env" "${WADE_ETC}/wade.env"
+if [[ -f "${ETC_SRC_DIR}/wade.env" && ! -f "${WADE_ETC}/wade.env" ]]; then
+  echo "[*] Using preseeded wade.env from ${ETC_SRC_DIR}"
+  install -m 0600 "${ETC_SRC_DIR}/wade.env" "${WADE_ETC}/wade.env"
+fi
+
+# Preseed config.yaml from repo if present
+if [[ -f "${ETC_SRC_DIR}/config.yaml" && ! -f "${WADE_ETC}/config.yaml" ]]; then
+  echo "[*] Using preseeded config.yaml from ${ETC_SRC_DIR}"
+  install -m 0600 "${ETC_SRC_DIR}/config.yaml" "${WADE_ETC}/config.yaml"
 fi
 
 # Seed default wade.conf if missing
@@ -796,6 +903,30 @@ fi
 WCONF
 chmod 0644 /etc/whiff/install.conf
 
+# Seed ModuleConfig YAML for workers (new)
+if [[ ! -f "${WADE_ETC}/config.yaml" ]]; then
+  echo "[*] Creating ${WADE_ETC}/config.yaml (ModuleConfig defaults)"
+  install -d -m 0755 "${WADE_ETC}"
+  cat > "${WADE_ETC}/config.yaml" <<'YAML'
+# WADE Tool Configuration (defaults). Override with env WADE_<TOOL>_<KEY>.
+volatility:
+  modules:
+    - windows.info
+    - windows.pslist
+    - windows.pstree
+    - windows.cmdline
+    - windows.netscan
+dissect:
+  windows_plugins:
+    - amcache.general
+    - prefetch
+  linux_plugins:
+    - log.authlog
+    - history.bashhistory
+YAML
+  chmod 0644 "${WADE_ETC}/config.yaml"
+fi
+
 # Seed universal jq injector
 if [[ ! -f "${WADE_ETC}/json_injection.d/00-universal.jq" ]]; then
   cat >"${WADE_ETC}/json_injection.d/00-universal.jq"<<'JQ'
@@ -837,7 +968,7 @@ if (( MEM_GB < 32 )); then
 fi
 
 #####################################
-# NEW: Build the package bundle & install once
+# Build the package bundle & install once
 #####################################
 # Core
 pkg_add samba
@@ -1226,6 +1357,9 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
   confirm "Proceed with installation?" || exit 0
 fi
 
+# Make prompt answers stick (defaults + secrets)
+persist_prompt_answers
+
 ######################
 # Samba non-sense
 ######################
@@ -1385,71 +1519,122 @@ VENV_DIR="/home/${LWADEUSER}/.venvs/wade"
 run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
   set -e
 
-  install -d -m 0755 /opt/wade
-  install -m 0755 "'"$STAGE_SRC"'" /opt/wade/stage_daemon.py
+  install -d -m 0755 /etc/wade
 
-  install -d -m 0755 "/home/'"${LWADEUSER}"'/.venvs"
-  python3 -m venv "'"$VENV_DIR"'"
-  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" "'"$VENV_DIR"'"
+  install -d -m 0755 /opt/wade/staging
+  rsync -a --delete "${STAGE_SRC_DIR}/" /opt/wade/staging/
 
-  "'"$VENV_DIR"'/bin/python" -m pip install -U pip setuptools wheel >/dev/null 2>&1 || true
-  # speed-up: use shared wheelhouse
-  '"pip_cached_install \"$VENV_DIR/bin\" inotify-simple"'
+  install -d -m 0755 "/home/${LWADEUSER}/.venvs"
+  python3 -m venv "${VENV_DIR}"
+  chown -R "${LWADEUSER}:${LWADEUSER}" "${VENV_DIR}"
 
-  "'"$VENV_DIR"'/bin/python" - <<'"'"'PY'"'"'
-import json, os, re, shutil, signal, sqlite3, subprocess, sys, time, string, uuid
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional, Tuple
-from inotify_simple import INotify, flags
-import difflib
-print("WADE staging imports OK from", sys.executable)
+  "${VENV_DIR}/bin/python" -m pip install -U pip setuptools wheel >/dev/null 2>&1 || true
+  # speed-up: use shared wheelhouse (use inotify + PyYAML for staging + workers)
+  pip_cached_install "${VENV_DIR}/bin" inotify PyYAML
+
+  # Smoke test essential imports
+  "${VENV_DIR}/bin/python" - <<PY
+import sys
+try:
+    import inotify.adapters  # provided by "inotify" package
+    ok_inotify = True
+except Exception as e:
+    ok_inotify = False
+    print("[WARN] inotify not available in venv:", e)
+import yaml  # PyYAML
+print("WADE staging venv OK:", sys.executable, "inotify=", ok_inotify)
 PY
 
   install -d -m 0755 /var/wade/logs/stage /var/wade/state
-  chown -R "'"${LWADEUSER}:${LWADEUSER}"'" /var/wade
+  chown -R "${LWADEUSER}:${LWADEUSER}" /var/wade
 
-  STAGING_ROOT="/home/'"${LWADEUSER}"'/'"${WADE_STAGINGDIR}"'"
-  DATAS_ROOT="/home/'"${LWADEUSER}"'/'"${WADE_DATADIR}"'"
+  STAGING_ROOT="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
+  DATAS_ROOT="/home/${LWADEUSER}/${WADE_DATADIR}"
   QUEUE_DIR="${WADE_QUEUE_DIR:-_queue}"
 
-  install -d -o "'"${LWADEUSER}"'" -g "'"${LWADEUSER}"'" -m 0755 \
+  install -d -o "${LWADEUSER}" -g "${LWADEUSER}" -m 0755 \
       "${STAGING_ROOT}/full" "${STAGING_ROOT}/light" \
       "${DATAS_ROOT}/Hosts" "${DATAS_ROOT}/Network" "${DATAS_ROOT}/${QUEUE_DIR}"
 
   cat >/etc/systemd/system/wade-staging.service <<EOF
+# /etc/systemd/system/wade-staging.service
 [Unit]
 Description=WADE Staging Daemon (full vs light)
+Documentation=https://github.com/imcconnell15/WADE
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=/opt/wade/stage_daemon.py
+ConditionPathExists=/opt/wade/staging/stage_daemon.py
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
 User=${LWADEUSER}
 Group=${LWADEUSER}
+# Uncomment if your Splunk UF runs as splunk and you created the group:
+#SupplementaryGroups=splunk
+
+# Environment
 EnvironmentFile=-/etc/wade/wade.env
+EnvironmentFile=-/etc/wade/secrets.env
 Environment=PYTHONUNBUFFERED=1
+# If you want a tag in journald:
+SyslogIdentifier=wade-staging
+
+# Preflight: create dirs and set ownership (runs as root only for these steps)
+PermissionsStartOnly=yes
+ExecStartPre=/bin/sh -lc "set -eu; umask 0002; mkdir -p /var/wade/logs/stage /var/wade/state \"${STAGING_ROOT}/full\" \"${STAGING_ROOT}/light\" \"${DATAS_ROOT}/${QUEUE_DIR}\" \"${DATAS_ROOT}/Hosts\" \"${DATAS_ROOT}/Network\" \"${DATAS_ROOT}/Unknown\" \"${STAGING_ROOT}/ignored\"; chown -R ${LWADEUSER}:${LWADEUSER} \"${STAGING_ROOT}\" \"${DATAS_ROOT}\" /var/wade"
+
 WorkingDirectory=/opt/wade
-ExecStart=${VENV_DIR}/bin/python /opt/wade/stage_daemon.py
+ExecStart=${VENV_DIR}/bin/python -m staging.stage_daemon
+
+# Restart policy
 Restart=on-failure
-RestartSec=3
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Make files group-readable (UF) and keep group on new files/dirs
 UMask=002
+
+# Logging: journald is the default; these are optional
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening (allow writes only where needed)
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=full
+PrivateDevices=yes
+ProtectSystem=strict
 ProtectHome=false
 ReadWritePaths=/home/${LWADEUSER} /var/wade
+# Add /var/log/wade only if the daemon truly writes there:
+#ReadWritePaths=/home/autopsy /var/wade /var/log/wade
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+
+# Process management
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemd_queue_enable wade-staging.service
-  sha256sum /opt/wade/stage_daemon.py | awk '"'"'{print $1}'"'"' > "'"${STEPS_DIR}/wade-stage.ver"'"
-  install -d -m 0755 /home/'"${LWADEUSER}"'/WADE 2>/dev/null || true
-  "'"$VENV_DIR"'/bin/pip" freeze > /home/'"${LWADEUSER}"'/WADE/requirements.lock || true
+  sha256sum /opt/wade/staging/stage_daemon.py | awk "{print \$1}" > "${STEPS_DIR}/wade-stage.ver"
+  install -d -m 0755 "/home/${LWADEUSER}/WADE" 2>/dev/null || true
+  "${VENV_DIR}/bin/pip" freeze > "/home/${LWADEUSER}/WADE/requirements.lock" || true
 ' || fail_note "wade-stage" "service install/start failed"
+
 
 #####################################
 # pipx tools: volatility3 + dissect (consolidated)
@@ -1492,8 +1677,7 @@ exec vol \
 EOF
   chmod 0755 /usr/local/bin/vol3
   VOL_VENV="/opt/pipx/venvs/volatility3"
-  VOL_PYTHON_VER=$("$VOL_VENV/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-  VOL_SITE_PACKAGES="$VOL_VENV/lib/python${VOL_PYTHON_VER}/site-packages/volatility3/symbols"
+  VOL_SITE_PACKAGES="$VOL_VENV/lib/python3*/site-packages/volatility3/symbols"
   mkdir -p "$VOL_SITE_PACKAGES"
   cp /var/wade/vol3/symbols/* "$VOL_SITE_PACKAGES/"
 
@@ -2671,6 +2855,9 @@ ENV
   chown root:"${LWADEUSER}" "$ENV_FILE"
   chmod 0640 "$ENV_FILE"
 fi
+
+# Ensure prompt-chosen keys win even on reruns
+persist_prompt_answers
 
 echo
 echo "[+] WADE install attempted."

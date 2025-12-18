@@ -1,68 +1,60 @@
-#!/usr/bin/env python3
-import os, shutil, subprocess
+from __future__ import annotations
+import json
 from pathlib import Path
-from typing import List, Dict, Tuple
 
 from .base import BaseWorker, WorkerResult
-from .utils import wade_paths, now_iso
+from .module_config import get_global_config
+from .subprocess_utils import run_tool
+from .logging import EventLogger
+from .ticket_schema import WorkerTicket
+from .path_resolver import compute_worker_output_paths
 
-def _be_cmd(env: Dict[str,str]) -> str:
-    return env.get("BULK_EXTRACTOR_CMD") or (shutil.which("bulk_extractor") and "bulk_extractor") or "bulk_extractor"
+DEFAULT_SCANNERS = ["email","url","ccn","telephone","base64"]
 
 class BulkExtractorWorker(BaseWorker):
-    tool = "bulkextractor"
-    module = "features"
-    help_text = "Run bulk_extractor to carve feature files; we emit a summary JSON."
+    tool = "bulk_extractor"
+    module = "scan"
 
-    def _host_and_img(self, ticket) -> Tuple[str, Path]:
-        host = ticket.get("host") or self.env.get("WADE_HOSTNAME","host")
-        p = Path(ticket.get("dest_path") or ticket.get("path") or "")
-        if not p.exists():
-            raise FileNotFoundError(f"artifact not found: {p}")
-        return host, p
+    def __init__(self, env=None, config=None):
+        super().__init__(env, config)
+        self.logger = EventLogger.get_logger("bulk_extractor_worker")
+        self.cfg = get_global_config()
 
-    def _append_log(self, host: str, text: str):
-        _, log_dir = wade_paths(self.env, host, self.tool, self.module)
-        with open(log_dir / f"{self.tool}_{self.module}.log", "a", encoding="utf-8") as fh:
-            fh.write(text.rstrip() + "\n")
+    def run(self, ticket_dict: dict) -> WorkerResult:
+        ticket = WorkerTicket.from_dict(ticket_dict)
+        host = ticket.metadata.hostname or "unknown_host"
+        target = Path(ticket.metadata.dest_path)
+        if not target.exists():
+            return WorkerResult(path=None, count=0, errors=[f"Input not found: {target}"])
 
-    def run(self, ticket: dict) -> WorkerResult:
-        host, f = self._host_and_img(ticket)
-        be = _be_cmd(self.env)
-        if not shutil.which(be):
-            return WorkerResult(None, 0, [f"bulk_extractor not found (BULK_EXTRACTOR_CMD={be})"])
+        scanners = self.cfg.get_modules("bulk_extractor", key="scanners", default=DEFAULT_SCANNERS)
+        disabled = set(self.cfg.get_modules("bulk_extractor", key="disabled_scanners", default=[]))
+        scanners = [s for s in scanners if s not in disabled]
 
-        # Put BE output in the same wade_ tree for traceability
-        out_dir, _ = wade_paths(self.env, host, self.tool, self.module)
-        be_out = out_dir / f"be_{int(os.stat(f).st_mtime)}"
-        be_out.mkdir(parents=True, exist_ok=True)
+        self.logger.log_worker_start(self.tool, host=host, image_path=str(target))
+        outdir, outfile = compute_worker_output_paths(ticket, self.tool, self.module, self.env)
 
-        args = [be, "-o", str(be_out), str(f)]
-        self._append_log(host, f"{now_iso()} running: {' '.join(args)}")
+        tmp_dir = outdir / "be_tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        args = ["-o", str(tmp_dir)]
+        for s in scanners:
+            args += ["-S", s]
+        args += [str(target)]
+
         try:
-            cp = subprocess.run(args, capture_output=True, text=True, check=False)
+            run_tool("bulk_extractor", args, timeout=3600, check=True)
+            # Convert be output (feature files) to JSONL envelope quickly
+            count = 0
+            with open(outfile, "w", encoding="utf-8") as dst:
+                env = ticket.get_artifact_envelope(self.tool, self.module)
+                for f in tmp_dir.glob("*.txt"):
+                    for line in f.read_text(errors="ignore").splitlines():
+                        if not line.strip():
+                            continue
+                        rec = {"source": f.name, "data": line}
+                        dst.write(json.dumps({**env, **rec}, ensure_ascii=False) + "\n")
+                        count += 1
+            self.logger.log_worker_complete(self.tool, host=host, module=self.module, record_count=count, output_path=outfile)
+            return WorkerResult(path=outdir, count=count)
         except Exception as e:
-            return WorkerResult(None, 0, [f"spawn: {e!r}"])
-
-        errors: List[str] = []
-        if cp.returncode != 0:
-            errors.append(f"rc={cp.returncode} stderr={cp.stderr.strip()[:4000]}")
-
-        # Summarize feature files present
-        feats = []
-        for ff in sorted(be_out.glob("*.txt")):
-            try:
-                size = ff.stat().st_size
-            except Exception:
-                size = 0
-            feats.append({"file": ff.name, "bytes": size})
-
-        rec = {
-            "ts": now_iso(),
-            "be_out_dir": str(be_out),
-            "feature_files": feats,
-            "stderr": cp.stderr.strip() if cp.stderr else "",
-            "rc": cp.returncode,
-        }
-        out, cnt = self.run_records(host, [rec], str(f))
-        return WorkerResult(out, cnt, errors)
+            return WorkerResult(path=None, count=0, errors=[f"bulk_extractor failed: {e}"])

@@ -1,551 +1,418 @@
-#!/usr/bin/env python3
 """
-WADE Dissect worker
+WADE Dissect Worker
 
-- Run `target-info -J` to capture OS + target metadata.
-- Use OS family (windows/linux/etc.) to select a plugin bundle.
-- Run `target-query -q -f <plugin> <image> | rdump -J`.
-- Ingest JSONL output into WADE via run_records() for Splunk.
+Runs Dissect target-query plugins against disk images and VM containers.
+Supports OS-specific plugin bundles configurable via YAML and environment.
 
-You can override the plugin bundles via:
-  - ticket["plugins"]  (list or comma-separated string)
-  - env DISSECT_PLUGINS_WINDOWS / DISSECT_PLUGINS_LINUX
+Configuration:
+  YAML (wade_config.yaml):
+    dissect:
+      windows_plugins:
+        - amcache.general
+        - prefetch
+        - regf.shellbags
+      linux_plugins:
+        - log.authlog
+        - history.bashhistory
+      disabled_windows_plugins:
+        - prefetch
+  
+  Environment:
+    WADE_DISSECT_WINDOWS_PLUGINS="+regf.runkeys,-prefetch"
+    WADE_DISSECT_LINUX_PLUGINS="log.authlog,log.syslog,cronjobs.cronjobs"
 """
-
 import json
-import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 from .base import BaseWorker, WorkerResult
-from .utils import wade_paths, now_iso
+from .subprocess_utils import run_tool, safe_run, get_default_registry, ToolNotFoundError, CommandExecutionError
+from .logging import EventLogger, finalize_worker_records
+from .module_config import get_global_config
 
 
-def _cmd_target_info(env: Dict[str, str]) -> str:
-    """Resolve the target-info command (allow override via env)."""
-    return env.get("DISSECT_TARGET_INFO_CMD") or shutil.which("target-info") or "target-info"
-
-
-def _cmd_target_query(env: Dict[str, str]) -> str:
-    """Resolve the target-query command (allow override via env)."""
-    return env.get("DISSECT_TARGET_QUERY_CMD") or shutil.which("target-query") or "target-query"
-
-
-def _cmd_rdump(env: Dict[str, str]) -> str:
-    """Resolve the rdump command (allow override via env)."""
-    return env.get("DISSECT_RDUMP_CMD") or shutil.which("rdump") or "rdump"
-
-
-# ---------------------------------------------------------------------------
 # Default plugin bundles
-#
-# These are *starting points* — tune them to match the output of
-# `target-query -l` in your environment. You can also override them
-# via DISSECT_PLUGINS_WINDOWS / DISSECT_PLUGINS_LINUX or ticket["plugins"].
-# ---------------------------------------------------------------------------
-
-WINDOWS_DEFAULT_PLUGINS: List[str] = [
-    # OS / general telemetry
-    "generic.activity",          # last seen activity (filesystem timeline-ish)
-    "generic.install_date",      # OS install date
-
-    # Execution / usage
+DEFAULT_WINDOWS_PLUGINS = [
+    # Execution
     "amcache.general",
-    "amcache.applications",
-    "amcache.files",
     "prefetch",
     "regf.userassist",
     "regf.shellbags",
     "regf.shimcache",
-
-    # Persistence / configuration
+    
+    # Persistence
     "regf.runkeys",
     "services.services",
     "tasks.tasks",
-    "startupinfo.startupinfo",
-
-    # User activity & artifacts
+    
+    # User activity
     "lnk.lnk",
     "jumplist.automatic_destination",
-    "jumplist.custom_destination",
     "recyclebin.recyclebin",
-
-    # Logging / timeline
+    
+    # Logs
     "log.evtx.evtx",
-    "log.evt.evt",
     "firewall.logs",
-    "sru.application_timeline",
-
-    # Anti Virus
-    "mcafee.msc",
-    "sophos.hitmanlogs",
-    "sophos.sophoshomelogs",
-    "symantec.firewall",
-    "symantec.logs",
-    "trendmicro.wffirewall",
-    "trendmicro.wflogs",
-
-    # --- browsers ---
-    "brave.cookies",
-    "brave.downloads",
-    "brave.extensions",
-    "brave.history",
-    "brave.passwords",
-
-    "browser.cookies",
-    "browser.downloads",
-    "browser.extensions",
+    
+    # Browsers
     "browser.history",
-    "browser.passwords",
-
-    "chrome.cookies",
-    "chrome.downloads",
-    "chrome.extensions",
-    "chrome.history",
-    "chrome.passwords",
-
-    "chromium.cookies",
-    "chromium.downloads",
-    "chromium.extensions",
-    "chromium.history",
-    "chromium.passwords",
-
-    "edge.cookies",
-    "edge.downloads",
-    "edge.extensions",
-    "edge.history",
-    "edge.passwords",
-
-    "firefox.cookies",
-    "firefox.downloads",
-    "firefox.extensions",
-    "firefox.history",
-    "firefox.passwords",
-
-    "iexplore.downloads",
-    "iexplore.history",
-
-    # --- chat ---
-    "chat.history",
-    "msn.history",
-
-    # --- containers ---
-    "container.containers",
-    "container.images",
-    "container.logs",
-    "docker.containers",
-    "docker.images",
-    "docker.logs",
-    "podman.containers",
-    "podman.images",
-    "podman.logs",
-
-    # --- text editors ---
-    "editor.extensions",   # (appears twice; kept once)
-    "editor.history",
-    "editor.tabs",
-    "windowsnotepad.history",
-    "windowsnotepad.tabs",
-
-    # --- EDR / acquire / velociraptor results ---
-    "acquire.handles",
-    "acquire.hashes",
-    "velociraptor.results",
-
-    # --- misc "other" apps ---
-    "envfile",
-
-    # --- productivity / Office / archivers ---
-    "msoffice.native",
-    "msoffice.startup",
-    "msoffice.web",
-    "7zip",
-    "sevenzip",
-    "winrar",
-
-    # --- remote access / RMM ---
-    "anydesk.filetransfer",
-    "anydesk.logs",
-    "remoteaccess.filetransfer",
-    "remoteaccess.logs",
-    "rustdesk.logs",
-    "splashtop.filetransfer",
-    "splashtop.logs",
-    "teamviewer.logs",
-
-    # --- shells / CLI helpers ---
-    "powershell_history",
-    "wget.hsts",
-
-    # --- SSH / key material / sessions ---
-    "openssh.authorized_keys",
-    "openssh.known_hosts",
-    "openssh.private_keys",
-    "openssh.public_keys",
-
-    "opensshd.config",
-
-    "putty.known_hosts",
-    "putty.sessions",
-
-    "ssh.authorized_keys",
-    "ssh.config",
-    "ssh.known_hosts",
-    "ssh.private_keys",
-    "ssh.public_keys",
-    "ssh.sessions",
-
-    # --- virtualization clients / workstation side ---
-    "vmware.clipboard",
-    "vmware.config",
-    "vmware.draganddrop",
-
-    # --- VPN client configs ---
-    "openvpn.config",
-    "wireguard.config",
-
-    # --- hosting panels ---
-    "cpanel.lastlogin",
-
-    # --- webservers (app layer) ---
-    "apache.access",
-    "apache.error",
-    "apache.hosts",
-
-    "caddy.access",
-
-    "iis.access",
-    "iis.logs",
-
-    "nginx.access",
-    "nginx.error",
-    "nginx.hosts",
-
-    "webserver.access",
-    "webserver.error",
-    "webserver.hosts",
-    "webserver.logs",
+    "browser.downloads",
+    "browser.cookies",
 ]
 
-LINUX_DEFAULT_PLUGINS: List[str] = [
-    # Auth / sessions / system logs
+DEFAULT_LINUX_PLUGINS = [
+    # Auth/logs
     "log.authlog",
-    "log.securelog",
-    "log.messages",
     "log.syslog",
-    "log.journal",
     "log.lastlog",
-    "log.utmp.utmp",
-    "log.utmp.wtmp",
-
-    # Packages / updates
-    "debian.apt.logs",
-    "debian.dpkg.log",
-    "debian.dpkg.status",
-    "redhat.yum.logs",
-    "suse.zypper.logs",
-    "packagemanager.logs",
-
-    # Processes / services / sockets
-    "linux.processes.processes",
-    "linux.services.services",
-    "linux.sockets.tcp",
-    "linux.sockets.udp",
-    "linux.sockets.unix",
-
-    # Shell / schedule / user activity
+    
+    # Shell history
     "history.bashhistory",
+    
+    # Scheduled tasks
     "cronjobs.cronjobs",
-    "recentlyused.recently_used",
-
-    # Network / firewall
-    "linux.iptables.iptables",
+    
+    # Network
     "linux.network.interfaces",
-    "linux.network.dns",
-    "linux.network.gateways",
-    "linux.network.ips",
-    "linux.network.macs",
-
-    # Containers / webservers
-    "container.containers",
-    "container.images",
-    "container.logs",
-    "webserver.access",
-    "webserver.error",
-    "webserver.logs",
+    "linux.iptables.iptables",
+    
+    # Packages
+    "debian.dpkg.status",
+    "packagemanager.logs",
 ]
 
 
 class DissectWorker(BaseWorker):
+    """Worker for running Dissect forensic analysis."""
+    
     tool = "dissect"
-    module = "target-info"  # primary "module" name for logging
-    help_text = (
-        "Run Dissect target-info and OS-specific target-query plugins, "
-        "outputting JSON records suitable for Splunk."
-    )
+    module = "target-query"
+    help_text = "Run Dissect target-info and OS-specific target-query plugins."
 
-    # ------------------------------------------------------------------
-    # Small helpers
-    # ------------------------------------------------------------------
-
-    def _host_and_img(self, ticket: dict) -> Tuple[str, Path]:
-        # Resolve image path from ticket
-        p = Path(ticket.get("dest_path") or ticket.get("path") or "")
-        if not p.exists():
-            raise FileNotFoundError(f"target not found: {p}")
-        host = ticket.get("host") or p.parent.name or self.env.get("WADE_HOSTNAME", "host")
-        return host, p
-
-    def _append_log(self, host: str, text: str) -> None:
-        _, log_dir = wade_paths(self.env, host, self.tool, self.module)
-        log_path = log_dir / f"{self.tool}_{self.module}.log"
-        prev = ""
-        if log_path.exists():
-            prev = log_path.read_text(encoding="utf-8", errors="ignore")
-        log_path.write_text(prev + text.rstrip() + "\n", encoding="utf-8")
-
-    # ------------------------------------------------------------------
-    # target-info: OS + metadata
-    # ------------------------------------------------------------------
-
-    def _get_target_info(
-
-        stdout = cp.stdout.strip()
-        if not stdout:
-            errors.append("target-info produced no output")
-            return None, 0
-
-        info = None
-        for ln in stdout.splitlines():
-            ln = ln.strip()
-            if not ln:
-                continue
+    def __init__(self, env=None, config=None):
+        super().__init__(env, config)
+        self.logger = EventLogger.get_logger("dissect_worker")
+        self.module_config = get_global_config()
+        
+        # Verify dissect tools are available
+        for tool_name in ["target-info", "target-query", "rdump"]:
             try:
-                info = json.loads(ln)
-                break
-            except Exception:
-                # Not JSON; likely a log line. Keep going.
-                continue
+                get_default_registry().require_tool(tool_name)
+            except ToolNotFoundError:
+                self.logger.log_event(
+                    f"worker.dissect.tool_missing",
+                    status="warning",
+                    tool=tool_name,
+                    message=f"{tool_name} not found - dissect functionality may be limited"
+                )
 
-        if info is None:
-            errors.append("target-info JSON parse error: no JSON object found in stdout")
-            return None, 0
+    def _resolve_host_and_image(self, ticket: dict) -> Tuple[str, Path]:
+        """Extract host and image path from ticket."""
+        path_str = ticket.get("dest_path") or ticket.get("path") or ticket.get("image_path")
+        if not path_str:
+            raise ValueError("No image path specified in ticket")
+        
+        img_path = Path(path_str)
+        if not img_path.exists():
+            raise FileNotFoundError(f"Target image not found: {img_path}")
+        
+        # Try to derive host from ticket or path
+        host = (
+            ticket.get("host")
+            or img_path.parent.name
+            or self.env.get("WADE_HOSTNAME", "unknown_host")
+        )
+        
+        return host, img_path
 
-        if cp.returncode != 0:
-            errors.append(f"target-info rc={cp.returncode} stderr={cp.stderr.strip()[:4000]}")
-            return None, 0
-
-        stdout = cp.stdout.strip()
-        if not stdout:
-            errors.append("target-info produced no output")
-            return None, 0
-
-        first_line = stdout.splitlines()[0]
+    def _get_target_info(self, image_path: Path, host: str) -> Tuple[Dict, str]:
+        """Run target-info to get OS and metadata.
+        
+        Args:
+            image_path: Path to target image
+            host: Hostname for logging
+        
+        Returns:
+            Tuple of (info_dict, os_family)
+            Returns ({}, "") on error
+        """
+        self.logger.log_event(
+            "worker.dissect.target_info_start",
+            host=host,
+            image_path=str(image_path),
+        )
+        
         try:
-            info = json.loads(first_line)
-        except Exception as e:
-            errors.append(f"target-info JSON parse error: {e!r}")
-            return None, 0
+            result = run_tool(
+                "target-info",
+                ["-J", str(image_path)],
+                timeout=60,
+                check=False,
+            )
+        except ToolNotFoundError as e:
+            self.logger.log_worker_error("dissect", str(e), module="target-info", host=host)
+            return {}, ""
+        
+        if not result.success:
+            self.logger.log_worker_error(
+                "dissect",
+                f"target-info failed: {result.truncated_stderr()}",
+                module="target-info",
+                host=host,
+                returncode=result.rc,
+            )
+            return {}, ""
+        
+        # Parse JSON output
+        try:
+            # target-info may output multiple lines; take first JSON object
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line and line.startswith("{"):
+                    info = json.loads(line)
+                    break
+            else:
+                info = {}
+        except json.JSONDecodeError:
+            self.logger.log_worker_error(
+                "dissect",
+                "Failed to parse target-info JSON",
+                module="target-info",
+                host=host,
+            )
+            return {}, ""
+        
+        # Extract OS family (schema varies by dissect version)
+        os_family = str(
+            info.get("os_family")
+            or info.get("os", {}).get("family")
+            or info.get("system", {}).get("os_family")
+            or ""
+        ).lower()
+        
+        self.logger.log_classification(
+            image_path,
+            classification=f"dissect_{os_family}" if os_family else "dissect_unknown",
+            os_family=os_family,
+        )
+        
+        return info, os_family
 
-        rec = {
-            "ts": now_iso(),
-            "tool": "dissect",
-            "module": "target-info",
-            "image_path": str(img),
-            "info": info,
-        }
-        _, cnt = self.run_records(host, [rec], str(img))
-        return info, cnt
-
-    # ------------------------------------------------------------------
-    # Plugin selection
-    # ------------------------------------------------------------------
-
-    def _plugins_for_os(self, os_family: str, ticket: dict) -> List[str]:
-        """
-        Decide which target-query plugins to run.
-
+    def _get_plugins(self, os_family: str, ticket: dict) -> List[str]:
+        """Get plugin list based on OS family.
+        
         Priority:
-          1) ticket["plugins"] (list or comma-separated string)
-          2) env DISSECT_PLUGINS_WINDOWS / DISSECT_PLUGINS_LINUX
-          3) built-in defaults per OS family
+          1. ticket["plugins"] (explicit override)
+          2. Environment variable
+          3. YAML config
+          4. Default plugin bundles
+        
+        Args:
+            os_family: OS family from target-info ("windows", "linux", etc.)
+            ticket: Worker ticket (may contain plugins override)
+        
+        Returns:
+            List of plugin names
         """
-        # Explicit override on the ticket
+        # Explicit ticket override
         if "plugins" in ticket:
             val = ticket["plugins"]
             if isinstance(val, str):
                 return [p.strip() for p in val.split(",") if p.strip()]
             if isinstance(val, (list, tuple)):
-                return [str(p).strip() for p in val if str(p).strip()]
-
-        os_key = (ticket.get("os_family") or ticket.get("os") or os_family or "").lower()
-
-        if "win" in os_key:
-            env_val = self.env.get("DISSECT_PLUGINS_WINDOWS")
-            if env_val:
-                return [p.strip() for p in env_val.split(",") if p.strip()]
-            return WINDOWS_DEFAULT_PLUGINS
-
-        if "linux" in os_key or "unix" in os_key:
-            env_val = self.env.get("DISSECT_PLUGINS_LINUX")
-            if env_val:
-                return [p.strip() for p in env_val.split(",") if p.strip()]
-            return LINUX_DEFAULT_PLUGINS
-
-        # Unknown OS family – caller can still override via ticket["plugins"]
-        return []
-
-    # ------------------------------------------------------------------
-    # target-query + rdump for a single plugin
-    # ------------------------------------------------------------------
+                return [str(p) for p in val if str(p).strip()]
+        
+        # Determine OS-specific key
+        if "win" in os_family:
+            key = "windows_plugins"
+            default = DEFAULT_WINDOWS_PLUGINS
+        elif "linux" in os_family or "unix" in os_family:
+            key = "linux_plugins"
+            default = DEFAULT_LINUX_PLUGINS
+        else:
+            # Unknown OS - no defaults
+            self.logger.log_event(
+                "worker.dissect.unknown_os",
+                status="warning",
+                os_family=os_family,
+                message="No default plugins for this OS family"
+            )
+            return []
+        
+        # Get from config with env override
+        return self.module_config.get_modules(
+            tool="dissect",
+            key=key,
+            default=default,
+        )
 
     def _run_plugin(
         self,
-        host: str,
-        img: Path,
         plugin: str,
-        errors: List[str],
+        image_path: Path,
+        host: str,
         os_family: str,
-    ) -> int:
+    ) -> Tuple[List[dict], str]:
+        """Run a single target-query plugin.
+        
+        Args:
+            plugin: Plugin name (e.g., "prefetch")
+            image_path: Path to target image
+            host: Hostname for logging
+            os_family: OS family for metadata
+        
+        Returns:
+            Tuple of (parsed_records, error_message)
         """
-        Run a single target-query plugin and feed JSONL into run_records().
-
-        Returns number of records ingested.
-        """
-        tq_cmd = _cmd_target_query(self.env)
-        rd_cmd = _cmd_rdump(self.env)
-
-        # If commands are missing, record an error and bail.
-        if not shutil.which(tq_cmd):
-            errors.append(f"target-query command '{tq_cmd}' not found in PATH")
-            return 0
-        if not shutil.which(rd_cmd):
-            errors.append(f"rdump command '{rd_cmd}' not found in PATH")
-            return 0
-
-        tq_args = [tq_cmd, "-q", "-f", plugin, str(img)]
-        self._append_log(host, f"{now_iso()} running: {' '.join(tq_args)} | {rd_cmd} -J")
-
-        # First stage: target-query
+        self.logger.log_event(
+            "worker.dissect.plugin_start",
+            plugin=plugin,
+            host=host,
+            image_path=str(image_path),
+        )
+        
+        # Run target-query | rdump pipeline
         try:
-            cp1 = subprocess.run(
-                tq_args,
-                capture_output=True,
-                text=True,
+            # Stage 1: target-query
+            tq_result = run_tool(
+                "target-query",
+                ["-q", "-f", plugin, str(image_path)],
+                timeout=180,
                 check=False,
             )
-        except Exception as e:
-            errors.append(f"{plugin}: target-query spawn error: {e!r}")
-            return 0
-
-        if cp1.returncode != 0:
-            stderr = (cp1.stderr or "").strip()
-            errors.append(f"{plugin}: target-query rc={cp1.returncode} stderr={stderr[:4000]}")
-            return 0
-
-        if not cp1.stdout.strip():
-            # No records for this plugin is fine.
-            return 0
-
-        # Second stage: rdump -J to convert records to JSONL
-        try:
-            cp2 = subprocess.run(
-                [rd_cmd, "-J"],
-                input=cp1.stdout,
+            
+            if not tq_result.success:
+                error = f"target-query failed: {tq_result.truncated_stderr()}"
+                return [], error
+            
+            if not tq_result.stdout.strip():
+                # No records - not necessarily an error
+                return [], ""
+            
+            # Stage 2: rdump -J to convert to JSONL
+            rd_result = safe_run(
+                ["rdump", "-J"],
+                timeout=60,
+                check=False,
+                log_output=False,
+            )
+            # Feed target-query output to rdump stdin
+            proc = subprocess.run(
+                ["rdump", "-J"],
+                input=tq_result.stdout,
                 capture_output=True,
                 text=True,
-                check=False,
+                timeout=60,
             )
+            
+            if proc.returncode != 0:
+                error = f"rdump failed: rc={proc.returncode}"
+                return [], error
+            
+            # Parse JSONL output
+            records = []
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    # Annotate with metadata
+                    obj["_plugin"] = plugin
+                    obj["_os_family"] = os_family
+                    records.append(obj)
+                except json.JSONDecodeError:
+                    continue
+            
+            self.logger.log_event(
+                "worker.dissect.plugin_complete",
+                status="success",
+                plugin=plugin,
+                host=host,
+                record_count=len(records),
+            )
+            
+            return records, ""
+            
+        except ToolNotFoundError as e:
+            return [], str(e)
+        except subprocess.TimeoutExpired:
+            return [], f"{plugin}: timeout after 180s"
         except Exception as e:
-            errors.append(f"{plugin}: rdump spawn error: {e!r}")
-            return 0
-
-        if cp2.returncode != 0:
-            stderr = (cp2.stderr or "").strip()
-            errors.append(f"{plugin}: rdump rc={cp2.returncode} stderr={stderr[:4000]}")
-            return 0
-
-        lines = [ln.strip() for ln in (cp2.stdout or "").splitlines() if ln.strip()]
-        if not lines:
-            return 0
-
-        recs: List[dict] = []
-        for ln in lines:
-            try:
-                obj = json.loads(ln)
-            except Exception as e:
-                errors.append(f"{plugin}: JSON parse error: {e!r}")
-                continue
-
-            # Annotate for WADE/Splunk context
-            obj["_tool"] = "dissect"
-            obj["_module"] = "target-query"
-            obj["_plugin"] = plugin
-            obj["_image_path"] = str(img)
-            if os_family:
-                obj["_os_family"] = os_family
-            obj["_wade_ts"] = now_iso()
-            recs.append(obj)
-
-        if not recs:
-            return 0
-
-        _, cnt = self.run_records(host, recs, str(img))
-        return cnt
-
-    # ------------------------------------------------------------------
-    # Main entrypoint
-    # ------------------------------------------------------------------
+            return [], f"{plugin}: {e}"
 
     def run(self, ticket: dict) -> WorkerResult:
-        """
-        Full workflow:
-
-          1) Resolve host + image.
-          2) Run target-info -J, store metadata record.
-          3) Derive os_family from target-info (or ticket).
-          4) Determine plugin set.
-          5) Run each plugin through target-query | rdump -J and ingest JSONL.
+        """Execute Dissect worker.
+        
+        Workflow:
+          1. Run target-info to get OS
+          2. Select plugin bundle for OS
+          3. Run each plugin via target-query | rdump
+          4. Write JSONL records
+        
+        Args:
+            ticket: Worker ticket
+        
+        Returns:
+            WorkerResult with execution summary
         """
         errors: List[str] = []
-
-        host, img = self._host_and_img(ticket)
-
-        # 1) target-info
-        info, meta_cnt = self._get_target_info(host, img, errors)
-        os_family = ""
-        if isinstance(info, dict):
-            # target-info JSON schema may vary; be defensive.
-            os_family = str(
-                info.get("os_family")
-                or info.get("os", {}).get("family")
-                or info.get("system", {}).get("os_family")
-                or ""
-            )
-
-        # Fallback to ticket fields if needed
-        if not os_family:
-            os_family = str(ticket.get("os_family") or ticket.get("os") or "")
-
-        # 2) plugin bundle
-        plugins = self._plugins_for_os(os_family, ticket)
-        total_cnt = meta_cnt
-
+        
+        try:
+            host, img_path = self._resolve_host_and_image(ticket)
+        except (ValueError, FileNotFoundError) as e:
+            errors.append(str(e))
+            return WorkerResult(path=None, count=0, errors=errors)
+        
+        self.logger.log_worker_start("dissect", host=host, image_path=str(img_path))
+        
+        # Get target info and OS
+        info, os_family = self._get_target_info(img_path, host)
+        
+        # Get plugins for OS
+        plugins = self._get_plugins(os_family, ticket)
         if not plugins:
-            errors.append(
-                f"no plugin bundle selected for os_family={os_family!r}; "
-                "only target-info metadata was collected"
-            )
-            return WorkerResult(None, total_cnt, errors)
-
-        # 3) run plugins
+            msg = "No plugins configured for OS family: {os_family}"
+            errors.append(msg)
+            self.logger.log_worker_error("dissect", msg, host=host, os_family=os_family)
+            return WorkerResult(path=None, count=0, errors=errors)
+        
+        # Run plugins
+        total_records = 0
+        output_dir, _ = self._get_output_paths(host)
+        
         for plugin in plugins:
-            try:
-                total_cnt += self._run_plugin(host, img, plugin, errors, os_family)
-            except Exception as e:
-                errors.append(f"{plugin}: unexpected exception: {e!r}")
-
-        # We don't rely on WorkerResult.out for anything in WADE right now,
-        # so returning None here is fine.
-        return WorkerResult(None, total_cnt, errors)
+            records, error = self._run_plugin(plugin, img_path, host, os_family)
+            
+            if error:
+                errors.append(f"{plugin}: {error}")
+            
+            if records:
+                output_file = output_dir / f"{plugin.replace('.', '_')}.jsonl"
+                count = finalize_worker_records(
+                    records,
+                    output_path=output_file,
+                    tool="dissect",
+                    module=plugin,
+                    host=host,
+                    metadata={
+                        "image_path": str(img_path),
+                        "os_family": os_family,
+                    },
+                )
+                total_records += count
+        
+        self.logger.log_worker_complete(
+            "dissect",
+            host=host,
+            record_count=total_records,
+            output_path=output_dir,
+        )
+        
+        return WorkerResult(path=output_dir, count=total_records, errors=errors)
+    
+    def _get_output_paths(self, host: str) -> Tuple[Path, Path]:
+        """Get output and log directories."""
+        from .utils import wade_paths
+        return wade_paths(self.env, host, self.tool, self.module)
