@@ -1,3 +1,5 @@
+#dated, needs update form install.sh
+
 # /etc/systemd/system/wade-staging.service
 [Unit]
 Description=WADE Staging Daemon (full vs light)
