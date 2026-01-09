@@ -1,0 +1,26 @@
+<form>
+  <label>Ask Whiff</label>
+  <fieldset submitButton="true">
+    <input type="text" token="q"><label>Question</label></input>
+  </fieldset>
+  <row>
+    <panel>
+      <title>Answer</title>
+      <search>
+        <query>| makeresults | eval ans=rest("http://127.0.0.1:8088/ask", "{\"query\":\"$q$\"}")</query>
+      </search>
+      <html>
+        <![CDATA[
+        <div style="white-space:pre-wrap" id="ans"></div>
+        <script>
+          const v = Splunk.util.getCurrentSearchManager().data("results");
+          v.on("data", ()=> {
+            const row = v.data().rows?.[0]?.[0] || "";
+            document.getElementById("ans").textContent = row;
+          });
+        </script>
+        ]]>
+      </html>
+    </panel>
+  </row>
+</form>

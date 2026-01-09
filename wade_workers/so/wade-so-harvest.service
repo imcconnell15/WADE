@@ -1,0 +1,10 @@
+[Unit]
+Description=WADE SO Harvester (copy pcaps/logs to WADE)
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+EnvironmentFile=-/etc/wade/wade.env
+WorkingDirectory=/opt/wade/WADE
+ExecStart=/usr/bin/env python3 /opt/wade/WADE/so/so2wade_harvest.py

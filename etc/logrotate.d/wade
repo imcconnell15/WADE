@@ -1,0 +1,10 @@
+/var/log/wade/*.log /var/log/wade/*.jsonl {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    missingok
+    copytruncate
+    # No create directive needed with copytruncate
+}
