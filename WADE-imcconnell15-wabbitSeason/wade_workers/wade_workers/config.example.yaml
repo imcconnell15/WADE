@@ -1,0 +1,23 @@
+# Default WADE worker config (safe, minimal)
+volatility:
+  modules:
+    - windows.info
+    - windows.pslist
+    - windows.pstree
+    - windows.cmdline
+    - windows.netscan
+    - windows.handles
+    - windows.dlllist
+    - windows.services
+    - windows.malfind
+
+yara:
+  ruleset: /opt/wade/yara/packed_rules.yar
+
+splunk:
+  enabled: false
+  rest_url: ""   # e.g., https://splunk.example.org:8089
+  token: ""      # e.g., Splunk <mgmt_token>
+  timeout_sec: 4
+  # search template may use {image_path}
+  search: 'search index=wade_* wade.image_path="{image_path}" earliest=-30d | head 1'

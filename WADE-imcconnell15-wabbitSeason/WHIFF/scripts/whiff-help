@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+API="${WHIFF_API:-http://127.0.0.1:8088/annotate}"
+IN="${1:-/var/wade/json/in.jsonl}"
+OUT="${2:-/var/wade/json/out.with_help.jsonl}"
+TMP="$(mktemp)"
+
+jq -c 'def ann:
+  . as $ev
+  | (curl -s -X POST "'"$API"'" -H "Content-Type: application/json" -d ({"event":$ev}|tojson))
+  | .help;
+  . + {help:(ann)}' "$IN" > "$TMP"
+
+mv "$TMP" "$OUT"
+echo "Wrote $OUT"

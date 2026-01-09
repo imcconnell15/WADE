@@ -1,0 +1,7 @@
+<nav>
+  <view name="search" default="true" label="Search" />
+  <collection label="WADE">
+    <view name="wade_health" label="Data Health" />
+    <view name="wade_overview" label="Overview" />
+  </collection>
+</nav>
