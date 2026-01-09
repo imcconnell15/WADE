@@ -200,6 +200,52 @@ set_secret_kv() {
   (( had_xtrace )) && set -x || true
 }
 
+read_env_kv() {
+  # Read KEY="value" from a shell-style env file without sourcing it.
+  # Returns empty string if missing.
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  sed -nE "s/^${key}=\"(.*)\"$/\1/p" "$file" | tail -n 1
+}
+
+ensure_whiff_db_pass() {
+  # Ensure WHIFF_DB_PASS is set (prefer existing secret if present); generate if missing/placeholder.
+  # IMPORTANT: Do NOT consume or delete PG_DB_PASS here — that is for Autopsy Postgres user.
+  local WADE_ETC="${WADE_ETC:-/etc/wade}"
+  local secrets="${WADE_ETC}/secrets.env"
+  local cur=""
+
+  # Prefer already-set WHIFF_DB_PASS
+  cur="${WHIFF_DB_PASS:-}"
+  if [[ -z "$cur" || "$cur" == "CHANGE_ME" ]]; then
+    cur="$(read_env_kv "$secrets" "WHIFF_DB_PASS")"
+  fi
+
+  # Legacy WHIFF installs may have used DB_PASS (WHIFF DB password). Migrate from that only.
+  if [[ -z "$cur" || "$cur" == "CHANGE_ME" ]]; then
+    cur="${DB_PASS:-}"
+  fi
+  if [[ -z "$cur" || "$cur" == "CHANGE_ME" ]]; then
+    cur="$(read_env_kv "$secrets" "DB_PASS")"
+  fi
+
+  # If still empty, generate a new one.
+  if [[ -z "$cur" || "$cur" == "CHANGE_ME" ]]; then
+    cur="$(tr -dc 'A-Za-z0-9@#%+=' </dev/urandom | head -c 32)"
+  fi
+
+  # Persist immediately so reruns keep the same password even if install stops mid-way.
+  set_secret_kv "$secrets" "WHIFF_DB_PASS" "$cur"
+
+  # Back-compat: install_whiff.sh currently expects DB_PASS in a lot of places.
+  # Keep DB_PASS as an alias for now (we’ll remove once install_whiff.sh is updated).
+  DB_PASS="$cur"
+  set_secret_kv "$secrets" "DB_PASS" "$cur"
+
+  WHIFF_DB_PASS="$cur"
+  export WHIFF_DB_PASS DB_PASS
+}
+
 persist_prompt_answers() {
   local WADE_ETC="${WADE_ETC:-/etc/wade}"
   local conf="${WADE_ETC}/wade.conf"
@@ -258,11 +304,23 @@ persist_prompt_answers() {
   fi
 
   # ---- Secrets (DO NOT put these in wade.conf/wade.env) ----
-  set_secret_kv "$secrets" "PG_DB_PASS" "${PG_DB_PASS:-}"
-  set_secret_kv "$secrets" "DB_PASS"    "${DB_PASS:-}"
 
-  # Intentionally NOT persisting SMB_ALL_PW (don’t store Samba passwords in plaintext).
+  # Autopsy multi-user Postgres role password (used during install + helpful for reruns)
+  # If you truly do NOT want this persisted, comment this line out.
+  set_secret_kv "$secrets" "PG_DB_PASS" "${PG_DB_PASS:-}"
+
+  # WHIFF DB password (root-only; used by WHIFF systemd units)
+  if [[ "${WHIFF_ENABLE_EFF:-0}" == "1" && -n "${WHIFF_DB_PASS:-}" ]]; then
+    set_secret_kv "$secrets" "WHIFF_DB_PASS" "${WHIFF_DB_PASS}"
+    # Temporary alias for older WHIFF installer expectations
+    set_secret_kv "$secrets" "DB_PASS" "${WHIFF_DB_PASS}"
+  fi
 }
+
+  # ---- Secrets (DO NOT put these in wade.conf/wade.env) ----
+  if [[ "${WHIFF_ENABLE_EFF:-0}" == "1" && -n "${WHIFF_DB_PASS:-}" ]]; then
+    set_secret_kv "$secrets" "WHIFF_DB_PASS" "${WHIFF_DB_PASS}"
+  fi
 
 # ensure_pipx_pkg <package> [install-args...]
 ensure_pipx_pkg() {
@@ -277,14 +335,77 @@ ensure_pipx_pkg() {
 
 # Queue systemd reload/enable once at end
 _SYSTEMD_UNITS=()
-systemd_queue_enable() { _SYSTEMD_UNITS+=("$1"); }
+
+systemd_norm_unit() {
+  local u="$1"
+  # If it already has a suffix (foo.service) keep it
+  if [[ "$u" == *.* ]]; then printf '%s\n' "$u"; return 0; fi
+  printf '%s.service\n' "$u"
+}
+
+systemd_queue_enable() {
+  local u; u="$(systemd_norm_unit "$1")"
+  local x
+  for x in "${_SYSTEMD_UNITS[@]}"; do
+    [[ "$x" == "$u" ]] && return 0
+  done
+  _SYSTEMD_UNITS+=("$u")
+}
+
+systemd_queue_enable_any() {
+  # Queue the first unit name that exists on this host
+  local cand u
+  for cand in "$@"; do
+    u="$(systemd_norm_unit "$cand")"
+    if systemctl cat "$u" >/dev/null 2>&1; then
+      systemd_queue_enable "$u"
+      return 0
+    fi
+  done
+  return 1
+}
+
+systemd_wait_active() {
+  local u; u="$(systemd_norm_unit "$1")"
+  local timeout="${2:-30}"
+  local i
+  for ((i=0; i<timeout; i++)); do
+    systemctl is-active --quiet "$u" && return 0
+    systemctl is-failed --quiet "$u" && return 1
+    sleep 1
+  done
+  return 1
+}
+
+WADE_SYSTEMD_OK=1
+
 systemd_finalize_enable() {
   ((${#_SYSTEMD_UNITS[@]}==0)) && return 0
+
   systemctl daemon-reload || true
+
+  local failed=()
+  local u
   for u in "${_SYSTEMD_UNITS[@]}"; do
-    systemctl start "$u" 2>/dev/null || true
-    systemctl enable --now "$u" 2>/dev/null || true
+    # Don’t hard-fail enable/start, but DO record if it never becomes active
+    systemctl enable --now "$u" >/dev/null 2>&1 || systemctl start "$u" >/dev/null 2>&1 || true
+
+    if ! systemd_wait_active "$u" 30; then
+      failed+=("$u")
+    fi
   done
+
+  if ((${#failed[@]})); then
+    WADE_SYSTEMD_OK=0
+    echo "[!] These services did NOT reach ACTIVE state:" >&2
+    printf '    - %s\n' "${failed[@]}" >&2
+    for u in "${failed[@]}"; do
+      systemctl --no-pager -l status "$u" || true
+    done
+    return 1
+  fi
+
+  return 0
 }
 
 solr_wait_ready() {
@@ -740,6 +861,7 @@ WADE_LOG_DIR="${WADE_BASE_VAR}/logs"
 WADE_PKG_DIR="${WADE_BASE_VAR}/pkg"
 WADE_TOOLS_DIR="${WADE_BASE_VAR}/tools.d"
 WADE_PIPELINES_DIR="${WADE_BASE_VAR}/pipelines.d"
+WADE_QUEUE_DIR="/home/${LWADEUSER}/${WADE_DATADIR}/_queue"
 
 WADE_DATADIR="DataSources"
 WADE_CASESDIR="Cases"
@@ -1256,23 +1378,9 @@ if [[ "$NONINTERACTIVE" -eq 0 ]]; then
     read -r -p "Whiff DB name [${DEFAULT_WHIFF_DB_NAME}]: " tmp; DB_NAME="${tmp:-$DEFAULT_WHIFF_DB_NAME}"
     read -r -p "Whiff DB user [${DEFAULT_WHIFF_DB_USER}]: " tmp; DB_USER="${tmp:-$DEFAULT_WHIFF_DB_USER}"
 
-    # Password: re-use PG_DB_PASS if we already captured it during WADE PG setup,
-    # otherwise ask once here.
-    if [[ -n "${PG_DB_PASS:-}" ]]; then
-      DB_PASS="$PG_DB_PASS"
-      echo "[*] Re-using WADE PostgreSQL password for WHIFF DB user."
-    else
-      while :; do
-        read -r -s -p "Password for WHIFF DB user '${DB_USER}': " p1; echo
-        read -r -s -p "Confirm password: " p2; echo
-        if [[ -n "$p1" && "$p1" == "$p2" ]]; then
-          DB_PASS="$p1"
-          PG_DB_PASS="$DB_PASS"
-          break
-        fi
-        echo "Mismatch/empty. Try again."
-      done
-    fi
+    # Password: auto-generate (or reuse existing /etc/wade/secrets.env value) for WHIFF.
+    # No prompts; secret is root-only and injected to services by systemd.
+    ensure_whiff_db_pass
 
     read -r -p "Online mode (download models / crawl docs)? (Y/n) [$( [[ "$DEFAULT_WHIFF_ONLINE_MODE" = "1" ]] && echo Y || echo n )]: " tmp
     if [[ "${tmp:-}" =~ ^[Nn]$ ]]; then
@@ -1319,7 +1427,8 @@ else
   DB_PORT="${DEFAULT_WHIFF_DB_PORT}"
   DB_NAME="${DEFAULT_WHIFF_DB_NAME}"
   DB_USER="${DEFAULT_WHIFF_DB_USER}"
-  DB_PASS="${DB_PASS:-${PG_DB_PASS:-}}"
+  DB_PASS="${DB_PASS:-}"
+  WHIFF_DB_PASS="${WHIFF_DB_PASS:-}"
   ONLINE_MODE="${DEFAULT_WHIFF_ONLINE_MODE}"
   DL_MODELS_NOW="${DEFAULT_WHIFF_DL_MODELS_NOW}"
   SEED_BASELINE_DOCS="${DEFAULT_WHIFF_SEED_BASELINE_DOCS}"
@@ -1331,10 +1440,15 @@ fi
 
 WHIFF_ENABLE="$WHIFF_ENABLE_EFF"
 
+# Ensure WHIFF_DB_PASS exists when WHIFF is enabled (both interactive + noninteractive).
+if [[ "${WHIFF_ENABLE_EFF:-0}" == "1" ]]; then
+  ensure_whiff_db_pass
+fi
+
 # Export everything install_whiff.sh expects when run with --non-interactive
 export WHIFF_ENABLE WHIFF_ENABLE_EFF
 export WHIFF_NONINTERACTIVE=1 \
-       INSTALL_PG_LOCAL DB_HOST DB_PORT DB_NAME DB_USER DB_PASS \
+       INSTALL_PG_LOCAL DB_HOST DB_PORT DB_NAME DB_USER WHIFF_DB_PASS DB_PASS \
        WHIFF_BIND WHIFF_PORT WHIFF_THREADS WHIFF_CTX \
        ONLINE_MODE DL_MODELS_NOW LLM_PATH EMBED_DIR \
        RUN_INITIAL_CRAWL SEED_BASELINE_DOCS \
@@ -1484,8 +1598,8 @@ if (( need_pw_note )); then
   echo "[wade] NOTE: Auto-generated Samba passwords were written to ${LOG_FILE}. Change them with 'smbpasswd <user>'." >&2
 fi
 
-  systemd_queue_enable smbd || systemd_queue_enable smb
-  systemd_queue_enable nmbd || systemd_queue_enable nmb || true
+  systemd_queue_enable_any smbd smb || true
+  systemd_queue_enable_any nmbd nmb || true
 
   # Firewall open
   if [[ "$FIREWALL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
@@ -1515,6 +1629,7 @@ run_step "samba" "configured" get_ver_samba 'wade_install_samba' || fail_note "s
 # Staging Service Install (venv-managed)
 #####################################
 VENV_DIR="/home/${LWADEUSER}/.venvs/wade"
+WADE_QUEUE_DIR="/home/${LWADEUSER}/${WADE_DATADIR}/_queue"
 
 run_step "wade-stage" "${STAGE_EXPECT_SHA}" get_ver_wade_stage '
   set -e
@@ -1550,7 +1665,7 @@ PY
 
   STAGING_ROOT="/home/${LWADEUSER}/${WADE_STAGINGDIR}"
   DATAS_ROOT="/home/${LWADEUSER}/${WADE_DATADIR}"
-  QUEUE_DIR="${WADE_QUEUE_DIR:-_queue}"
+  QUEUE_DIR="${WADE_QUEUE_DIR}"
 
   install -d -o "${LWADEUSER}" -g "${LWADEUSER}" -m 0755 \
       "${STAGING_ROOT}/full" "${STAGING_ROOT}/light" \
@@ -2302,7 +2417,9 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemd_queue_enable zookeeper
+  systemd_queue_enable zookeeper.service
+  systemctl daemon-reload
+  systemctl enable --now zookeeper.service
   systemctl start zookeeper.service
 ' || fail_note "zookeeper" "install/config failed"
 
@@ -2343,6 +2460,8 @@ run_step "solr" "${SOLR_VER}" get_ver_solr '
   CONF_DIR=$(find /opt/autopsy-solr -type d -path "*/AutopsyConfig/conf" | head -1 || true)
   chown -R solr:solr /opt/autopsy-solr
   [[ -n "$CONF_DIR" ]] && sudo -u solr /opt/solr/bin/solr create_collection -c AutopsyConfig -d "$CONF_DIR" || true
+
+  systemd_queue_enable solr.service
 ' || fail_note "solr" "install/config failed"
 
 #####################################
@@ -2401,6 +2520,7 @@ run_step "postgresql" "configured" get_ver_pg '
       done
     fi
 
+    systemd_queue_enable postgresql.service
     systemctl restart postgresql || true
 
   fi
@@ -2472,8 +2592,8 @@ run_step "splunk-uf" "installed" get_ver_splunkuf '
     curl -L "${SPLUNK_UF_DEB_URL}" -o "$PKG"
   elif ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb >/dev/null 2>&1; then
     PKG="$(ls "${WADE_PKG_DIR:-/var/wade/pkg}"/splunkforwarder/*.deb | sort -V | tail -1)"
-  elif [[ -n "${SPLUNK_SRC_DIR:-}" ]] && ls "${SPLUNK_SRC_DIR}"/*splunk*.deb >/dev/null 2>&1; then
-    PKG="$(ls "${SPLUNK_SRC_DIR}"/*splunk*.deb | sort -V | tail -1)"
+  elif [[ -n "${SPLUNK_SRC_DIR:-}" ]] && ls "${SPLUNK_SRC_DIR}"/*splunkforwarder*.deb >/dev/null 2>&1; then
+    PKG="$(ls "${SPLUNK_SRC_DIR}"/*splunkforwarder*.deb | sort -V | tail -1)"
   fi
 
   if [[ -z "${PKG:-}" || ! -f "${PKG:-/dev/null}" ]]; then
@@ -2532,6 +2652,7 @@ targetUri = ${DS_TARGET}
 EOF
   fi
 
+  systemd_queue_enable SplunkForwarder.service
   systemctl enable --now SplunkForwarder.service 2>/dev/null || systemctl enable --now splunkforwarder.service || true
 ' || fail_note "splunk-uf" "install/config failed"
 
@@ -2556,11 +2677,13 @@ User=%i
 Group=%i
 WorkingDirectory=/opt/wade/wade_workers
 EnvironmentFile=-/etc/wade/wade.env
-Environment=PYTHONPATH=/opt/wade/wade_workers
+Environment=PYTHONPATH=/opt/wade/wade_workers:/opt/wade
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/autopsy/.venvs/wade/bin/python /opt/wade/wade_workers/bin/wade_queue_runner.py
-Restart=always
-RestartSec=2
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
 UMask=002
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -2601,6 +2724,9 @@ if [[ "${WHIFF_ENABLE_EFF:-0}" == "1" ]]; then
     DB_PASS="$PG_DB_PASS"
   fi
 
+  # Ensure we have WHIFF_DB_PASS (and DB_PASS back-compat) before calling WHIFF installer.
+  ensure_whiff_db_pass
+
   if [[ -z "${DB_PASS:-}" ]]; then
     echo "[!] WHIFF is enabled but DB_PASS is empty; skipping WHIFF install."
   else
@@ -2613,6 +2739,7 @@ if [[ "${WHIFF_ENABLE_EFF:-0}" == "1" ]]; then
       DB_PORT="${DB_PORT:-5432}" \
       DB_NAME="${DB_NAME:-whiff}" \
       DB_USER="${DB_USER:-whiff}" \
+      WHIFF_DB_PASS="${WHIFF_DB_PASS}" \
       DB_PASS="${DB_PASS}" \
       WHIFF_BIND="${WHIFF_BIND:-127.0.0.1}" \
       WHIFF_PORT="${WHIFF_PORT:-8088}" \
@@ -2768,6 +2895,7 @@ WADE_LOG_DIR="${WADE_LOG_DIR}"
 WADE_PKG_DIR="${WADE_PKG_DIR}"
 WADE_TOOLS_DIR="${WADE_TOOLS_DIR}"
 WADE_PIPELINES_DIR="${WADE_PIPELINES_DIR}"
+WADE_QUEUE_ROOT="${WADE_QUEUE_DIR}"
 
 # Logging
 WADE_TEXT_LOGS=1
@@ -2799,9 +2927,6 @@ WADE_STAGE_SMALL_FILE_STABLE=5
 
 # Offline flag
 OFFLINE="${OFFLINE}"
-
-# Queue 
-WADE_QUEUE_DIR=_queue
 
 # Plaso / log2timeline
 PLASO_ENABLED="${PLASO_ENABLED}"
